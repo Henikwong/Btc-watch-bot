@@ -1,6 +1,1 @@
-
-requests
-pandas
-numpy
-ta
-python-dotenv
+worker: python3 Bot.py
