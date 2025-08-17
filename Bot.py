@@ -1,3 +1,4 @@
+
 import os
 import time
 import requests
@@ -16,16 +17,24 @@ coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt",
 def get_kline(symbol, period="60min", size=100):
     url = "https://api.huobi.pro/market/history/kline"
     params = {"symbol": symbol, "period": period, "size": size}
-    r = requests.get(url, params=params)
-    data = r.json()["data"]
-    df = pd.DataFrame(data)
-    df = df.sort_values("id")
-    df['close'] = df['close'].astype(float)
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['vol'] = df['vol'].astype(float)
-    return df
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        res = r.json()
+        if "data" not in res or res.get("status") != "ok":
+            print(f"获取 {symbol} K线失败:", res)
+            return None
+        data = res["data"]
+        df = pd.DataFrame(data)
+        df = df.sort_values("id")
+        df['close'] = df['close'].astype(float)
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['vol'] = df['vol'].astype(float)
+        return df
+    except Exception as e:
+        print(f"请求 {symbol} K线异常:", e)
+        return None
 
 # 计算技术指标并判断信号
 def check_signal(df):
@@ -54,9 +63,10 @@ def check_signal(df):
     # WR
     df['WR'] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
 
-    # 简单判断做多/做空信号
+    # 获取最新一根 K 线
     latest = df.iloc[-1]
 
+    # 简单判断做多/做空信号
     long_signal = (latest['EMA5'] > latest['EMA10'] > latest['EMA30']) and (latest['MACD'] > 0) and (latest['RSI'] < 70)
     short_signal = (latest['EMA5'] < latest['EMA10'] < latest['EMA30']) and (latest['MACD'] < 0) and (latest['RSI'] > 30)
 
@@ -74,7 +84,7 @@ def send_telegram_message(message):
         data = {"chat_id": CHAT_ID, "text": message}
         try:
             r = requests.post(url, data=data)
-            print(f"消息发送状态: {r.status_code}")
+            print(f"消息发送状态: {r.status_code} -> {message}")
         except Exception as e:
             print("发送消息失败:", e)
 
@@ -82,6 +92,8 @@ def send_telegram_message(message):
 while True:
     for coin in coins:
         df = get_kline(coin)
+        if df is None:
+            continue  # 获取失败就跳过
         signal = check_signal(df)
         if signal:
             send_telegram_message(f"{coin.upper()} 信号: {signal}")
