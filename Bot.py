@@ -2,108 +2,135 @@ import os
 import time
 import requests
 import pandas as pd
-import numpy as np
-import ta
+import ta  # pip install ta
 
-# Telegram 环境变量
+# Telegram 变量
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 监控币种
-coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt",
-         "dogeusdt","trxusdt","adausdt","hypeusdt","linkusdt"]
+# 币种
+main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
+meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
 
-# K 线周期
-periods = ["15min", "30min", "60min", "4hour"]
+# 周期
+main_periods = ["60min","4hour","1day"]
 
-# 记录上一次信号，避免重复发送
-last_signal = {coin: {p: None for p in periods} for coin in coins}
-
-# 获取 Huobi K 线数据
-def get_kline(symbol, period="60min", size=100):
+# 获取 K 线数据
+def get_kline(symbol, period="60min", size=120):
     url = "https://api.huobi.pro/market/history/kline"
-    params = {"symbol": symbol, "period": period, "size": size}
     try:
-        r = requests.get(url, params=params, timeout=10)
-        res = r.json()
-        if "data" not in res or res.get("status") != "ok":
-            print(f"获取 {symbol} {period} K线失败:", res)
+        r = requests.get(url, params={"symbol": symbol, "period": period, "size": size})
+        data = r.json()
+        if "data" not in data:
             return None
-        df = pd.DataFrame(res["data"])
+        df = pd.DataFrame(data["data"])
         df = df.sort_values("id")
-        for col in ['close','open','high','low','vol']:
+        for col in ["open","high","low","close","vol"]:
             df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        print(f"请求 {symbol} {period} K线异常:", e)
+        print("获取K线失败:", e)
         return None
 
-# 计算指标并判断信号
-def check_signal(df):
-    close = df['close']
-    high = df['high']
-    low = df['low']
+# 技术指标 & 信号
+def calc_signal(df):
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
 
     # EMA
-    df['EMA5'] = close.ewm(span=5, adjust=False).mean()
-    df['EMA10'] = close.ewm(span=10, adjust=False).mean()
-    df['EMA30'] = close.ewm(span=30, adjust=False).mean()
+    ema5 = close.ewm(span=5).mean()
+    ema10 = close.ewm(span=10).mean()
+    ema30 = close.ewm(span=30).mean()
 
     # MACD
     macd = ta.trend.MACD(close)
-    df['MACD'] = macd.macd_diff()
+    macd_diff = macd.macd_diff()
 
     # RSI
-    df['RSI'] = ta.momentum.RSIIndicator(close, window=14).rsi()
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
 
     # KDJ
     stoch = ta.momentum.StochasticOscillator(high, low, close, window=9, smooth_window=3)
-    df['K'] = stoch.stoch()
-    df['D'] = stoch.stoch_signal()
-    df['J'] = 3*df['K'] - 2*df['D']
+    k = stoch.stoch()
+    d = stoch.stoch_signal()
+    j = 3*k - 2*d
 
     # WR
-    df['WR'] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
+    wr = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
 
-    latest = df.iloc[-1]
-    price = latest['close']
+    latest = df.index[-1]
+    entry = close.iloc[-1]
 
-    long_signal = (latest['EMA5'] > latest['EMA10'] > latest['EMA30']) and (latest['MACD'] > 0) and (latest['RSI'] < 70)
-    short_signal = (latest['EMA5'] < latest['EMA10'] < latest['EMA30']) and (latest['MACD'] < 0) and (latest['RSI'] > 30)
+    long_signal = (ema5.iloc[-1] > ema10.iloc[-1] > ema30.iloc[-1]) and (macd_diff.iloc[-1] > 0) and (rsi.iloc[-1] < 70) and (j.iloc[-1] > d.iloc[-1])
+    short_signal = (ema5.iloc[-1] < ema10.iloc[-1] < ema30.iloc[-1]) and (macd_diff.iloc[-1] < 0) and (rsi.iloc[-1] > 30) and (j.iloc[-1] < d.iloc[-1])
 
     if long_signal:
-        buy_price = price
-        sell_price = price * 1.02  # 假设止盈 2%
-        return "做多", buy_price, sell_price
+        return "做多", entry
     elif short_signal:
-        buy_price = price
-        sell_price = price * 0.98  # 假设止盈 2%
-        return "做空", buy_price, sell_price
+        return "做空", entry
     else:
-        return None, None, None
+        return None, entry
 
-# 发送 Telegram 消息
+# Telegram 消息
 def send_telegram_message(message):
     if TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         data = {"chat_id": CHAT_ID, "text": message}
         try:
-            r = requests.post(url, data=data)
-            print(f"消息发送状态: {r.status_code} -> {message}")
+            requests.post(url, data=data)
         except Exception as e:
-            print("发送消息失败:", e)
+            print("消息发送失败:", e)
 
 # 主循环
 while True:
-    for coin in coins:
-        for period in periods:
+    main_msgs = []
+    meme_msgs = []
+
+    # -------- 主流币 --------
+    for coin in main_coins:
+        signals_by_period = {"60min": [], "4hour": [], "1day": []}
+        for period in main_periods:
             df = get_kline(coin, period)
-            if df is None:
+            if df is None or len(df) < 35:
                 continue
-            signal, buy_price, sell_price = check_signal(df)
-            if signal and signal != last_signal[coin][period]:
-                msg = f"{coin.upper()} {period} 信号: {signal}\n买入价: {buy_price:.4f}\n卖出价: {sell_price:.4f}"
-                send_telegram_message(msg)
-            last_signal[coin][period] = signal
-    # 每 30 分钟检查一次
-    time.sleep(1800)
+            signal, entry = calc_signal(df)
+            if signal:
+                if period == "60min":
+                    target = entry * (1.01 if signal=="做多" else 0.99)
+                elif period == "4hour":
+                    target = entry * (1.02 if signal=="做多" else 0.98)
+                else:
+                    target = entry * (1.03 if signal=="做多" else 0.97)
+
+                signals_by_period[period].append(
+                    f"{coin.upper()} {period}\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}\n——"
+                )
+
+        coin_msg = []
+        if signals_by_period["60min"]:
+            coin_msg.append("⏱ 1H 信号\n" + "\n".join(signals_by_period["60min"]))
+        if signals_by_period["4hour"]:
+            coin_msg.append("⏰ 4H 信号\n" + "\n".join(signals_by_period["4hour"]))
+        if signals_by_period["1day"]:
+            coin_msg.append("📅 1D 信号\n" + "\n".join(signals_by_period["1day"]))
+        if coin_msg:
+            main_msgs.append(f"📊 {coin.upper()} 技术信号\n" + "\n".join(coin_msg) + "\n")
+
+    # -------- MEME 币 --------
+    for coin in meme_coins:
+        df = get_kline(coin, "60min")
+        if df is None or len(df) < 35:
+            continue
+        signal, entry = calc_signal(df)
+        if signal:
+            target = entry * (1.08 if signal=="做多" else 0.92)
+            meme_msgs.append(f"🔥 MEME 币 {coin.upper()} 出现信号！\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}")
+
+    # -------- 推送 --------
+    if main_msgs:
+        send_telegram_message("\n\n".join(main_msgs))
+    if meme_msgs:
+        send_telegram_message("\n\n".join(meme_msgs))
+
+    time.sleep(3600)  # 每小时运行一次
