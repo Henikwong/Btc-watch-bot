@@ -56,9 +56,6 @@ def calc_signal(df):
     d = stoch.stoch_signal()
     j = 3*k - 2*d
 
-    # WR
-    wr = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
-
     latest = df.index[-1]
     entry = close.iloc[-1]
 
@@ -71,6 +68,16 @@ def calc_signal(df):
         return "做空", entry
     else:
         return None, entry
+
+# 支撑 / 阻力止损计算
+def calc_stop_loss(df, signal, entry, lookback=10):
+    support = df["low"].tail(lookback).min()
+    resistance = df["high"].tail(lookback).max()
+    if signal == "做多":
+        return support  # 多单止损在支撑位
+    elif signal == "做空":
+        return resistance  # 空单止损在阻力位
+    return None
 
 # Telegram 消息
 def send_telegram_message(message):
@@ -103,8 +110,10 @@ while True:
                 else:
                     target = entry * (1.03 if signal=="做多" else 0.97)
 
+                stop_loss = calc_stop_loss(df, signal, entry)
+
                 signals_by_period[period].append(
-                    f"{coin.upper()} {period}\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}\n——"
+                    f"{coin.upper()} {period}\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}\n止损价：{stop_loss:.6f}\n——"
                 )
 
         coin_msg = []
@@ -125,7 +134,10 @@ while True:
         signal, entry = calc_signal(df)
         if signal:
             target = entry * (1.08 if signal=="做多" else 0.92)
-            meme_msgs.append(f"🔥 MEME 币 {coin.upper()} 出现信号！\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}")
+            stop_loss = calc_stop_loss(df, signal, entry)
+            meme_msgs.append(
+                f"🔥 MEME 币 {coin.upper()} 出现信号！\n信号：{signal}\n入场价：{entry:.6f}\n目标价：{target:.6f}\n止损价：{stop_loss:.6f}"
+            )
 
     # -------- 推送 --------
     if main_msgs:
