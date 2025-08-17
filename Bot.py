@@ -1,17 +1,23 @@
-
 import os
 import time
 import requests
 import pandas as pd
 import numpy as np
-import ta  # pip install ta
+import ta
 
 # Telegram 环境变量
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 币种列表
-coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","hypeusdt","linkusdt"]
+# 监控币种
+coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt",
+         "dogeusdt","trxusdt","adausdt","hypeusdt","linkusdt"]
+
+# K 线周期
+periods = ["15min", "30min", "60min", "4hour"]
+
+# 记录上一次信号，避免重复发送
+last_signal = {coin: {p: None for p in periods} for coin in coins}
 
 # 获取 Huobi K 线数据
 def get_kline(symbol, period="60min", size=100):
@@ -21,22 +27,18 @@ def get_kline(symbol, period="60min", size=100):
         r = requests.get(url, params=params, timeout=10)
         res = r.json()
         if "data" not in res or res.get("status") != "ok":
-            print(f"获取 {symbol} K线失败:", res)
+            print(f"获取 {symbol} {period} K线失败:", res)
             return None
-        data = res["data"]
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(res["data"])
         df = df.sort_values("id")
-        df['close'] = df['close'].astype(float)
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['vol'] = df['vol'].astype(float)
+        for col in ['close','open','high','low','vol']:
+            df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        print(f"请求 {symbol} K线异常:", e)
+        print(f"请求 {symbol} {period} K线异常:", e)
         return None
 
-# 计算技术指标并判断信号
+# 计算指标并判断信号
 def check_signal(df):
     close = df['close']
     high = df['high']
@@ -49,7 +51,7 @@ def check_signal(df):
 
     # MACD
     macd = ta.trend.MACD(close)
-    df['MACD'] = macd.macd_diff()  # DIF - DEA
+    df['MACD'] = macd.macd_diff()
 
     # RSI
     df['RSI'] = ta.momentum.RSIIndicator(close, window=14).rsi()
@@ -63,19 +65,22 @@ def check_signal(df):
     # WR
     df['WR'] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
 
-    # 获取最新一根 K 线
     latest = df.iloc[-1]
+    price = latest['close']
 
-    # 简单判断做多/做空信号
     long_signal = (latest['EMA5'] > latest['EMA10'] > latest['EMA30']) and (latest['MACD'] > 0) and (latest['RSI'] < 70)
     short_signal = (latest['EMA5'] < latest['EMA10'] < latest['EMA30']) and (latest['MACD'] < 0) and (latest['RSI'] > 30)
 
     if long_signal:
-        return "做多"
+        buy_price = price
+        sell_price = price * 1.02  # 假设止盈 2%
+        return "做多", buy_price, sell_price
     elif short_signal:
-        return "做空"
+        buy_price = price
+        sell_price = price * 0.98  # 假设止盈 2%
+        return "做空", buy_price, sell_price
     else:
-        return None
+        return None, None, None
 
 # 发送 Telegram 消息
 def send_telegram_message(message):
@@ -91,10 +96,14 @@ def send_telegram_message(message):
 # 主循环
 while True:
     for coin in coins:
-        df = get_kline(coin)
-        if df is None:
-            continue  # 获取失败就跳过
-        signal = check_signal(df)
-        if signal:
-            send_telegram_message(f"{coin.upper()} 信号: {signal}")
-    time.sleep(60)  # 每分钟检查一次
+        for period in periods:
+            df = get_kline(coin, period)
+            if df is None:
+                continue
+            signal, buy_price, sell_price = check_signal(df)
+            if signal and signal != last_signal[coin][period]:
+                msg = f"{coin.upper()} {period} 信号: {signal}\n买入价: {buy_price:.4f}\n卖出价: {sell_price:.4f}"
+                send_telegram_message(msg)
+            last_signal[coin][period] = signal
+    # 每 30 分钟检查一次
+    time.sleep(1800)
