@@ -13,12 +13,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ================== 币种 ==================
 main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
 meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
-
 main_periods = ["60min","4hour","1day"]
-MODE = "新闻主导"  
 
-MEME_START = 0  # UTC 小时
-MEME_END = 8
+MODE = "新闻主导"  # 可选 ["普通","新闻主导","突破放量","时间窗口","汇总表格"]
 
 # ================== 工具函数 ==================
 def get_kline(symbol, period="60min", size=120):
@@ -34,7 +31,7 @@ def get_kline(symbol, period="60min", size=120):
             df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        print(f"❌ 获取K线失败: {e}")
+        print(f"获取K线失败 {symbol} {period}: {e}")
         return None
 
 def calc_signal(df):
@@ -82,161 +79,140 @@ def get_btc_news_sentiment():
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
         "https://www.theblock.co/rss",
-        "https://www.reuters.com/markets/cryptocurrency/rss/",
-        "https://www.bloomberg.com/feed/podcast/etf-report.xml"
+        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",  # WSJ Markets
     ]
-    sentiments = []
-    for url in feeds:
+    news = []
+    for f in feeds:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                title = entry.title.lower()
-                if "drop" in title or "fall" in title or "delay" in title:
-                    sentiments.append(-1)
-                elif "rise" in title or "adoption" in title or "growth" in title:
-                    sentiments.append(1)
+            d = feedparser.parse(f)
+            for entry in d.entries[:3]:
+                news.append(entry.title.lower())
         except Exception as e:
-            print(f"❌ 新闻获取失败 {url}: {e}")
-    if not sentiments:
+            print(f"新闻源读取失败 {f}: {e}")
+
+    score = 0
+    for n in news:
+        if "drop" in n or "fall" in n or "bear" in n:
+            score -= 1
+        if "rise" in n or "adoption" in n or "bull" in n:
+            score += 1
+
+    if score > 0:
+        return 1
+    elif score < 0:
+        return -1
+    else:
         return 0
-    avg_sentiment = sum(sentiments)/len(sentiments)
-    if avg_sentiment > 0.2: return 1
-    elif avg_sentiment < -0.2: return -1
-    else: return 0
 
-# ================== 挂单监控 ==================
-def get_orderbook(symbol, exchange="binance"):
+# ================== 观察挂单 Binance + Huobi ==================
+def get_orderbook_binance(symbol):
+    url = f"https://api.binance.com/api/v3/depth"
     try:
-        if exchange == "binance":
-            url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}&limit=50"
-            data = requests.get(url).json()
-            return data
-        elif exchange == "okx":
-            url = f"https://www.okx.com/api/v5/market/books?instId={symbol.upper()}&sz=50"
-            data = requests.get(url).json()
-            return data
-        elif exchange == "bybit":
-            url = f"https://api.bybit.com/v2/public/orderBook/L2?symbol={symbol.upper()}"
-            data = requests.get(url).json()
-            return data
-        elif exchange == "bitget":
-            url = f"https://api.bitget.com/api/spot/v1/market/depth?symbol={symbol.upper()}&limit=50"
-            data = requests.get(url).json()
-            return data
-        elif exchange == "huobi":
-            url = f"https://api.huobi.pro/market/depth?symbol={symbol.lower()}&type=step0"
-            data = requests.get(url).json()
-            return data
+        r = requests.get(url, params={"symbol": symbol.upper(), "limit": 50})
+        data = r.json()
+        bids = [(float(p), float(q)) for p,q in data["bids"]]
+        asks = [(float(p), float(q)) for p,q in data["asks"]]
+        return bids, asks
     except Exception as e:
-        print(f"❌ 获取挂单失败 {exchange} {symbol}: {e}")
-    return None
+        print(f"❌ Binance挂单获取失败 {symbol}: {e}")
+        return [], []
 
-def detect_large_orders(symbol, threshold_usdt=5_000_000):
-    exchanges = ["binance","okx","bybit","bitget","huobi"]
-    alerts = []
-    for ex in exchanges:
-        data = get_orderbook(symbol, ex)
-        if not data: continue
-        try:
-            if ex == "binance":
-                bids = [(float(p), float(q)) for p,q in data["bids"]]
-                asks = [(float(p), float(q)) for p,q in data["asks"]]
-            elif ex == "okx":
-                bids = [(float(p[0]), float(p[1])) for p in data["data"][0]["bids"]]
-                asks = [(float(p[0]), float(p[1])) for p in data["data"][0]["asks"]]
-            elif ex == "bybit":
-                bids = [(float(p["price"]), float(p["size"])) for p in data["result"] if p["side"]=="Buy"]
-                asks = [(float(p["price"]), float(p["size"])) for p in data["result"] if p["side"]=="Sell"]
-            elif ex == "bitget":
-                bids = [(float(p[0]), float(p[1])) for p in data["data"]["bids"]]
-                asks = [(float(p[0]), float(p[1])) for p in data["data"]["asks"]]
-            elif ex == "huobi":
-                bids = [(float(p[0]), float(p[1])) for p in data["tick"]["bids"]]
-                asks = [(float(p[0]), float(p[1])) for p in data["tick"]["asks"]]
-            for price, qty in bids+asks:
-                notional = price * qty
-                if notional >= threshold_usdt:
-                    alerts.append(f"🚨 {ex.upper()} {symbol.upper()} 大额挂单 {notional/1e6:.2f}M USDT @ {price}")
-        except Exception as e:
-            print(f"⚠️ 挂单解析失败 {ex} {symbol}: {e}")
-    return alerts
+def get_orderbook_huobi(symbol):
+    url = f"https://api.huobi.pro/market/depth"
+    try:
+        r = requests.get(url, params={"symbol": symbol, "type": "step0"})
+        data = r.json()
+        bids = [(float(p), float(q)) for p,q in data["tick"]["bids"][:50]]
+        asks = [(float(p), float(q)) for p,q in data["tick"]["asks"][:50]]
+        return bids, asks
+    except Exception as e:
+        print(f"❌ Huobi挂单获取失败 {symbol}: {e}")
+        return [], []
 
-# ================== Telegram ==================
+def check_large_walls(symbol, threshold=5_000_000):
+    messages = []
+    for ex, func in [("Binance", get_orderbook_binance), ("Huobi", get_orderbook_huobi)]:
+        bids, asks = func(symbol)
+        if not bids and not asks:
+            continue
+        for price, qty in bids + asks:
+            notional = price * qty
+            if notional > threshold:
+                side = "买单墙" if (price, qty) in bids else "卖单墙"
+                messages.append(f"💎 {ex} {symbol.upper()} 出现{side}\n价格: {price} 数量: {qty:.2f} 总额: {notional/1e6:.2f}M USDT")
+    return messages
+
+# ================== 推送 ==================
 def send_telegram_message(message):
     if TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         data = {"chat_id": CHAT_ID, "text": message}
         try:
             requests.post(url, data=data)
-            print(f"📨 已推送到 Telegram: {message[:50]}...")
+            print("✅ 已发送信号到 Telegram")
         except Exception as e:
-            print(f"❌ 消息发送失败: {e}")
+            print(f"消息发送失败: {e}")
 
 # ================== 主循环 ==================
-print("✅ Bot 启动成功，开始运行...")
-
 while True:
-    main_msgs, meme_msgs, order_msgs = [], [], []
+    try:
+        sentiment = get_btc_news_sentiment()
+        print(f"📰 当前新闻情绪: {sentiment}")
 
-    sentiment = get_btc_news_sentiment()
-    hour_now = datetime.utcnow().hour
-    allow_meme = (MODE != "时间窗口") or (MEME_START <= hour_now <= MEME_END)
+        main_msgs = []
+        meme_msgs = []
 
-    # 主流币
-    for coin in main_coins:
-        signals_by_period = {}
-        for period in main_periods:
-            df = get_kline(coin, period)
-            if df is None or len(df) < 35: continue
-            signal, entry = calc_signal(df)
-            if signal:
-                if sentiment == -1 and "多" in signal:
-                    signal = None
-                elif sentiment == -1:
-                    signal = f"{signal} ⚠️ (新闻利空)"
-                elif sentiment == 1:
-                    signal = f"{signal} ✅ (新闻利好)"
-            if signal:
-                target = entry * (1.01 if "多" in signal else 0.99)
-                stop_loss = calc_stop_loss(df, signal, entry)
-                signals_by_period[period] = f"{coin.upper()} {period}\n信号：{signal}\n入场价：{entry:.2f}\n目标价：{target:.2f}\n止损价：{stop_loss:.2f}\n——"
-        if signals_by_period:
-            msg = "📊 "+coin.upper()+" 技术信号\n" + "\n".join(signals_by_period.values())
-            main_msgs.append(msg)
-
-        # 检查挂单
-        alerts = detect_large_orders(coin)
-        if alerts:
-            order_msgs.extend(alerts)
-
-    # MEME 币
-    if allow_meme:
-        for coin in meme_coins:
-            for period in ["60min","4hour"]:
+        # 主流币
+        for coin in main_coins:
+            signals_by_period = {}
+            for period in main_periods:
                 df = get_kline(coin, period)
-                if df is None or len(df) < 35: continue
+                if df is None or len(df) < 35:
+                    continue
                 signal, entry = calc_signal(df)
                 if signal:
                     if sentiment == -1 and "多" in signal:
                         signal = None
                     elif sentiment == -1:
-                        signal = f"{signal} ⚠️ (新闻利空)"
+                        signal += " ⚠️ (新闻利空)"
                     elif sentiment == 1:
-                        signal = f"{signal} ✅ (新闻利好)"
+                        signal += " ✅ (新闻利好)"
                 if signal:
-                    target = entry * (1.08 if "多" in signal else 0.92)
                     stop_loss = calc_stop_loss(df, signal, entry)
-                    meme_msgs.append(f"🔥 MEME {coin.upper()} {period}\n信号：{signal}\n入场价：{entry:.2f}\n目标价：{target:.2f}\n止损价：{stop_loss:.2f}")
+                    target = entry * (1.01 if "多" in signal else 0.99)
+                    signals_by_period[period] = f"{coin.upper()} {period}\n信号:{signal}\n入场:{entry:.2f}\n目标:{target:.2f}\n止损:{stop_loss:.2f}"
 
-            # 检查挂单
-            alerts = detect_large_orders(coin, threshold_usdt=2_000_000)
-            if alerts:
-                order_msgs.extend(alerts)
+            if signals_by_period:
+                main_msgs.append("📊 " + "\n".join(signals_by_period.values()))
 
-    # 推送
-    if main_msgs: send_telegram_message("\n\n".join(main_msgs))
-    if meme_msgs: send_telegram_message("\n\n".join(meme_msgs))
-    if order_msgs: send_telegram_message("\n".join(order_msgs))
+            # 观察挂单
+            walls = check_large_walls(coin)
+            if walls:
+                main_msgs.extend(walls)
 
-    print("⏳ 等待 1 小时后再次运行...")
-    time.sleep(3600)
+        # MEME 币
+        for coin in meme_coins:
+            for period in ["60min", "4hour"]:
+                df = get_kline(coin, period)
+                if df is None or len(df) < 35:
+                    continue
+                signal, entry = calc_signal(df)
+                if signal:
+                    stop_loss = calc_stop_loss(df, signal, entry)
+                    target = entry * (1.08 if "多" in signal else 0.92)
+                    meme_msgs.append(f"🔥 MEME {coin.upper()} {period}\n信号:{signal}\n入场:{entry:.2f}\n目标:{target:.2f}\n止损:{stop_loss:.2f}")
+
+            walls = check_large_walls(coin)
+            if walls:
+                meme_msgs.extend(walls)
+
+        # 发送
+        if main_msgs:
+            send_telegram_message("\n\n".join(main_msgs))
+        if meme_msgs:
+            send_telegram_message("\n\n".join(meme_msgs))
+
+    except Exception as e:
+        print(f"循环错误: {e}")
+
+    time.sleep(3600)  # 每小时跑一次
