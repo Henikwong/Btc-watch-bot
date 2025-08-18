@@ -15,8 +15,6 @@ main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxu
 meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
 main_periods = ["60min","4hour","1day"]
 
-MODE = "新闻主导"  # 可选 ["普通","新闻主导","突破放量","时间窗口","汇总表格"]
-
 # ================== 工具函数 ==================
 def get_kline(symbol, period="60min", size=120):
     url = "https://api.huobi.pro/market/history/kline"
@@ -52,7 +50,6 @@ def calc_signal(df):
     j = 3*k - 2*d
 
     entry = close.iloc[-1]
-    volume = vol.iloc[-1]
 
     long_signal = (ema5.iloc[-1] > ema10.iloc[-1] > ema30.iloc[-1]) and (macd_diff.iloc[-1] > 0) and (rsi.iloc[-1] < 70) and (j.iloc[-1] > d.iloc[-1])
     short_signal = (ema5.iloc[-1] < ema10.iloc[-1] < ema30.iloc[-1]) and (macd_diff.iloc[-1] < 0) and (rsi.iloc[-1] > 30) and (j.iloc[-1] < d.iloc[-1])
@@ -79,7 +76,7 @@ def get_btc_news_sentiment():
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
         "https://www.theblock.co/rss",
-        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",  # WSJ Markets
+        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     ]
     news = []
     for f in feeds:
@@ -97,14 +94,9 @@ def get_btc_news_sentiment():
         if "rise" in n or "adoption" in n or "bull" in n:
             score += 1
 
-    if score > 0:
-        return 1
-    elif score < 0:
-        return -1
-    else:
-        return 0
+    return 1 if score > 0 else -1 if score < 0 else 0
 
-# ================== 观察挂单 Binance + Huobi ==================
+# ================== 观察挂单 ==================
 def get_orderbook_binance(symbol):
     url = f"https://api.binance.com/api/v3/depth"
     try:
@@ -159,17 +151,17 @@ while True:
         sentiment = get_btc_news_sentiment()
         print(f"📰 当前新闻情绪: {sentiment}")
 
-        main_msgs = []
-        meme_msgs = []
+        main_msgs, meme_msgs = [], []
 
         # 主流币
         for coin in main_coins:
-            signals_by_period = {}
             for period in main_periods:
                 df = get_kline(coin, period)
                 if df is None or len(df) < 35:
                     continue
                 signal, entry = calc_signal(df)
+
+                # 情绪修正
                 if signal:
                     if sentiment == -1 and "多" in signal:
                         signal = None
@@ -177,22 +169,27 @@ while True:
                         signal += " ⚠️ (新闻利空)"
                     elif sentiment == 1:
                         signal += " ✅ (新闻利好)"
+
                 if signal:
                     stop_loss = calc_stop_loss(df, signal, entry)
                     target = entry * (1.01 if "多" in signal else 0.99)
-                    signals_by_period[period] = f"{coin.upper()} {period}\n信号:{signal}\n入场:{entry:.2f}\n目标:{target:.2f}\n止损:{stop_loss:.2f}"
 
-            if signals_by_period:
-                main_msgs.append("📊 " + "\n".join(signals_by_period.values()))
+                    # === 过滤 <1% 的信号 ===
+                    if abs(target - entry) / entry < 0.01:
+                        continue
+
+                    # === 只推送 4h 和 1d ===
+                    if period in ["4hour", "1day"]:
+                        main_msgs.append(f"📊 {coin.upper()} {period}\n信号:{signal}\n入场:{entry:.2f}\n目标:{target:.2f}\n止损:{stop_loss:.2f}")
 
             # 观察挂单
             walls = check_large_walls(coin)
             if walls:
                 main_msgs.extend(walls)
 
-        # MEME 币
+        # MEME 币（还是推送 4h + 1h?）
         for coin in meme_coins:
-            for period in ["60min", "4hour"]:
+            for period in ["4hour"]:  # 只保留4h
                 df = get_kline(coin, period)
                 if df is None or len(df) < 35:
                     continue
@@ -200,13 +197,13 @@ while True:
                 if signal:
                     stop_loss = calc_stop_loss(df, signal, entry)
                     target = entry * (1.08 if "多" in signal else 0.92)
-                    meme_msgs.append(f"🔥 MEME {coin.upper()} {period}\n信号:{signal}\n入场:{entry:.2f}\n目标:{target:.2f}\n止损:{stop_loss:.2f}")
+                    if abs(target - entry) / entry >= 0.01:
+                        meme_msgs.append(f"🔥 MEME {coin.upper()} {period}\n信号:{signal}\n入场:{entry:.6f}\n目标:{target:.6f}\n止损:{stop_loss:.6f}")
 
             walls = check_large_walls(coin)
             if walls:
                 meme_msgs.extend(walls)
 
-        # 发送
         if main_msgs:
             send_telegram_message("\n\n".join(main_msgs))
         if meme_msgs:
@@ -215,4 +212,4 @@ while True:
     except Exception as e:
         print(f"循环错误: {e}")
 
-    time.sleep(3600)  # 每小时跑一次
+    time.sleep(3600)
