@@ -36,7 +36,6 @@ def calc_signal(df):
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    vol = df["vol"]
 
     ema5 = close.ewm(span=5).mean()
     ema10 = close.ewm(span=10).mean()
@@ -96,7 +95,7 @@ def get_btc_news_sentiment():
 
     return 1 if score > 0 else -1 if score < 0 else 0
 
-# ================== 观察挂单 ==================
+# ================== 各交易所挂单 ==================
 def get_orderbook_binance(symbol):
     url = f"https://api.binance.com/api/v3/depth"
     try:
@@ -121,10 +120,61 @@ def get_orderbook_huobi(symbol):
         print(f"❌ Huobi挂单获取失败 {symbol}: {e}")
         return [], []
 
+def get_orderbook_bybit(symbol):
+    url = "https://api.bybit.com/v5/market/orderbook"
+    try:
+        r = requests.get(url, params={"category":"spot", "symbol":symbol.upper(), "limit":50})
+        j = r.json()
+        if j.get("retCode") != 0:
+            return [], []
+        bids = [(float(p), float(q)) for p,q in j["result"]["b"]]
+        asks = [(float(p), float(q)) for p,q in j["result"]["a"]]
+        return bids, asks
+    except Exception as e:
+        print(f"❌ Bybit挂单获取失败 {symbol}: {e}")
+        return [], []
+
+def get_orderbook_okx(symbol):
+    url = "https://www.okx.com/api/v5/market/books"
+    try:
+        r = requests.get(url, params={"instId":symbol.upper().replace("USDT","-USDT"), "sz":50})
+        j = r.json()
+        if j.get("code") != "0":
+            return [], []
+        data = j.get("data", [])[0]
+        bids = [(float(p[0]), float(p[1])) for p in data.get("bids", [])]
+        asks = [(float(p[0]), float(p[1])) for p in data.get("asks", [])]
+        return bids, asks
+    except Exception as e:
+        print(f"❌ OKX挂单获取失败 {symbol}: {e}")
+        return [], []
+
+def get_orderbook_coinbase(symbol):
+    url = f"https://api.exchange.coinbase.com/products/{symbol.replace('usdt','-usd')}/book"
+    try:
+        r = requests.get(url, params={"level":2})
+        j = r.json()
+        if "bids" not in j or "asks" not in j:
+            return [], []
+        bids = [(float(p[0]), float(p[1])) for p in j["bids"]]
+        asks = [(float(p[0]), float(p[1])) for p in j["asks"]]
+        return bids, asks
+    except Exception as e:
+        print(f"❌ Coinbase挂单获取失败 {symbol}: {e}")
+        return [], []
+
+# ================== 观察挂单 ==================
 def check_large_walls(symbol, threshold=5_000_000):
     messages = []
-    for ex, func in [("Binance", get_orderbook_binance), ("Huobi", get_orderbook_huobi)]:
-        bids, asks = func(symbol)
+    exch_funcs = [
+        ("Binance", get_orderbook_binance, symbol),
+        ("Huobi", get_orderbook_huobi, symbol),
+        ("Bybit", get_orderbook_bybit, symbol),
+        ("OKX", get_orderbook_okx, symbol),
+        ("Coinbase", get_orderbook_coinbase, symbol),
+    ]
+    for ex, func, sym in exch_funcs:
+        bids, asks = func(sym)
         if not bids and not asks:
             continue
         for price, qty in bids + asks:
@@ -187,7 +237,7 @@ while True:
             if walls:
                 main_msgs.extend(walls)
 
-        # MEME 币（还是推送 4h + 1h?）
+        # MEME 币
         for coin in meme_coins:
             for period in ["4hour"]:  # 只保留4h
                 df = get_kline(coin, period)
