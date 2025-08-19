@@ -9,6 +9,18 @@ from datetime import datetime, timedelta
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ================== 工具函数：价格格式化 ==================
+def format_price(price: float) -> str:
+    """根据币价范围自动决定小数位"""
+    if price >= 100:        # BTC、BNB
+        return f"{price:.2f}"
+    elif price >= 1:        # ETH、XRP、LTC
+        return f"{price:.4f}"
+    elif price >= 0.01:     # DOGE、TRX
+        return f"{price:.6f}"
+    else:                   # SHIB、PEPE、BONK 等超小数
+        return f"{price:.8f}"
+
 # ================== GPT 模拟分析 ==================
 def gpt_analysis(symbol, df, signal):
     try:
@@ -28,8 +40,8 @@ def gpt_analysis(symbol, df, signal):
 
         return (f"{symbol.upper()} 当前信号：{signal}\n"
                 f"- K线形态：{shape}\n"
-                f"- 支撑位：{support:.2f}, 阻力位：{resistance:.2f}\n"
-                f"- 技术均价：{avg:.2f}\n"
+                f"- 支撑位：{format_price(support)}, 阻力位：{format_price(resistance)}\n"
+                f"- 技术均价：{format_price(avg)}\n"
                 f"- 外部因子：{news_factor}\n"
                 f"📌 建议结合多周期和成交量观察。")
     except Exception as e:
@@ -40,7 +52,7 @@ main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxu
 meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
 main_periods = ["60min","4hour","1day"]
 
-# ================== 工具函数 ==================
+# ================== K线获取 ==================
 def get_kline_huobi(symbol, period="60min", size=120):
     url = "https://api.huobi.pro/market/history/kline"
     try:
@@ -84,6 +96,7 @@ def get_kline_bybit(symbol, period="60", limit=120):
     except:
         return None
 
+# ================== 信号计算 ==================
 def calc_signal(df):
     if len(df) > 0:  # 丢掉最后一根未收盘K
         df = df.iloc[:-1].copy()
@@ -124,6 +137,7 @@ def calc_stop_loss(df, signal, entry, lookback=10):
         return resistance
     return None
 
+# ================== Telegram 推送 ==================
 def send_telegram_message(message):
     if TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -193,7 +207,7 @@ while True:
                             entry = period_entries[p]
                             stop_loss = calc_stop_loss(dfs["huobi"], period_signals[p], entry)
                             target = entry*(1.01 if "多" in period_signals[p] else 0.99)
-                            line = f"{p} → {period_signals[p]} | 入场:{entry:.2f} 目标:{target:.2f} 止损:{stop_loss:.2f}"
+                            line = f"{p} → {period_signals[p]} | 入场:{format_price(entry)} 目标:{format_price(target)} 止损:{format_price(stop_loss)}"
                             prev_sig = prev_signals.get(coin, {}).get(p)
                             if prev_sig and prev_sig != period_signals[p]:
                                 line += " ⚡ 信号变化"
