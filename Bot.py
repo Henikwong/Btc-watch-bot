@@ -104,27 +104,37 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"消息发送失败: {e}")
 
+# ================== GPT 分析模拟函数 ==================
+def gpt_analysis(coin, signal):
+    # 这里可改为调用实际 GPT API
+    if "多" in signal:
+        return f"{coin.upper()} 多头趋势，可能因市场利好或资金流入。红色信号通常会出现回调。"
+    elif "空" in signal:
+        return f"{coin.upper()} 空头趋势，可能因新闻利空或公司事件。绿色信号通常会出现反弹。"
+    return f"{coin.upper()} 当前无明显方向。"
+
 # ================== 主循环 ==================
 kline_cache = {}
 last_send = datetime.utcnow() - timedelta(hours=1)
 prev_signals = {}  # 保存上一次信号，用于变化提醒
+last_gpt_analysis = datetime.utcnow() - timedelta(hours=4)
 
 while True:
     now = datetime.utcnow()
     try:
         for coin in main_coins + meme_coins:
             kline_cache[coin] = {}
-            # 抓三家交易所
             kline_cache[coin]["huobi"] = get_kline_huobi(coin, "60min")
             kline_cache[coin]["binance"] = get_kline_binance(coin, "1h")
             kline_cache[coin]["bybit"] = get_kline_bybit(coin, "60")
 
+        # ================= 每小时发送信号 =================
         if (now - last_send).total_seconds() >= 3600:
             messages = []
             for coin, dfs in kline_cache.items():
                 period_signals = {}
                 period_entries = {}
-                # 获取1h, 4h, 1d信号
+
                 for period in main_periods:
                     signals = []
                     entries = []
@@ -140,10 +150,10 @@ while True:
                         period_entries[period] = sum(entries)/len(entries)
 
                 if period_signals:
-                    # 判断颜色
                     sig_values = list(period_signals.values())
                     unique_count = len(set(sig_values))
-                    color = "🟢 绿色"  # 默认1个周期
+                    # 颜色逻辑：红=空, 绿=多
+                    color = "🟢 绿色"
                     if unique_count == 1 and len(sig_values) == 3:
                         color = "🔴 红色"
                     elif len(sig_values) >= 2:
@@ -156,30 +166,21 @@ while True:
                             stop_loss = calc_stop_loss(dfs["huobi"], period_signals[p], entry)
                             target = entry*(1.01 if "多" in period_signals[p] else 0.99)
                             line = f"{p} → {period_signals[p]} | 入场:{entry:.2f} 目标:{target:.2f} 止损:{stop_loss:.2f}"
-                            # 信号变化提醒
                             prev_sig = prev_signals.get(coin, {}).get(p)
                             if prev_sig and prev_sig != period_signals[p]:
                                 line += " ⚡ 信号变化"
                             msg_lines.append(line)
-                            # 接近止盈止损提醒 ±0.5%
                             last_close = dfs["huobi"]["close"].iloc[-1]
                             if abs(last_close - target)/target <= 0.005:
                                 msg_lines.append(f"⚠️ {p} 接近目标价格")
                             if abs(last_close - stop_loss)/stop_loss <= 0.005:
                                 msg_lines.append(f"⚠️ {p} 接近止损价格")
 
-                    # 三交易所一致特发信息
                     if len(set(sig_values)) == 1 and len(sig_values) == 3:
                         msg_lines.append("🌟 强信号！三交易所一致")
 
                     messages.append("\n".join(msg_lines))
-                    prev_signals[coin] = period_signals  # 保存本次信号
+                    prev_signals[coin] = period_signals
 
             if messages:
-                send_telegram_message("\n\n".join(messages))
-            last_send = now
-
-    except Exception as e:
-        print(f"循环错误: {e}")
-
-    time.sleep(900)
+                send_telegram_message("\n\n".
