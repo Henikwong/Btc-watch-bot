@@ -106,7 +106,6 @@ def send_telegram_message(message):
 
 # ================== GPT 分析模拟函数 ==================
 def gpt_analysis(coin, signal):
-    # 这里可改为调用实际 GPT API
     if "多" in signal:
         return f"{coin.upper()} 多头趋势，可能因市场利好或资金流入。红色信号通常会出现回调。"
     elif "空" in signal:
@@ -116,7 +115,7 @@ def gpt_analysis(coin, signal):
 # ================== 主循环 ==================
 kline_cache = {}
 last_send = datetime.utcnow() - timedelta(hours=1)
-prev_signals = {}  # 保存上一次信号，用于变化提醒
+prev_signals = {}  
 last_gpt_analysis = datetime.utcnow() - timedelta(hours=4)
 
 while True:
@@ -134,7 +133,6 @@ while True:
             for coin, dfs in kline_cache.items():
                 period_signals = {}
                 period_entries = {}
-
                 for period in main_periods:
                     signals = []
                     entries = []
@@ -152,7 +150,6 @@ while True:
                 if period_signals:
                     sig_values = list(period_signals.values())
                     unique_count = len(set(sig_values))
-                    # 颜色逻辑：红=空, 绿=多
                     color = "🟢 绿色"
                     if unique_count == 1 and len(sig_values) == 3:
                         color = "🔴 红色"
@@ -183,4 +180,21 @@ while True:
                     prev_signals[coin] = period_signals
 
             if messages:
-                send_telegram_message("\n\n".
+                send_telegram_message("\n\n".join(messages))
+            last_send = now
+
+        # ================= 每四小时 GPT 分析 =================
+        if (now - last_gpt_analysis).total_seconds() >= 4*3600:
+            analysis_messages = []
+            for coin, sigs in prev_signals.items():
+                for period, signal in sigs.items():
+                    if signal:
+                        analysis_messages.append(gpt_analysis(coin, signal))
+            if analysis_messages:
+                send_telegram_message("🧠 GPT 综合分析\n\n" + "\n\n".join(analysis_messages))
+            last_gpt_analysis = now
+
+    except Exception as e:
+        print(f"循环错误: {e}")
+
+    time.sleep(900)
