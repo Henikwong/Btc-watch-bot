@@ -107,6 +107,7 @@ def send_telegram_message(message):
 # ================== 主循环 ==================
 kline_cache = {}
 last_send = datetime.utcnow() - timedelta(hours=1)
+prev_signals = {}  # 保存上一次信号，用于变化提醒
 
 while True:
     now = datetime.utcnow()
@@ -154,13 +155,25 @@ while True:
                             entry = period_entries[p]
                             stop_loss = calc_stop_loss(dfs["huobi"], period_signals[p], entry)
                             target = entry*(1.01 if "多" in period_signals[p] else 0.99)
-                            msg_lines.append(f"{p} → {period_signals[p]} | 入场:{entry:.2f} 目标:{target:.2f} 止损:{stop_loss:.2f}")
+                            line = f"{p} → {period_signals[p]} | 入场:{entry:.2f} 目标:{target:.2f} 止损:{stop_loss:.2f}"
+                            # 信号变化提醒
+                            prev_sig = prev_signals.get(coin, {}).get(p)
+                            if prev_sig and prev_sig != period_signals[p]:
+                                line += " ⚡ 信号变化"
+                            msg_lines.append(line)
+                            # 接近止盈止损提醒 ±0.5%
+                            last_close = dfs["huobi"]["close"].iloc[-1]
+                            if abs(last_close - target)/target <= 0.005:
+                                msg_lines.append(f"⚠️ {p} 接近目标价格")
+                            if abs(last_close - stop_loss)/stop_loss <= 0.005:
+                                msg_lines.append(f"⚠️ {p} 接近止损价格")
 
                     # 三交易所一致特发信息
                     if len(set(sig_values)) == 1 and len(sig_values) == 3:
                         msg_lines.append("🌟 强信号！三交易所一致")
 
                     messages.append("\n".join(msg_lines))
+                    prev_signals[coin] = period_signals  # 保存本次信号
 
             if messages:
                 send_telegram_message("\n\n".join(messages))
