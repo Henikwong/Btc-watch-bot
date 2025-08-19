@@ -1,4 +1,3 @@
-
 import os
 import time
 import requests
@@ -199,8 +198,12 @@ while True:
                             if prev_sig and prev_sig != period_signals[p]:
                                 line += " ⚡ 信号变化"
                                 # 突发时也推 GPT 分析
-                                analysis = gpt_analysis(coin, dfs["huobi"], period_signals[p])
-                                send_telegram_message(f"🧠 突发 GPT 分析\n{analysis[:3000]}")
+                                df_ref = dfs.get("huobi")
+                                if df_ref is None or df_ref.empty:
+                                    df_ref = next((df for df in dfs.values() if df is not None and not df.empty), None)
+                                if df_ref is not None:
+                                    analysis = gpt_analysis(coin, df_ref, period_signals[p])
+                                    send_telegram_message(f"🧠 突发 GPT 分析\n{analysis[:3000]}")
                             msg_lines.append(line)
 
                     if len(set(sig_values)) == 1 and len(sig_values) == 3:
@@ -211,9 +214,13 @@ while True:
 
                     # 每轮都推 GPT 综合分析
                     try:
-                        df_ref = dfs.get("huobi") or list(dfs.values())[0]
-                        analysis = gpt_analysis(coin, df_ref, period_signals)
-                        send_telegram_message(f"🧠 GPT 综合分析\n{analysis[:3000]}")
+                        df_ref = dfs.get("huobi")
+                        if df_ref is None or df_ref.empty:
+                            df_ref = next((df for df in dfs.values() if df is not None and not df.empty), None)
+
+                        if df_ref is not None:
+                            analysis = gpt_analysis(coin, df_ref, period_signals)
+                            send_telegram_message(f"🧠 GPT 综合分析\n{analysis[:3000]}")
                     except Exception as e:
                         print(f"[GPT ERROR] {e}")
 
