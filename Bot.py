@@ -1,3 +1,4 @@
+
 import os
 import time
 import requests
@@ -8,6 +9,32 @@ from datetime import datetime, timedelta
 # ================== Telegram ==================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# ================== GPT 模拟分析 ==================
+def gpt_analysis(symbol, df, signal):
+    try:
+        closes = df["close"].tail(50).tolist()
+        recent = closes[-5:]
+        avg = sum(closes) / len(closes)
+        support = min(closes[-20:])
+        resistance = max(closes[-20:])
+
+        shape = ""
+        if recent[-1] > recent[-2] > recent[-3]:
+            shape = "近期连续上涨，可能形成小W底"
+        elif recent[-1] < recent[-2] < recent[-3]:
+            shape = "近期连续下跌，可能构成M头或弱势下跌"
+
+        news_factor = "近期宏观市场消息或交易所动态可能带来不确定性"
+
+        return (f"{symbol.upper()} 当前信号：{signal}\n"
+                f"- K线形态：{shape}\n"
+                f"- 支撑位：{support:.2f}, 阻力位：{resistance:.2f}\n"
+                f"- 技术均价：{avg:.2f}\n"
+                f"- 外部因子：{news_factor}\n"
+                f"📌 建议结合多周期和成交量观察。")
+    except Exception as e:
+        return f"GPT 分析失败: {e}"
 
 # ================== 币种 ==================
 main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
@@ -59,6 +86,9 @@ def get_kline_bybit(symbol, period="60", limit=120):
         return None
 
 def calc_signal(df):
+    if len(df) > 0:  # 丢掉最后一根未收盘K
+        df = df.iloc[:-1].copy()
+
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -104,44 +134,46 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"消息发送失败: {e}")
 
-# ================== GPT 分析模拟函数 ==================
-def gpt_analysis(coin, signal):
-    if "多" in signal:
-        return f"{coin.upper()} 多头趋势，可能因市场利好或资金流入。红色信号通常会出现回调。"
-    elif "空" in signal:
-        return f"{coin.upper()} 空头趋势，可能因新闻利空或公司事件。绿色信号通常会出现反弹。"
-    return f"{coin.upper()} 当前无明显方向。"
-
 # ================== 主循环 ==================
 kline_cache = {}
 last_send = datetime.utcnow() - timedelta(hours=1)
-prev_signals = {}  
-last_gpt_analysis = datetime.utcnow() - timedelta(hours=4)
+prev_signals = {}
 
 while True:
     now = datetime.utcnow()
     try:
-        for coin in main_coins + meme_coins:
-            kline_cache[coin] = {}
-            kline_cache[coin]["huobi"] = get_kline_huobi(coin, "60min")
-            kline_cache[coin]["binance"] = get_kline_binance(coin, "1h")
-            kline_cache[coin]["bybit"] = get_kline_bybit(coin, "60")
+        coins = main_coins + meme_coins
+        kline_cache = {c: {"60min":{}, "4hour":{}, "1day":{}} for c in coins}
 
-        # ================= 每小时发送信号 =================
+        for coin in coins:
+            # Huobi
+            kline_cache[coin]["60min"]["huobi"] = get_kline_huobi(coin, "60min")
+            kline_cache[coin]["4hour"]["huobi"] = get_kline_huobi(coin, "4hour")
+            kline_cache[coin]["1day"]["huobi"]  = get_kline_huobi(coin, "1day")
+            # Binance
+            kline_cache[coin]["60min"]["binance"] = get_kline_binance(coin, "1h")
+            kline_cache[coin]["4hour"]["binance"] = get_kline_binance(coin, "4h")
+            kline_cache[coin]["1day"]["binance"]  = get_kline_binance(coin, "1d")
+            # Bybit
+            kline_cache[coin]["60min"]["bybit"] = get_kline_bybit(coin, "60")
+            kline_cache[coin]["4hour"]["bybit"] = get_kline_bybit(coin, "240")
+            kline_cache[coin]["1day"]["bybit"]  = get_kline_bybit(coin, "D")
+
         if (now - last_send).total_seconds() >= 3600:
             messages = []
-            for coin, dfs in kline_cache.items():
-                period_signals = {}
-                period_entries = {}
+            for coin in coins:
+                period_signals, period_entries = {}, {}
+
                 for period in main_periods:
-                    signals = []
-                    entries = []
+                    signals, entries = [], []
+                    dfs = kline_cache[coin].get(period, {})
                     for ex, df in dfs.items():
                         if df is not None and len(df) > 35:
                             sig, entry = calc_signal(df)
                             if sig:
                                 signals.append(sig)
                                 entries.append(entry)
+
                     if signals:
                         final_sig = max(set(signals), key=signals.count)
                         period_signals[period] = final_sig
@@ -166,33 +198,28 @@ while True:
                             prev_sig = prev_signals.get(coin, {}).get(p)
                             if prev_sig and prev_sig != period_signals[p]:
                                 line += " ⚡ 信号变化"
+                                # 突发时也推 GPT 分析
+                                analysis = gpt_analysis(coin, dfs["huobi"], period_signals[p])
+                                send_telegram_message(f"🧠 突发 GPT 分析\n{analysis[:3000]}")
                             msg_lines.append(line)
-                            last_close = dfs["huobi"]["close"].iloc[-1]
-                            if abs(last_close - target)/target <= 0.005:
-                                msg_lines.append(f"⚠️ {p} 接近目标价格")
-                            if abs(last_close - stop_loss)/stop_loss <= 0.005:
-                                msg_lines.append(f"⚠️ {p} 接近止损价格")
 
                     if len(set(sig_values)) == 1 and len(sig_values) == 3:
-                        msg_lines.append("🌟 强信号！三交易所一致")
+                        msg_lines.append("🌟 强信号！三周期一致")
 
                     messages.append("\n".join(msg_lines))
                     prev_signals[coin] = period_signals
 
+                    # 每轮都推 GPT 综合分析
+                    try:
+                        df_ref = dfs.get("huobi") or list(dfs.values())[0]
+                        analysis = gpt_analysis(coin, df_ref, period_signals)
+                        send_telegram_message(f"🧠 GPT 综合分析\n{analysis[:3000]}")
+                    except Exception as e:
+                        print(f"[GPT ERROR] {e}")
+
             if messages:
                 send_telegram_message("\n\n".join(messages))
             last_send = now
-
-        # ================= 每四小时 GPT 分析 =================
-        if (now - last_gpt_analysis).total_seconds() >= 4*3600:
-            analysis_messages = []
-            for coin, sigs in prev_signals.items():
-                for period, signal in sigs.items():
-                    if signal:
-                        analysis_messages.append(gpt_analysis(coin, signal))
-            if analysis_messages:
-                send_telegram_message("🧠 GPT 综合分析\n\n" + "\n\n".join(analysis_messages))
-            last_gpt_analysis = now
 
     except Exception as e:
         print(f"循环错误: {e}")
