@@ -14,16 +14,19 @@ from datetime import datetime, timedelta
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-POLL_INTERVAL = 60            # 测试用：每分钟抓取一次；你可以改回 900（15分钟）或其他
+POLL_INTERVAL = 60            # 测试用，每分钟抓一次，可改回 900（15分钟）
 ATR_MULT = 1.5                # ATR 止盈/止损倍数
-RSI_THRESHOLD = 5             # RSI 最大允许差（跨交易所）
-WR_THRESHOLD = 5              # WR 最大允许差
-VOL_REL_THRESHOLD = 0.20      # 成交量增减比例允许差（跨交易所）
+RSI_THRESHOLD = 5
+WR_THRESHOLD = 5
+VOL_REL_THRESHOLD = 0.20
 
-# 币种（你原本的列表）
+# 币种
 main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
 meme_coins = ["shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkuspt","flokusdt"]
+
+# 周期
 main_periods = ["60min","4hour","1day"]
+all_periods = ["60min","4hour","1day","1week"]
 
 # ====== 工具函数 ======
 def log(msg: str):
@@ -56,15 +59,15 @@ def compute_atr(df: pd.DataFrame, period=14):
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(period).mean()
         return float(atr.iloc[-1])
-    except Exception:
+    except:
         return None
 
 # ====== K线抓取函数 ======
 period_map = {
-    "60min": {"binance":"1h","okx":"1H","huobi":"60min","binance_raw":"1h"},
-    "4hour": {"binance":"4h","okx":"4H","huobi":"4hour","binance_raw":"4h"},
-    "1day": {"binance":"1d","okx":"1D","huobi":"1day","binance_raw":"1d"},
-    "1week": {"binance":"1w","okx":"1W","huobi":"1week","binance_raw":"1w"}
+    "60min": {"binance":"1h","okx":"1H","huobi":"60min"},
+    "4hour": {"binance":"4h","okx":"4H","huobi":"4hour"},
+    "1day": {"binance":"1d","okx":"1D","huobi":"1day"},
+    "1week": {"binance":"1w","okx":"1W","huobi":"1week"}
 }
 
 def get_kline_huobi(symbol: str, period="60min", size=200):
@@ -76,8 +79,7 @@ def get_kline_huobi(symbol: str, period="60min", size=200):
             return None
         df = pd.DataFrame(j["data"]).sort_values("id")
         for c in ["open","high","low","close","vol"]:
-            if c in df.columns:
-                df[c] = df[c].astype(float)
+            df[c] = df[c].astype(float)
         return df
     except Exception as e:
         log(f"[Huobi ERROR] {symbol} {e}")
@@ -108,7 +110,9 @@ def get_kline_okx(symbol: str, bar="1H", limit=200):
         j = r.json()
         if not isinstance(j, dict) or j.get("code") != "0" or "data" not in j:
             return None
-        df = pd.DataFrame([row for row in j["data"]])
+        df = pd.DataFrame(j["data"])
+        if isinstance(df.iloc[0,0], list) or isinstance(df.iloc[0,0], str):
+            df = pd.DataFrame([row for row in j["data"]])
         df = df.iloc[:, :6]
         df.columns = ["ts","open","high","low","close","vol"]
         for c in ["open","high","low","close","vol"]:
@@ -148,7 +152,6 @@ def calc_indicators(df: pd.DataFrame):
         k_trend = "多" if k_val > d_val else "空" if k_val < d_val else "中性"
 
         ema_trend = "多" if (ema5 > ema10 and ema10 > ema30) else ("空" if (ema5 < ema10 and ema10 < ema30) else "中性")
-
         vol_trend = (vol.iloc[-1] - vol.iloc[-2]) / (abs(vol.iloc[-2]) + 1e-12)
 
         return {
@@ -168,7 +171,7 @@ def calc_indicators(df: pd.DataFrame):
         log(f"[IND ERROR] {e}")
         return None
 
-# ====== 停损止盈 (ATR) ======
+# ====== ATR止盈止损 ======
 def compute_stop_target_from_df(df: pd.DataFrame, side: str, entry: float):
     atr = compute_atr(df)
     if atr is None:
@@ -199,7 +202,7 @@ def send_telegram_message(text: str):
         log(f"❌ Telegram 发送异常: {e}")
         return False
 
-# ====== 一致性检测函数 ======
+# ====== 一致性检测 ======
 def indicators_agree(list_of_inds):
     try:
         inds = [x for x in list_of_inds if x is not None]
@@ -227,7 +230,7 @@ def indicators_agree(list_of_inds):
     except Exception as e:
         return False, f"异常: {e}"
 
-# ====== 格式化 3/3 2/3 1/3 模板 ======
+# ====== 构建一致性 block ======
 def build_consistency_block(coin_upper, side, entry, target, stop, consistent_count):
     entry_s = format_price(entry)
     target_s = format_price(target)
@@ -251,28 +254,24 @@ def build_consistency_block(coin_upper, side, entry, target, stop, consistent_co
                 f"止损: {stop_s}\n"
                 f"一致性: 1/3 周期")
 
-# ====== 新增：生成每小时指标汇总 ======
+# ====== 每小时指标快照生成 ======
 def build_indicator_report(coins, per_coin_results):
-    """
-    coins: 币列表
-    per_coin_results: { coin: { period_label: { 'huobi':ind, 'binance':ind, 'okx':ind } } }
-    """
-    report_lines = ["📊 每小时指标回报"]
+    lines = ["📢 每小时普通信息（含 1h / 4h / 24h / 1w 指标 & 一致性状态）"]
     for coin in coins:
         coin_upper = coin.upper()
-        parts = []
-        for p in ["60min","4hour","1day","1week"]:
-            ind_h = per_coin_results[coin][p]["huobi"]
-            ind_b = per_coin_results[coin][p]["binance"]
-            ind_o = per_coin_results[coin][p]["okx"]
+        per_period_results = per_coin_results[coin]
+        summary_parts = []
+        for p in all_periods:
+            ind_h = per_period_results[p]["huobi"]
+            ind_b = per_period_results[p]["binance"]
+            ind_o = per_period_results[p]["okx"]
             ind_display = ind_h or ind_b or ind_o
             if ind_display:
-                parts.append(f"{p} → EMA:{ind_display['ema_trend']} MACD:{ind_display['macd']:.3f} "
-                             f"RSI:{ind_display['rsi']:.2f} WR:{ind_display['wr']:.2f} VOLΔ:{ind_display['vol_trend']:.3f}")
+                summary_parts.append(f"{p} → EMA:{ind_display['ema_trend']} MACD:{ind_display['macd']:.3f} RSI:{ind_display['rsi']:.2f} WR:{ind_display['wr']:.2f} VOLΔ:{ind_display['vol_trend']:.3f}")
             else:
-                parts.append(f"{p} → 无数据")
-        report_lines.append(f"{coin_upper}:\n" + "\n".join(parts))
-    return "\n\n".join(report_lines)
+                summary_parts.append(f"{p} → 无数据")
+        lines.append(f"{coin_upper} 监控快照:\n" + "\n".join(summary_parts))
+    return "\n\n".join(lines)
 
 # ====== 主循环 ======
 prev_high_signal = {}
@@ -281,34 +280,3 @@ last_hour_msg = None
 log("启动 Bot，多交易所多周期监控（POLL_INTERVAL = {}s）".format(POLL_INTERVAL))
 
 while True:
-    try:
-        coins = main_coins + meme_coins
-        now = datetime.now()
-
-        hourly_report_lines = ["📢 每小时普通信息（含 1h / 4h / 24h / 1w 指标 & 一致性状态）"]
-        strong_alerts = []
-        per_coin_results = {}  # 保存每个币每个周期指标，供 build_indicator_report 使用
-
-        for coin in coins:
-            coin_upper = coin.upper()
-            per_period_results = {}
-
-            for period_label in ["60min","4hour","1day","1week"]:
-                huobi_period = period_label
-                binance_interval = period_map[period_label]["binance"]
-                okx_bar = period_map[period_label]["okx"]
-
-                huobi_df = get_kline_huobi(coin, period=huobi_period)
-                binance_df = get_kline_binance(coin, interval=binance_interval)
-                okx_df = get_kline_okx(coin, bar=okx_bar)
-
-                if period_label in ["60min","4hour","1day"]:
-                    log(f"{coin_upper} {period_label} 抓取状态: Huobi={'OK' if huobi_df is not None else 'FAIL'}, "
-                        f"Binance={'OK' if binance_df is not None else 'FAIL'}, OKX={'OK' if okx_df is not None else 'FAIL'}")
-
-                h_ind = calc_indicators(huobi_df) if huobi_df is not None else None
-                b_ind = calc_indicators(binance_df) if binance_df is not None else None
-                o_ind = calc_indicators(okx_df) if okx_df is not None else None
-                per_period_results[period_label] = {
-                   "huobi_df": huobi_df, "binance_df": binance_df, "okx_df": okx_df,
-                    "huobi": h_ind, "binance": b_ind, "okx": o
