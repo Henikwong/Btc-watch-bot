@@ -1,5 +1,5 @@
 # bot.py
-# 高度动向多周期多交易所监控（Huobi + Binance + Bybit v5）
+# 高度动向多周期多交易所监控（Huobi + Binance + Bybit v5 + OKX）
 # 要求：环境变量 TELEGRAM_BOT_TOKEN 与 TELEGRAM_CHAT_ID 已设置
 
 import os
@@ -19,6 +19,7 @@ ATR_MULT = 1.5                # ATR 止盈/止损倍数
 RSI_THRESHOLD = 5             # RSI 最大允许差（跨交易所）
 WR_THRESHOLD = 5              # WR 最大允许差
 VOL_REL_THRESHOLD = 0.20      # 成交量增减比例允许差（跨交易所）
+
 main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
 meme_coins = ["shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
 main_periods = ["60min","4hour","1day"]  # 保持和 Huobi period 命名一致
@@ -112,6 +113,33 @@ def get_kline_bybit(symbol: str, period="60", limit=200):
         log(f"[Bybit ERROR] {symbol} {e}")
         return None
 
+def get_kline_okx(symbol: str, period="1H", limit=200):
+    """
+    OKX V5: GET /api/v5/market/candles
+    instId 例子：BTC-USDT-SWAP；bar: 1m/5m/15m/1H/4H/1D 等
+    """
+    try:
+        instId = symbol.upper().replace("USDT", "-USDT-SWAP")
+        r = requests.get("https://www.okx.com/api/v5/market/candles",
+                         params={"instId": instId, "bar": period, "limit": limit},
+                         timeout=10)
+        j = r.json()
+        if not isinstance(j, dict) or j.get("code") != "0" or "data" not in j:
+            log(f"[OKX FAIL] {instId} code={j.get('code') if isinstance(j,dict) else 'nojson'}")
+            return None
+        # OKX 返回倒序，列含义：ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm
+        cols = ["ts","open","high","low","close","vol","volCcy","volCcyQuote","confirm"]
+        df = pd.DataFrame(j["data"], columns=cols)
+        for c in ["open","high","low","close","vol"]:
+            df[c] = df[c].astype(float)
+        # 升序，仿照其他交易所
+        df = df.iloc[::-1].reset_index(drop=True)
+        df["id"] = pd.to_numeric(df["ts"], errors="coerce")
+        return df
+    except Exception as e:
+        log(f"[OKX ERROR] {symbol} {e}")
+        return None
+
 # ====== 指标计算（返回标准化指标） ======
 def calc_indicators(df: pd.DataFrame):
     """
@@ -202,13 +230,14 @@ prev_high_signal = {}
 last_hour_msg = None
 
 # mapping period strings for different exchanges:
-# Huobi uses "60min","4hour","1day" in this code (we already used those)
+# Huobi uses "60min","4hour","1day"
 # Binance intervals: "1h","4h","1d"
 # Bybit v5: "60","240","D"
+# OKX bars: "1H","4H","1D"
 period_map = {
-    "60min": {"binance":"1h","bybit":"60"},
-    "4hour": {"binance":"4h","bybit":"240"},
-    "1day": {"binance":"1d","bybit":"D"}
+    "60min": {"binance":"1h","bybit":"60","okx":"1H"},
+    "4hour": {"binance":"4h","bybit":"240","okx":"4H"},
+    "1day": {"binance":"1d","bybit":"D","okx":"1D"}
 }
 
 log("启动 Bot，多交易所多周期监控（测试模式 - POLL_INTERVAL = {}s）".format(POLL_INTERVAL))
@@ -223,67 +252,80 @@ while True:
             coin_upper = coin.upper()
             period_results = {}  # store per period indicators across exchanges
 
-            # 对每个周期抓取 3 家交易所的数据
+            # 对每个周期抓取 4 家交易所的数据（以 Huobi+Binance+OKX 为一致性门槛；Bybit 只记录/展示）
             for period in main_periods:
-                # Huobi period matches our label
                 huobi_df = get_kline_huobi(coin, period=period)
                 binance_interval = period_map[period]["binance"]
                 bybit_interval = period_map[period]["bybit"]
+                okx_bar = period_map[period]["okx"]
 
                 binance_df = get_kline_binance(coin, period=binance_interval)
                 bybit_df = get_kline_bybit(coin_upper, period=bybit_interval)
+                okx_df = get_kline_okx(coin, period=okx_bar)
 
-                # log fetch status
+                # 抓取状态日志
                 log(f"{coin_upper} {period} 抓取状态: Huobi={'OK' if huobi_df is not None else 'FAIL'}, "
-                    f"Binance={'OK' if binance_df is not None else 'FAIL'}, Bybit={'OK' if bybit_df is not None else 'FAIL'}")
+                    f"Binance={'OK' if binance_df is not None else 'FAIL'}, "
+                    f"OKX={'OK' if okx_df is not None else 'FAIL'}, "
+                    f"Bybit={'OK' if bybit_df is not None else 'FAIL'}")
 
-                # ensure we have 3 valid dfs; if any missing, skip this period
-                if huobi_df is None or binance_df is None or bybit_df is None:
+                # 一致性判定必须具备 Huobi + Binance + OKX
+                if huobi_df is None or binance_df is None or okx_df is None:
                     continue
 
-                # compute indicators for each exchange
+                # 计算指标（Bybit 若有就算；没有也不影响一致性）
                 h_ind = calc_indicators(huobi_df)
                 b_ind = calc_indicators(binance_df)
-                by_ind = calc_indicators(bybit_df)
+                o_ind = calc_indicators(okx_df)
+                by_ind = calc_indicators(bybit_df) if bybit_df is not None else None
 
-                # if any indicator calc failed skip
-                if h_ind is None or b_ind is None or by_ind is None:
+                if h_ind is None or b_ind is None or o_ind is None:
                     continue
 
-                period_results[period] = {
+                exch_inds = {
                     "huobi": h_ind,
                     "binance": b_ind,
-                    "bybit": by_ind,
+                    "okx": o_ind
                 }
+                if by_ind is not None:
+                    exch_inds["bybit"] = by_ind
 
-                # 日志显示每交易所指标（只显示关键数值，避免太长）
+                period_results[period] = exch_inds
+
+                # 日志显示各交易所关键数值（有就打）
                 def short_ind_text(name, ind):
-                    return (f"{name}: EMA_trend={ind['ema_trend']} EMA_vals={[round(x,4) for x in ind['ema_vals']]} "
-                            f"MACD={ind['macd']:.4f} RSI={ind['rsi']:.2f} WR={ind['wr']:.2f} VOLΔ={ind['vol_trend']:.3f}")
-                log(f"{coin_upper} {period} 指标 => {short_ind_text('Huobi',h_ind)} | {short_ind_text('Binance',b_ind)} | {short_ind_text('Bybit',by_ind)}")
+                    return (f"{name}: EMA_trend={ind['ema_trend']} "
+                            f"EMA_vals={[round(x,4) for x in ind['ema_vals']]} "
+                            f"MACD={ind['macd']:.4f} RSI={ind['rsi']:.2f} "
+                            f"WR={ind['wr']:.2f} VOLΔ={ind['vol_trend']:.3f}")
+                parts = []
+                for ex_name in ["Huobi","Binance","OKX","Bybit"]:
+                    ex_key = ex_name.lower()
+                    if ex_key in exch_inds:
+                        parts.append(short_ind_text(ex_name, exch_inds[ex_key]))
+                log(f"{coin_upper} {period} 指标 => " + " | ".join(parts))
 
             # 如果没有任何周期可用，跳过该币
             if not period_results:
-                # 在 hourly message we will show "无一致信号 (监控中)" later
                 continue
 
-            # 判断每个周期是否满足 三家交易所一致性与指标一致
+            # —— 一致性检查：严格以 Huobi+Binance+OKX 三家为准 —— #
             period_consistent = {}
             for period, exch_inds in period_results.items():
-                # collect trends/values
-                ema_trends = [exch_inds[e]['ema_trend'] for e in exch_inds]
-                k_trends = [("多" if exch_inds[e]['ema_vals'][0] > exch_inds[e]['ema_vals'][1] else "空") for e in exch_inds]  # approximate
-                macd_signs = [1 if exch_inds[e]['macd'] > 0 else -1 for e in exch_inds]
-                rsi_vals = [exch_inds[e]['rsi'] for e in exch_inds]
-                wr_vals = [exch_inds[e]['wr'] for e in exch_inds]
-                vol_vals = [exch_inds[e]['vol_trend'] for e in exch_inds]
+                check_keys = ["huobi","binance","okx"]
+                if not all(k in exch_inds for k in check_keys):
+                    continue
 
-                # basic consistency checks:
-                ema_consistent = (len(set(ema_trends)) == 1)  # all same '多'/'空'/'中性'
+                ema_trends = [exch_inds[k]['ema_trend'] for k in check_keys]
+                macd_signs = [1 if exch_inds[k]['macd'] > 0 else -1 for k in check_keys]
+                rsi_vals = [exch_inds[k]['rsi'] for k in check_keys]
+                wr_vals = [exch_inds[k]['wr'] for k in check_keys]
+                vol_vals = [exch_inds[k]['vol_trend'] for k in check_keys]
+
+                ema_consistent = (len(set(ema_trends)) == 1)
                 macd_consistent = (max(macd_signs) - min(macd_signs) == 0)
                 rsi_consistent = (max(rsi_vals) - min(rsi_vals) <= RSI_THRESHOLD)
                 wr_consistent = (max(wr_vals) - min(wr_vals) <= WR_THRESHOLD)
-                # vol: all vol_trend within relative threshold
                 vol_consistent = (max(vol_vals) - min(vol_vals) <= VOL_REL_THRESHOLD)
 
                 is_consistent = ema_consistent and macd_consistent and rsi_consistent and wr_consistent and vol_consistent
@@ -294,51 +336,58 @@ while True:
                     "exch_inds": exch_inds
                 }
 
-                log(f"{coin_upper} {period} 一致性: EMA_consistent={ema_consistent} MACD_consistent={macd_consistent} RSI_consistent={rsi_consistent} WR_consistent={wr_consistent} VOL_consistent={vol_consistent} => FINAL={is_consistent}")
+                log(f"{coin_upper} {period} 一致性[Huo+Bin+OKX]: "
+                    f"EMA={ema_consistent} MACD={macd_consistent} "
+                    f"RSI={rsi_consistent} WR={wr_consistent} VOL={vol_consistent} "
+                    f"=> FINAL={is_consistent}")
 
-            # 最后：要求所有 main_periods 都存在并且一致，才构成高度动向信号
-            good_periods = [p for p,v in period_consistent.items() if v["consistent"]]
+            # 要求所有 main_periods 都一致，才构成高度动向信号
+            good_periods = [p for p,v in period_consistent.items() if v.get("consistent")]
             if len(good_periods) == len(main_periods):
-                # all periods consistent
-                # final side: take ema_trend of 60min period (they're same across periods by logic)
                 final_side = period_consistent["60min"]["ema_trend"]
-                # entry from huobi 60min
                 entry = period_consistent["60min"]["exch_inds"]["huobi"]["entry"]
-                stop, target = compute_stop_target(period_results["60min"]["huobi"], final_side, entry)
+                stop, target = compute_stop_target(
+                    # 使用 Huobi 的 60min 数据计算 ATR
+                    get_kline_huobi(coin, period="60min") or pd.DataFrame(),
+                    final_side, entry
+                )
+
                 prev = prev_high_signal.get(coin)
                 if prev != final_side:
                     prev_high_signal[coin] = final_side
-                    # build message
                     lines = [f"🚨🚨 高度动向信号：{coin_upper} → {final_side}"]
                     for p in main_periods:
                         ind_ref = period_consistent[p]["exch_inds"]["huobi"]
-                        lines.append(f"{p} | 入场:{format_price(ind_ref['entry'])} 目标:{format_price(target)} 止损:{format_price(stop)} | EMA_trend:{period_consistent[p]['ema_trend']}")
-                        # add per-exchange short lines
-                        for ex in ("huobi","binance","bybit"):
-                            ind = period_consistent[p]["exch_inds"][ex]
-                            lines.append(f"  {ex.upper()} EMA:{[round(x,4) for x in ind['ema_vals']]} MACD:{ind['macd']:.4f} RSI:{ind['rsi']:.2f} WR:{ind['wr']:.2f} VOLΔ:{ind['vol_trend']:.3f}")
-                    # GPT quick analysis from huobi 60min
-                    df_ref = period_results["60min"]["huobi"]
+                        lines.append(f"{p} | 入场:{format_price(ind_ref['entry'])} "
+                                     f"目标:{format_price(target)} 止损:{format_price(stop)} "
+                                     f"| EMA_trend:{period_consistent[p]['ema_trend']}")
+                        # 逐交易所输出：HUOBI / BINANCE / OKX / BYBIT(若有)
+                        for ex in ["huobi","binance","okx","bybit"]:
+                            if ex in period_consistent[p]["exch_inds"]:
+                                ind = period_consistent[p]["exch_inds"][ex]
+                                lines.append(f"  {ex.upper()} EMA:{[round(x,4) for x in ind['ema_vals']]} "
+                                             f"MACD:{ind['macd']:.4f} RSI:{ind['rsi']:.2f} "
+                                             f"WR:{ind['wr']:.2f} VOLΔ:{ind['vol_trend']:.3f}")
+                    # 简短均价提示
+                    df_ref = get_kline_huobi(coin, period="60min")
                     try:
                         from_text = ""
                         if df_ref is not None:
-                            # try include a short GPT style analysis snippet
                             closes = df_ref["close"].tail(50).astype(float).tolist()
                             avg = sum(closes)/len(closes)
                             from_text = f"\n🧠 快速提示: 均价(50):{format_price(avg)}"
                         msg = "\n".join(lines) + from_text
                     except:
                         msg = "\n".join(lines)
+
                     send_telegram_message(msg)
                     log(f"🔥 {coin_upper} 高度动向信息已发送: {final_side}")
                 else:
                     log(f"{coin_upper} 已有相同高度动向({final_side})，跳过重复发送")
-
             else:
-                # 非强信号 — hourly message will show "无一致信号 (监控中)"
                 log(f"{coin_upper} 未满足所有周期一致性（满足周期数 {len(good_periods)}/{len(main_periods)})")
 
-        # 普通信息每小时发送一次（更清楚地说明是“无一致信号”）
+        # 普通信息每小时发送一次
         if last_hour_msg is None or (now - last_hour_msg) >= timedelta(hours=1):
             msg_lines = ["📢 每小时普通信息（仅显示是否有强一致信号）"]
             for coin in main_coins:
@@ -346,7 +395,6 @@ while True:
                 if prev_high_signal.get(coin):
                     status = f"上次高度动向: {prev_high_signal[coin]}"
                 msg_lines.append(f"{coin.upper()}  {status}")
-            # meme coins as well
             for coin in meme_coins:
                 status = prev_high_signal.get(coin) or "无一致信号 (监控中)"
                 msg_lines.append(f"{coin.upper()}  {status}")
