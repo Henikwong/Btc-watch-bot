@@ -309,7 +309,6 @@ while True:
                 h_ind = calc_indicators(huobi_df) if huobi_df is not None else None
                 b_ind = calc_indicators(binance_df) if binance_df is not None else None
                 o_ind = calc_indicators(okx_df) if okx_df is not None else None
-
                 per_period_results[period_label] = {
-                    "huobi_df": huobi_df, "binance_df": binance_df, "okx_df": okx_df,
+                   "huobi_df": huobi_df, "binance_df": binance_df, "okx_df": okx_df,
                     "huobi": h_ind, "binance": b_ind, "okx": o
