@@ -441,3 +441,39 @@ while True:
     except Exception as e:
         log(f"[LOOP ERROR] {e}")
         time.sleep(10)
+        # ====== 新增：指标行情回报 ======
+def build_indicator_report(coin: str, ind: dict, stop: float, target: float):
+    if ind is None:
+        return f"{coin.upper()} 无法计算指标"
+    
+    signal = ind['trend']  # trend 里已有 "多头", "空头", "观望"
+    entry = format_price(ind['entry']) if ind['entry'] else "无"
+    stop_loss = format_price(stop) if stop else "无"
+    take_profit = format_price(target) if target else "无"
+    
+    return (
+        f"📊 {coin.upper()} 指标行情回报\n"
+        f"趋势信号: {signal}\n"
+        f"EMA趋势: {ind['ema_trend']} (5:{format_price(ind['ema_vals'][0])}, "
+        f"10:{format_price(ind['ema_vals'][1])}, 30:{format_price(ind['ema_vals'][2])})\n"
+        f"MACD: {ind['macd']:.4f}\n"
+        f"RSI: {ind['rsi']:.2f}\n"
+        f"WR: {ind['wr']:.2f}\n"
+        f"KDJ(K:{ind['k']:.2f} D:{ind['d']:.2f} J:{ind['j']:.2f}) → {ind['k_trend']}\n"
+        f"成交量趋势: {ind['vol_trend']:.3f}\n"
+        f"入场: {entry}\n"
+        f"目标: {take_profit}\n"
+        f"止损: {stop_loss}"
+    )
+    # === 指标行情回报（所有币，每小时一次） ===
+for coin in coins:
+    ind_ref = per_period_results["60min"]["huobi"] or per_period_results["60min"]["binance"] or per_period_results["60min"]["okx"]
+    if ind_ref:
+        stop, target = compute_stop_target_from_df(
+            per_period_results["60min"]["huobi_df"], 
+            ind_ref["ema_trend"], 
+            ind_ref["entry"]
+        )
+        rep = build_indicator_report(coin, ind_ref, stop, target)
+        send_telegram_message(rep)
+        time.sleep(1)  # 防止TG刷屏限流
