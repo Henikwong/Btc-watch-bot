@@ -147,7 +147,7 @@ def get_kline_bybit(symbol, period="60", limit=200):
         j = r.json()
         if not j or j.get("ret_code") not in (0, None):
             return None
-        res = j.get("result") or j.get("result", [])
+        res = j.get("result") or []
         if not res:
             return None
         df = pd.DataFrame(res)
@@ -216,12 +216,12 @@ def check_large_walls(symbol, threshold=WALL_THRESHOLD):
             continue
     return messages
 
-# ================== SIGNAL CALCULATION (keep your original rules) ==================
+# ================== SIGNAL CALCULATION ==================
 def calc_signal(df):
+    """Return ('做多'|'做空'|None, entry_price)"""
     try:
         if len(df) > 1:
-            df_work = df.copy()
-            df_work = df_work.iloc[:-1].copy()
+            df_work = df.iloc[:-1].copy()  # drop last candle
         else:
             df_work = df.copy()
 
@@ -254,6 +254,7 @@ def calc_signal(df):
     except Exception:
         return None, None
 
+# ================== STOP LOSS / TARGET ==================
 def calc_stop_loss(df, signal, entry, lookback=10):
     try:
         support = float(df["low"].tail(lookback).min())
@@ -268,7 +269,7 @@ def calc_stop_loss(df, signal, entry, lookback=10):
 
 def calc_dynamic_target_by_atr(df, signal, entry):
     try:
-        atr = compute_atr(df, period=14)
+        atr = compute_atr(df)
         if atr is None or entry is None:
             return None, None
         if "多" in signal:
@@ -281,7 +282,7 @@ def calc_dynamic_target_by_atr(df, signal, entry):
     except Exception:
         return None, None
 
-# ================== GPT SIMULATED ANALYSIS (detailed) ==================
+# ================== GPT SIMULATED ANALYSIS ==================
 def gpt_analysis(symbol, df, signal):
     try:
         closes = df["close"].tail(60).astype(float).tolist()
@@ -333,16 +334,10 @@ def gpt_analysis(symbol, df, signal):
         return f"GPT 分析失败: {e}"
 
 # ================== TELEGRAM SENDER ==================
-def send_telegram_message(message):
-    if not TOKEN or not CHAT_ID:
-        print("⚠️ Telegram 配置未设置，无法发送消息。")
-        return False
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+def send_telegram_message(message: str):
     try:
-        data = {"chat_id": CHAT_ID, "text": message}
-        r = requests.post(url, data=data, timeout=15)
-        if r.status_code != 200:
-            print("Telegram 返回:", r.status_code, r.text)
-        else:
-            print("✅ Telegram 已发送消息")
-        return
+        if not TOKEN or not CHAT_ID:
+            print("⚠️ Telegram TOKEN 或 CHAT_ID 未配置")
+            return
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        data = {"chat_id
