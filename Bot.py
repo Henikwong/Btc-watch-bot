@@ -83,7 +83,8 @@ def get_btc_news_sentiment():
 # ================== KLINE FETCHERS ==================
 def get_kline_huobi(symbol, period="60min", size=200):
     try:
-        r = requests.get("https://api.huobi.pro/market/history/kline", params={"symbol": symbol, "period": period, "size": size}, timeout=15)
+        r = requests.get("https://api.huobi.pro/market/history/kline",
+                         params={"symbol": symbol, "period": period, "size": size}, timeout=15)
         j = r.json()
         if not j or "data" not in j:
             return None
@@ -96,7 +97,8 @@ def get_kline_huobi(symbol, period="60min", size=200):
 
 def get_kline_binance(symbol, period="1h", limit=200):
     try:
-        r = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": symbol.upper(), "interval": period, "limit": limit}, timeout=15)
+        r = requests.get("https://api.binance.com/api/v3/klines",
+                         params={"symbol": symbol.upper(), "interval": period, "limit": limit}, timeout=15)
         j = r.json()
         if not isinstance(j, list):
             return None
@@ -111,7 +113,8 @@ def get_kline_binance(symbol, period="1h", limit=200):
 
 def get_kline_bybit(symbol, period="60", limit=200):
     try:
-        r = requests.get("https://api.bybit.com/v2/public/kline/list", params={"symbol": symbol.upper(), "interval": period, "limit": limit}, timeout=15)
+        r = requests.get("https://api.bybit.com/v2/public/kline/list",
+                         params={"symbol": symbol.upper(), "interval": period, "limit": limit}, timeout=15)
         j = r.json()
         if not j or j.get("ret_code") not in (0, None):
             return None
@@ -131,7 +134,8 @@ def get_kline_bybit(symbol, period="60", limit=200):
 # ================== ORDERBOOK / WALLS ==================
 def get_orderbook_binance(symbol):
     try:
-        r = requests.get("https://api.binance.com/api/v3/depth", params={"symbol": symbol.upper(), "limit": 50}, timeout=10)
+        r = requests.get("https://api.binance.com/api/v3/depth",
+                         params={"symbol": symbol.upper(), "limit": 50}, timeout=10)
         j = r.json()
         bids = [(float(p[0]), float(p[1])) for p in j.get("bids", [])]
         asks = [(float(p[0]), float(p[1])) for p in j.get("asks", [])]
@@ -141,7 +145,8 @@ def get_orderbook_binance(symbol):
 
 def get_orderbook_huobi(symbol):
     try:
-        r = requests.get("https://api.huobi.pro/market/depth", params={"symbol": symbol, "type": "step0"}, timeout=10)
+        r = requests.get("https://api.huobi.pro/market/depth",
+                         params={"symbol": symbol, "type": "step0"}, timeout=10)
         j = r.json()
         tick = j.get("tick") or {}
         bids = [(float(p[0]), float(p[1])) for p in tick.get("bids", [])]
@@ -152,7 +157,8 @@ def get_orderbook_huobi(symbol):
 
 def get_orderbook_bybit(symbol):
     try:
-        r = requests.get("https://api.bybit.com/v5/market/orderbook", params={"category":"spot", "symbol":symbol.upper(), "limit":50}, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/orderbook",
+                         params={"category":"spot", "symbol":symbol.upper(), "limit":50}, timeout=10)
         j = r.json()
         if j.get("retCode") != 0:
             return [], []
@@ -185,9 +191,78 @@ def check_large_walls(symbol, threshold=WALL_THRESHOLD):
 def calc_signal(df):
     try:
         df_work = df.iloc[:-1] if len(df) > 1 else df.copy()
-        close, high, low = df_work["close"], df_work["high"], df_work["low"]
+        close = df_work["close"]
+        high = df_work["high"]
+        low = df_work["low"]
 
-        ema5, ema10, ema30 = close.ewm(span=5).mean(), close.ewm(span=10).mean(), close.ewm(span=30).mean()
+        # EMA
+        ema5 = close.ewm(span=5).mean()
+        ema10 = close.ewm(span=10).mean()
+        ema30 = close.ewm(span=30).mean()
+
+        # MACD
         macd_diff = ta.trend.MACD(close).macd_diff()
+
+        # RSI
         rsi = ta.momentum.RSIIndicator(close,14).rsi()
-        st
+
+        # KDJ
+        low_min = low.rolling(9).min()
+        high_max = high.rolling(9).max()
+        rsv = (close - low_min) / (high_max - low_min) * 100
+        k = rsv.ewm(alpha=1/3).mean()
+        d = k.ewm(alpha=1/3).mean()
+        j = 3*k - 2*d
+
+        long_signal = (ema5.iloc[-1] > ema10.iloc[-1] > ema30.iloc[-1]) \
+                      and (macd_diff.iloc[-1] > 0) \
+                      and (rsi.iloc[-1] < 70) \
+                      and (j.iloc[-1] > j.iloc[-2])
+        short_signal = (ema5.iloc[-1] < ema10.iloc[-1] < ema30.iloc[-1]) \
+                       and (macd_diff.iloc[-1] < 0) \
+                       and (rsi.iloc[-1] > 30) \
+                       and (j.iloc[-1] < j.iloc[-2])
+
+        return "做多" if long_signal else "做空" if short_signal else None, float(close.iloc[-1])
+    except Exception as e:
+        print("calc_signal error:", e)
+        return None, None
+
+# ================== STOP LOSS / TARGET ==================
+def calc_stop_loss(df, signal, lookback=10):
+    try:
+        if signal == "做多":
+            return float(df["low"].tail(lookback).min())
+        elif signal == "做空":
+            return float(df["high"].tail(lookback).max())
+    except:
+        return None
+
+def calc_dynamic_target_by_atr(df, signal, entry):
+    try:
+        atr = compute_atr(df)
+        if atr is None or entry is None:
+            return None, None
+        if signal == "做多":
+            target = entry + ATR_MULTIPLIER * atr
+            stop = max(calc_stop_loss(df, signal), entry - ATR_MULTIPLIER * atr)
+        elif signal == "做空":
+            target = entry - ATR_MULTIPLIER * atr
+            stop = min(calc_stop_loss(df, signal), entry + ATR_MULTIPLIER * atr)
+        else:
+            return None, None
+        return float(target), float(stop)
+    except:
+        return None, None
+
+# ================== TELEGRAM SENDER ==================
+def send_telegram_message(msg):
+    try:
+        if not TOKEN or not CHAT_ID:
+            print("⚠️ Telegram TOKEN 或 CHAT_ID 未配置")
+            return
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode":"HTML"}
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print("send_telegram_message error:", e)
