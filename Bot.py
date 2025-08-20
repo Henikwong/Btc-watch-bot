@@ -3,10 +3,13 @@
 # Features:
 # - Multi-exchange Kline (Huobi, Binance, Bybit)
 # - Multi-period signals (60min, 4hour, 1day)
-# - EMA/MACD/RSI/KDJ rules
-# - Support/resistance stop-loss + ATR dynamic target
+# - EMA/MACD/RSI/KDJ rules (kept from original)
+# - Support/resistance stop-loss + ATR dynamic target (new)
 # - News sentiment aggregation (RSS)
-# - Large orderbook wall detection
+# - Large orderbook wall detection across exchanges
+# - 15-minute polling, 1-hour push, 4-hour GPT summary (simulated by default)
+# - Avoid duplicate "strong" alerts; push sudden GPT analysis on signal change
+# - Friendly price formatting for tiny-value memecoins
 # - Telegram push
 
 import os
@@ -19,21 +22,21 @@ import feedparser
 from datetime import datetime, timedelta
 
 # ================== CONFIG (ENV) ==================
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")      # Telegram bot token
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # Telegram chat id
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Optional: if present, can enable actual OpenAI calls (not active by default)
 
 # Polling and timing
 POLL_INTERVAL = 900            # 15 minutes checking
 PUSH_INTERVAL = 3600           # send main pushes every hour
-GPT_SUMMARY_INTERVAL = 4 * 3600
-WALL_THRESHOLD = 5_000_000     # USD
-ATR_MULTIPLIER = 1.5
+GPT_SUMMARY_INTERVAL = 4 * 3600  # every 4 hours send GPT comprehensive analysis
+WALL_THRESHOLD = 5_000_000     # 5M USD large wall threshold (adjustable)
+ATR_MULTIPLIER = 1.5           # ATR multiplier to determine dynamic target distance (can tune)
 
 # ================== SYMBOL LISTS ==================
 main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
 meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
-main_periods = ["60min","4hour","1day"]
+main_periods = ["60min","4hour","1day"]  # used as labels only
 
 # ================== UTILITIES ==================
 def safe_get(df, col):
@@ -43,6 +46,7 @@ def safe_get(df, col):
         return None
 
 def format_price(price: float) -> str:
+    """根据币价范围自动决定小数位；对 None 返回 '-'"""
     try:
         if price is None or (isinstance(price, float) and np.isnan(price)):
             return "-"
@@ -59,6 +63,7 @@ def format_price(price: float) -> str:
         return "-"
 
 def compute_atr(df, period=14):
+    """计算 ATR，返回最后一根 ATR 值；若失败返回 None"""
     try:
         high = df["high"]
         low = df["low"]
@@ -72,7 +77,7 @@ def compute_atr(df, period=14):
     except Exception:
         return None
 
-# ================== NEWS SENTIMENT ==================
+# ================== NEWS SENTIMENT (simple RSS aggregated) ==================
 NEWS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -81,6 +86,7 @@ NEWS_FEEDS = [
 ]
 
 def get_btc_news_sentiment():
+    """简单关键词打分：正/负/中性 -> 1/-1/0"""
     news_titles = []
     for feed in NEWS_FEEDS:
         try:
@@ -141,7 +147,7 @@ def get_kline_bybit(symbol, period="60", limit=200):
         j = r.json()
         if not j or j.get("ret_code") not in (0, None):
             return None
-        res = j.get("result") or []
+        res = j.get("result") or j.get("result", [])
         if not res:
             return None
         df = pd.DataFrame(res)
@@ -210,11 +216,12 @@ def check_large_walls(symbol, threshold=WALL_THRESHOLD):
             continue
     return messages
 
-# ================== SIGNAL CALCULATION ==================
+# ================== SIGNAL CALCULATION (keep your original rules) ==================
 def calc_signal(df):
     try:
         if len(df) > 1:
-            df_work = df.iloc[:-1].copy()
+            df_work = df.copy()
+            df_work = df_work.iloc[:-1].copy()
         else:
             df_work = df.copy()
 
@@ -274,7 +281,7 @@ def calc_dynamic_target_by_atr(df, signal, entry):
     except Exception:
         return None, None
 
-# ================== GPT SIMULATED ANALYSIS ==================
+# ================== GPT SIMULATED ANALYSIS (detailed) ==================
 def gpt_analysis(symbol, df, signal):
     try:
         closes = df["close"].tail(60).astype(float).tolist()
@@ -325,7 +332,7 @@ def gpt_analysis(symbol, df, signal):
     except Exception as e:
         return f"GPT 分析失败: {e}"
 
-# ================== TELEGRAM ==================
+# ================== TELEGRAM SENDER ==================
 def send_telegram_message(message):
     if not TOKEN or not CHAT_ID:
         print("⚠️ Telegram 配置未设置，无法发送消息。")
@@ -338,57 +345,4 @@ def send_telegram_message(message):
             print("Telegram 返回:", r.status_code, r.text)
         else:
             print("✅ Telegram 已发送消息")
-        return True
-    except Exception as e:
-        print("Telegram 发送异常:", e)
-        return False
-
-# ================== MAIN LOOP ==================
-kline_cache = {}
-last_push = datetime.utcnow() - timedelta(seconds=PUSH_INTERVAL)
-last_gpt = datetime.utcnow() - timedelta(seconds=GPT_SUMMARY_INTERVAL)
-sent_strong_signals = set()
-prev_signals = {}
-
-def main_loop():
-    global kline_cache, last_push, last_gpt, sent_strong_signals, prev_signals
-    while True:
-        now = datetime.utcnow()
-        try:
-            coins = main_coins + meme_coins
-            kline_cache = {c: {"60min":{}, "4hour":{}, "1day":{}} for c in coins}
-
-            for coin in coins:
-                # Huobi
-                kline_cache[coin]["60min"]["huobi"] = get_kline_huobi(coin, "60min")
-                kline_cache[coin]["4hour"]["huobi"] = get_kline_huobi(coin, "4hour")
-                kline_cache[coin]["1day"]["huobi"]  = get_kline_huobi(coin, "1day")
-                # Binance
-                kline_cache[coin]["60min"]["binance"] = get_kline_binance(coin, "1h")
-                kline_cache[coin]["4hour"]["binance"] = get_kline_binance(coin, "4h")
-                kline_cache[coin]["1day"]["binance"]  = get_kline_binance(coin, "1d")
-                # Bybit
-                kline_cache[coin]["60min"]["bybit"] = get_kline_bybit(coin, "60")
-                kline_cache[coin]["4hour"]["bybit"] = get_kline_bybit(coin, "240")
-                kline_cache[coin]["1day"]["bybit"]  = get_kline_bybit(coin, "D")
-
-            if (now - last_push).total_seconds() >= PUSH_INTERVAL:
-                messages = []
-                for coin in coins:
-                    period_signals = {}
-                    period_entries = {}
-                    dfs_ref_for_analysis = None
-
-                    for period in main_periods:
-                        signals = []
-                        entries = []
-                        dfs = kline_cache[coin].get(period, {})
-                        for ex, df in dfs.items():
-                            if df is None:
-                                continue
-                            try:
-                                if isinstance(df, pd.DataFrame) and len(df) > 35:
-                                    sig, entry = calc_signal(df)
-                                    if sig:
-                                        signals.append(sig)
-                                        entries.append
+        return
