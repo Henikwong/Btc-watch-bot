@@ -4,104 +4,92 @@ import requests
 import pandas as pd
 import ta
 from datetime import datetime, timedelta
-import pytz
 
-# Telegram 环境变量
+# ================== Telegram ==================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ================== 币种列表 ==================
 coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt",
-         "dogeusdt","trxusdt","adausdt","hypeusdt","linkusdt"]
+         "dogeusdt","trxusdt","adausdt","linkusdt"]
 
-# 存储上一次周线信号，避免重复发
-last_week_signal = {coin: None for coin in coins}
-
-# 获取周线数据
-def get_week_kline(symbol, size=52):  # 默认取过去一年周线
-    url = "https://api.huobi.pro/market/history/kline"
-    params = {"symbol": symbol, "period": "1week", "size": size}
+# ================== 工具函数 ==================
+def format_price(price):
     try:
-        r = requests.get(url, params=params, timeout=10)
-        res = r.json()
-        if "data" not in res or res.get("status") != "ok":
-            print(f"获取 {symbol} 周线失败:", res)
-            return None
-        df = pd.DataFrame(res["data"])
-        df = df.sort_values("id")
-        for col in ['close','open','high','low','vol']:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        print(f"请求 {symbol} 周线异常:", e)
-        return None
+        price = float(price)
+        if price >= 100:
+            return f"{price:.2f}"
+        elif price >= 1:
+            return f"{price:.4f}"
+        elif price >= 0.01:
+            return f"{price:.6f}"
+        else:
+            return f"{price:.8f}"
+    except:
+        return "-"
 
-# 信号判断
-def check_signal(df):
-    close = df['close']
-    high = df['high']
-    low = df['low']
-
-    df['EMA5'] = close.ewm(span=5, adjust=False).mean()
-    df['EMA10'] = close.ewm(span=10, adjust=False).mean()
-    df['EMA30'] = close.ewm(span=30, adjust=False).mean()
-    macd = ta.trend.MACD(close)
-    df['MACD'] = macd.macd_diff()
-    df['RSI'] = ta.momentum.RSIIndicator(close, window=14).rsi()
-    stoch = ta.momentum.StochasticOscillator(high, low, close, window=9, smooth_window=3)
-    df['K'] = stoch.stoch()
-    df['D'] = stoch.stoch_signal()
-    df['J'] = 3*df['K'] - 2*df['D']
-    df['WR'] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
-
-    latest = df.iloc[-1]
-    price = latest['close']
-
-    long_signal = (latest['EMA5'] > latest['EMA10'] > latest['EMA30']) and (latest['MACD'] > 0) and (latest['RSI'] < 70)
-    short_signal = (latest['EMA5'] < latest['EMA10'] < latest['EMA30']) and (latest['MACD'] < 0) and (latest['RSI'] > 30)
-
-    if long_signal:
-        return "做多", price, price*1.05  # 止盈 5%
-    elif short_signal:
-        return "做空", price, price*0.95  # 止盈 5%
-    else:
-        return "观望", price, price
-
-# 发送 Telegram 消息
 def send_telegram_message(message):
     if TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": message}
         try:
-            r = requests.post(url, data=data)
-            print(f"消息发送状态: {r.status_code}")
+            requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+            print("✅ Telegram 已发送")
         except Exception as e:
-            print("发送消息失败:", e)
+            print("❌ Telegram 发送失败:", e)
 
-# 主循环：每天美国时间9点推送
-while True:
-    # 获取美国东部时间
-    tz = pytz.timezone("US/Eastern")
-    now = datetime.now(tz)
+# ================== K线获取 ==================
+def get_kline_huobi(symbol, period="60min", size=50):
+    url = "https://api.huobi.pro/market/history/kline"
+    try:
+        r = requests.get(url, params={"symbol": symbol, "period": period, "size": size}, timeout=10)
+        res = r.json()
+        if "data" not in res or res.get("status") != "ok":
+            print(f"获取 {symbol} {period} K线失败:", res)
+            return None
+        df = pd.DataFrame(res["data"]).sort_values("id")
+        for col in ['open','high','low','close','vol']:
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        print(f"请求 {symbol} K线异常:", e)
+        return None
 
-    # 判断是否是周一~周日9点整（可调整到每天9点）
-    if now.hour == 9 and now.minute == 0:
-        messages = []
-        for coin in coins:
-            df = get_week_kline(coin)
-            if df is None:
-                continue
-            signal, buy_price, sell_price = check_signal(df)
-            # 只有信号变化才发送
-            if signal != last_week_signal[coin]:
-                last_week_signal[coin] = signal
-            messages.append(f"{coin.upper()} 周线: {signal}\n买入价: {buy_price:.4f}\n卖出价: {sell_price:.4f}")
+# ================== 信号计算 ==================
+def calc_signal(df):
+    close = df['close']
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ema10 = close.ewm(span=10, adjust=False).mean()
+    latest = df.iloc[-1]
 
-        # 整合消息一次性发送
-        if messages:
-            send_telegram_message("\n\n".join(messages))
-
-        # 等 61 秒，避免重复触发
-        time.sleep(61)
+    # 简化信号：只看 EMA5 与 EMA10
+    if ema5.iloc[-1] > ema10.iloc[-1]:
+        return "做多", latest['close']
+    elif ema5.iloc[-1] < ema10.iloc[-1]:
+        return "做空", latest['close']
     else:
-        # 每分钟检查一次时间
-        time.sleep(60)
+        return "观望", latest['close']
+
+# ================== 主循环 ==================
+last_signals = {coin: None for coin in coins}
+
+while True:
+    messages = []
+    for coin in coins:
+        df = get_kline_huobi(coin, period="60min", size=50)
+        if df is None or df.empty:
+            continue
+        signal, price = calc_signal(df)
+        # 打印调试信息
+        print(f"{datetime.utcnow()} | {coin} 信号: {signal}, 当前价: {format_price(price)}")
+
+        # 只有信号变化才发送 Telegram
+        if signal != last_signals[coin]:
+            last_signals[coin] = signal
+            msg = f"📊 {coin.upper()} 当前信号: {signal}\n当前价格: {format_price(price)}"
+            messages.append(msg)
+
+    if messages:
+        send_telegram_message("\n\n".join(messages))
+
+    # 每分钟循环一次
+    time.sleep(60)
