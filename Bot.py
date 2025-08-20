@@ -299,6 +299,47 @@ def build_consistency_block(coin_upper, side, entry, target, stop, consistent_co
                 f"止损: {stop_s}\n"
                 f"一致性: 1/3 周期")
 
+# ====== 新增：指标行情回报 ======
+def build_indicator_report(coin: str, ind: dict, stop: float, target: float):
+    """
+    为单个币生成一条指标行情回报文本（📊）。
+    不改变其它逻辑：如果 ind 中没有 'trend' 字段，会以 ema_trend 推断：ema_trend == '中性' -> '观望'，否则 '多头'/'空头'。
+    """
+    if ind is None:
+        return f"{coin.upper()} 无法计算指标"
+
+    # 尽量不修改原 ind：若用户已有 trend 字段则使用，否则根据 ema_trend 推断
+    if "trend" in ind:
+        signal = ind.get("trend", "观望")
+    else:
+        et = ind.get("ema_trend", "中性")
+        if et == "中性":
+            signal = "观望"
+        elif et == "多":
+            signal = "多头"
+        else:
+            signal = "空头"
+
+    entry = format_price(ind.get("entry"))
+    stop_loss = format_price(stop) if stop is not None else "无"
+    take_profit = format_price(target) if target is not None else "无"
+    ema_vals = ind.get("ema_vals", [None, None, None])
+
+    # 文本构造（简洁且包含你要的全部指标）
+    txt = (
+        f"📊 {coin.upper()} 指标行情回报\n"
+        f"趋势信号: {signal}\n"
+        f"EMA趋势: {ind.get('ema_trend','-')} (5:{format_price(ema_vals[0])}, 10:{format_price(ema_vals[1])}, 30:{format_price(ema_vals[2])})\n"
+        f"MACD(diff): {ind.get('macd',0):.4f}\n"
+        f"RSI: {ind.get('rsi',0):.2f}  WR: {ind.get('wr',0):.2f}\n"
+        f"KDJ: K:{ind.get('k',0):.2f} D:{ind.get('d',0):.2f} J:{ind.get('j',0):.2f} → {ind.get('k_trend','-')}\n"
+        f"成交量变化率 (近两根): {ind.get('vol_trend',0):.3f}\n"
+        f"入场: {entry}\n"
+        f"目标: {take_profit}\n"
+        f"止损: {stop_loss}"
+    )
+    return txt
+
 # ====== 主循环 ======
 prev_high_signal = {}    # 保存最近一次已发的高度动向，避免重复
 last_hour_msg = None
@@ -430,50 +471,4 @@ while True:
             # compose hourly message: first the blocks for 3/2/1 that we appended earlier (they follow the templates)
             # plus the snapshots
             # ensure not to exceed Telegram message size: join and send
-            msg_text = "\n\n".join(hourly_report_lines)
-            send_telegram_message(msg_text)
-            last_hour_msg = now
-            log("📢 每小时普通信息 已发送")
-
-        # 间隔
-        time.sleep(POLL_INTERVAL)
-
-    except Exception as e:
-        log(f"[LOOP ERROR] {e}")
-        time.sleep(10)
-        # ====== 新增：指标行情回报 ======
-def build_indicator_report(coin: str, ind: dict, stop: float, target: float):
-    if ind is None:
-        return f"{coin.upper()} 无法计算指标"
-    
-    signal = ind['trend']  # trend 里已有 "多头", "空头", "观望"
-    entry = format_price(ind['entry']) if ind['entry'] else "无"
-    stop_loss = format_price(stop) if stop else "无"
-    take_profit = format_price(target) if target else "无"
-    
-    return (
-        f"📊 {coin.upper()} 指标行情回报\n"
-        f"趋势信号: {signal}\n"
-        f"EMA趋势: {ind['ema_trend']} (5:{format_price(ind['ema_vals'][0])}, "
-        f"10:{format_price(ind['ema_vals'][1])}, 30:{format_price(ind['ema_vals'][2])})\n"
-        f"MACD: {ind['macd']:.4f}\n"
-        f"RSI: {ind['rsi']:.2f}\n"
-        f"WR: {ind['wr']:.2f}\n"
-        f"KDJ(K:{ind['k']:.2f} D:{ind['d']:.2f} J:{ind['j']:.2f}) → {ind['k_trend']}\n"
-        f"成交量趋势: {ind['vol_trend']:.3f}\n"
-        f"入场: {entry}\n"
-        f"目标: {take_profit}\n"
-        f"止损: {stop_loss}"
-    )
-    # === 指标行情回报（所有币，每小时一次） ===
-for coin in coins:
-    ind_ref = per_period_results["60min"]["huobi"] or per_period_results["60min"]["binance"] or per_period_results["60min"]["okx"]
-    if ind_ref:
-        stop, target = compute_stop_target_from_df(
-            per_period_results["60min"]["huobi_df"], 
-            ind_ref["ema_trend"], 
-            ind_ref["entry"]
-        )
-        rep = build_indicator_report(coin, ind_ref, stop, target)
-        send_telegram_message(rep)
-        time.sleep(1)  # 防止TG刷屏限流
+            msg_text 
