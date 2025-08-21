@@ -1,305 +1,326 @@
 # autotrader.py
-import os, time, math, json, requests, joblib, warnings
-import numpy as np
+# 三确认（≥3/4 周期）才下单 + 多指标同向确认 + Telegram 推送 + ccxt 实盘/纸面切换
+# 支持：huobi / binance / okx （默认现货，MARKET_TYPE=swap 时尝试合约）
+# 周期：1h, 4h, 1d, 1w；满足 >=3 个周期同方向 -> 触发下单
+# 指标：EMA(5/10/30)趋势、MACD hist、RSI(14)、WR(14)、K/D(金叉/死叉)、VOL变化、ATR止损止盈
+
+import os, time, math, traceback
+import ccxt
+import requests
 import pandas as pd
-import pandas_ta as ta
-from datetime import datetime, timedelta
-from collections import deque
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+import numpy as np
+import ta
+from datetime import datetime
 from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore")
 load_dotenv()
 
-# ===== 配置 =====
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")         # 可留空，本地仅打印
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))   # 轮询间隔(秒)
-ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
-RSI_THRESHOLD = 5
-WR_THRESHOLD  = 5
-VOL_REL_THRESHOLD = 0.20
-MAX_POS_USDT = float(os.getenv("MAX_POS_USDT","300"))   # 单币最大名义
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN","15"))      # 触发后冷却(分钟)
-MODEL_PATH   = os.getenv("MODEL_PATH","model.pkl")      # 可选 AI 模型
+# ========== ENV ==========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS = ["BTCUSDT","ETHUSDT","LTCUSDT"]
-# 周期映射（用 binance 免费行情做示例；换交易所只改获取函数）
-PERIODS = {"1h":"1h", "4h":"4h", "1d":"1d", "1w":"1w"}   # 监控 1h/4h/1d/1w
+EXCHANGE_NAME = os.getenv("EXCHANGE", "huobi").lower()   # huobi/binance/okx
+API_KEY   = os.getenv("API_KEY", "")
+API_SECRET= os.getenv("API_SECRET", "")
 
-# ===== 简易工具 =====
+MARKET_TYPE = os.getenv("MARKET_TYPE", "spot").lower()   # spot / swap
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,LTC/USDT").split(",") if s.strip()]
+
+BASE_USDT = float(os.getenv("BASE_USDT", "100"))
+ATR_MULT  = float(os.getenv("RISK_ATR_MULT", "1.5"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+LIVE_TRADE = int(os.getenv("LIVE_TRADE", "0"))
+
+# 周期与 ccxt interval 映射
+PERIODS = {
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1d",
+    "1w": "1w",
+}
+REQUIRED_CONFIRMS = 3  # 4 个周期中至少 3 个同向
+
+def nowstr():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 def log(msg):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}")
+    print(f"[{nowstr()}] {msg}", flush=True)
 
-def fmt(p):
+def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        log(f"TG发送失败: {e}")
+
+def build_exchange():
+    # 统一用 enableRateLimit，走 API KEY
+    params = {"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True}
+    if EXCHANGE_NAME == "huobi":
+        ex = ccxt.huobi(params)
+    elif EXCHANGE_NAME == "binance":
+        ex = ccxt.binance(params)
+    elif EXCHANGE_NAME == "okx":
+        ex = ccxt.okx(params)
+    else:
+        raise ValueError("EXCHANGE 仅支持 huobi/binance/okx")
+    # 选择衍生品/现货市场
+    if MARKET_TYPE == "swap" and hasattr(ex, "options"):
+        # 对支持的交易所启用合约市场（不同交易所有不同配置；ccxt 会自动切换）
+        try:
+            ex.options["defaultType"] = "swap"
+            if hasattr(ex, "set_sandbox_mode"):
+                # 你可以根据需要开启沙盒
+                pass
+        except Exception:
+            pass
+    return ex
+
+def fetch_ohlcv(ex, symbol, timeframe="1h", limit=200):
+    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+def df_from_ohlcv(ohlcv):
+    # ohlcv: [ts, open, high, low, close, volume]
+    cols = ["ts","open","high","low","close","vol"]
+    df = pd.DataFrame(ohlcv, columns=cols)
+    for c in ["open","high","low","close","vol"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def compute_atr(df, period=14):
+    try:
+        high = df["high"]; low = df["low"]; close = df["close"]
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        return float(atr.iloc[-1])
+    except Exception:
+        return None
+
+def indicators_and_side(df):
+    """
+    返回 (side, details)
+    side: "多"/"空"/None
+    details: dict(ema_trend, macd, rsi, wr, k_trend, vol_trend, entry)
+    """
+    if df is None or len(df) < 35:
+        return None, None
+    work = df.copy().iloc[:-1]  # 丢掉未收盘
+    close = work["close"].astype(float)
+    high  = work["high"].astype(float)
+    low   = work["low"].astype(float)
+    vol   = work["vol"].astype(float)
+
+    ema5  = close.ewm(span=5).mean().iloc[-1]
+    ema10 = close.ewm(span=10).mean().iloc[-1]
+    ema30 = close.ewm(span=30).mean().iloc[-1]
+    ema_trend = "多" if (ema5>ema10 and ema10>ema30) else ("空" if (ema5<ema10 and ema10<ema30) else "中性")
+
+    macd_hist = ta.trend.MACD(close).macd_diff().iloc[-1]     # >0 多，<0 空
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]  # >50 多，<50 空
+    wr  = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r().iloc[-1]  # >-50 偏多，<-50 偏空
+    stoch = ta.momentum.StochasticOscillator(high, low, close, window=9, smooth_window=3)
+    k_val = stoch.stoch().iloc[-1]; d_val = stoch.stoch_signal().iloc[-1]
+    k_trend = "多" if k_val>d_val else ("空" if k_val<d_val else "中性")
+
+    vol_trend = (vol.iloc[-1] - vol.iloc[-2]) / (vol.iloc[-2] + 1e-12)  # 成交量相对变化
+
+    # 条件同向计分（严格一点提升“准度”）
+    score_bull = 0
+    score_bear = 0
+    score_bull += 1 if ema_trend=="多" else 0
+    score_bear += 1 if ema_trend=="空" else 0
+    score_bull += 1 if macd_hist>0 else 0
+    score_bear += 1 if macd_hist<0 else 0
+    score_bull += 1 if rsi>50 else 0
+    score_bear += 1 if rsi<50 else 0
+    score_bull += 1 if wr>-50 else 0
+    score_bear += 1 if wr<-50 else 0
+    score_bull += 1 if k_trend=="多" else 0
+    score_bear += 1 if k_trend=="空" else 0
+    # 成交量：上涨更偏多，下降更偏空（不强制，但作为加分项）
+    if vol_trend>0: score_bull += 1
+    if vol_trend<0: score_bear += 1
+
+    # 需要至少 4 项同向才判定该周期方向（避免噪音）
+    side = None
+    if score_bull >= 4 and score_bull >= score_bear+2:
+        side = "多"
+    elif score_bear >= 4 and score_bear >= score_bull+2:
+        side = "空"
+
+    details = {
+        "ema_trend": ema_trend,
+        "ema_vals": [float(ema5), float(ema10), float(ema30)],
+        "macd": float(macd_hist),
+        "rsi": float(rsi),
+        "wr": float(wr),
+        "k_trend": k_trend,
+        "vol_trend": float(vol_trend),
+        "entry": float(close.iloc[-1]),
+    }
+    return side, details
+
+def calc_stop_target(df, side, entry):
+    atr = compute_atr(df)
+    if atr is None: return None, None
+    if side=="多":
+        return entry - ATR_MULT*atr, entry + ATR_MULT*atr
+    else:
+        return entry + ATR_MULT*atr, entry - ATR_MULT*atr
+
+def format_price(p):
     try:
         p = float(p)
         if p >= 100: return f"{p:.2f}"
         if p >= 1:   return f"{p:.4f}"
         if p >= 0.01:return f"{p:.6f}"
         return f"{p:.8f}"
-    except: return "-"
+    except:
+        return "-"
 
-def tg(text):
-    if not TOKEN or not CHAT_ID:
-        log("TG未配置，打印代替：\n"+text)
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-        if r.status_code == 200: log("✅ TG已发")
-        else: log(f"⚠️ TG错误 {r.status_code}: {r.text}")
-    except Exception as e:
-        log(f"❌ TG异常: {e}")
+def tier_color_text(cons):
+    # cons: 一致个数
+    if cons >= 3:
+        return "🟢 强（3+/4）"
+    elif cons == 2:
+        return "🟡 中（2/4）"
+    elif cons == 1:
+        return "🔴 弱（1/4）"
+    else:
+        return "⚪ 无（0/4）"
 
-# ===== 行情（示例：Binance 公共K线）=====
-def get_binance_klines(symbol, interval="1h", limit=300):
-    url = "https://api.binance.com/api/v3/klines"
-    sym = symbol.upper()
+def place_order(ex, symbol, side, entry, stop, target):
+    """
+    以 BASE_USDT / entry 计算数量，市价单。
+    LIVE_TRADE=0 时仅打印，不下单。
+    """
+    qty = max(1e-8, BASE_USDT / max(entry, 1e-8))
+    order_side = "buy" if side=="多" else "sell"
+    if LIVE_TRADE != 1:
+        log(f"[纸面单] {symbol} {side} 市价数量≈{qty}")
+        return {"id":"paper", "status":"simulated", "side":order_side, "amount":qty}
+
+    # 真下单
     try:
-        r = requests.get(url, params={"symbol": sym, "interval": interval, "limit": limit}, timeout=10)
-        j = r.json()
-        if not isinstance(j, list): return None
-        df = pd.DataFrame(j, columns=[
-            "open_time","open","high","low","close","volume","close_time","q1","q2","q3","q4","q5"
-        ])
-        for c in ["open","high","low","close","volume"]:
-            df[c] = df[c].astype(float)
-        df = df[["open","high","low","close","volume"]]
-        return df
+        # 现货市价
+        if MARKET_TYPE == "spot":
+            o = ex.create_order(symbol, type="market", side=order_side, amount=qty)
+        else:
+            # 合约：不同交易所可能需要额外参数；这里用最通用的 create_order
+            # 有些交易所需 symbol 形如 BTC/USDT:USDT 或不同命名，若报错请调整 SYMBOLS 或用 ex.load_markets() 查看
+            o = ex.create_order(symbol, type="market", side=order_side, amount=qty)
+        log(f"[下单成功] {o}")
+        return o
     except Exception as e:
-        log(f"[行情ERR]{symbol} {interval} {e}")
+        log(f"[下单失败] {e}")
         return None
 
-# ===== 指标 + 特征 =====
-def compute_indicators(df: pd.DataFrame):
-    if df is None or len(df) < 80: return None
-    work = df.copy().iloc[:-1]  # 舍弃未收K
-    close, high, low, vol = work["close"], work["high"], work["low"], work["volume"]
+def summarize_details(tf, side, det):
+    return (f"{tf} | 方向:{side or '无'}  入场:{format_price(det['entry']) if det else '-'} | "
+            f"EMA趋势:{det['ema_trend'] if det else '-'}  MACD:{det['macd'] if det else '-'}  "
+            f"RSI:{det['rsi'] if det else '-'}  WR:{det['wr'] if det else '-'}  "
+            f"KDJ:{det['k_trend'] if det else '-'}  VOLΔ:{round(det['vol_trend'],3) if det else '-'}")
 
-    ema5  = ta.ema(close, length=5).iloc[-1]
-    ema10 = ta.ema(close, length=10).iloc[-1]
-    ema30 = ta.ema(close, length=30).iloc[-1]
-    ma20  = ta.sma(close, length=20).iloc[-1]
+def main():
+    ex = build_exchange()
+    log(f"启动交易Bot | EXCHANGE={EXCHANGE_NAME} MARKET_TYPE={MARKET_TYPE} LIVE_TRADE={LIVE_TRADE} POLL={POLL_INTERVAL}s")
+    tg_send(f"🤖 交易Bot已启动：{EXCHANGE_NAME} / {MARKET_TYPE} / 轮询{POLL_INTERVAL}s / 纸面={1 if LIVE_TRADE!=1 else 0}")
 
-    macd = ta.macd(close)
-    macd_hist = macd["MACDh_12_26_9"].iloc[-1]
+    last_hourly_push_ts = 0
 
-    rsi = ta.rsi(close, length=14).iloc[-1]
-    wr  = ta.willr(high, low, close, length=14).iloc[-1]
+    while True:
+        loop_start = time.time()
+        try:
+            ex.load_markets()
 
-    stoch = ta.stoch(high, low, close, k=9, d=3, smooth_k=3)
-    k_val = stoch["STOCHk_9_3_3"].iloc[-1]
-    d_val = stoch["STOCHd_9_3_3"].iloc[-1]
+            for symbol in SYMBOLS:
+                sides = []
+                details_map = {}
 
-    vol_trend = (vol.iloc[-1] - vol.iloc[-2]) / (vol.iloc[-2] + 1e-12)
+                # 逐周期拉K并判定
+                for tf in ["1h","4h","1d","1w"]:
+                    try:
+                        ohlcv = fetch_ohlcv(ex, symbol, timeframe=PERIODS[tf], limit=200)
+                        df = df_from_ohlcv(ohlcv)
+                        side, det = indicators_and_side(df)
+                        details_map[tf] = (side, det, df)
+                        sides.append(side)
+                        log(summarize_details(tf, side, det))
+                    except Exception as e_tf:
+                        log(f"{symbol} {tf} 获取/指标失败: {e_tf}")
+                        details_map[tf] = (None, None, None)
 
-    ema_trend = "多" if (ema5>ema10>ema30) else ("空" if (ema5<ema10<ema30) else "中性")
-    k_trend = "多" if k_val>d_val else ("空" if k_val<d_val else "中性")
+                # 统计方向一致性
+                bull = sum(1 for s in sides if s=="多")
+                bear = sum(1 for s in sides if s=="空")
+                final_side = None
+                confirms = 0
+                if bull >= REQUIRED_CONFIRMS and bull > bear:
+                    final_side = "多"; confirms = bull
+                elif bear >= REQUIRED_CONFIRMS and bear > bull:
+                    final_side = "空"; confirms = bear
 
-    atr = ta.atr(high, low, close, length=14).iloc[-1]
-    entry = close.iloc[-1]
+                # 每小时汇总推送（含强/中/弱评级）
+                now_ts = int(time.time())
+                if now_ts - last_hourly_push_ts >= 3600:
+                    grade = tier_color_text(max(bull, bear))
+                    lines = [f"⏰ 每小时汇总 [{symbol}] 评级: {grade}（多:{bull} 空:{bear}）"]
+                    for tf in ["1h","4h","1d","1w"]:
+                        s, det, _ = details_map[tf]
+                        lines.append(summarize_details(tf, s, det))
+                    tg_send("\n".join(lines))
+                    last_hourly_push_ts = now_ts
 
-    feats = {
-        "ema5":float(ema5),"ema10":float(ema10),"ema30":float(ema30),"ma20":float(ma20),
-        "macd_hist":float(macd_hist),"rsi":float(rsi),"wr":float(wr),
-        "k":float(k_val),"d":float(d_val),"vol_chg":float(vol_trend),
-        "ema_trend":ema_trend,"k_trend":k_trend,"atr":float(atr),"entry":float(entry)
-    }
-    return feats
+                # 三确认才下单（突发）
+                if final_side is not None:
+                    # 用 1h 的 df 做 ATR（更灵敏），并拿 1h 的 entry
+                    s1h, d1h, df1h = details_map["1h"]
+                    if d1h and df1h is not None:
+                        entry = d1h["entry"]
+                        stop, target = calc_stop_target(df1h, final_side, entry)
+                        if stop is None or target is None:
+                            log(f"{symbol} 无法计算ATR止盈止损，跳过下单")
+                            continue
 
-def atr_stop_target(side, entry, atr, mult=ATR_MULT):
-    if atr is None or np.isnan(atr): return None, None
-    if side=="多":
-        return entry - mult*atr, entry + mult*atr
-    else:
-        return entry + mult*atr, entry - mult*atr
+                        # 额外的“所有条件满足”强劲突发（KDJ/EMA/MACD/RSI/WR/VOL 同向）
+                        strong = False
+                        if s1h == final_side:
+                            det = d1h
+                            conds_ok = [
+                                (det["ema_trend"] == ("多" if final_side=="多" else "空")),
+                                ((det["macd"]>0) if final_side=="多" else (det["macd"]<0)),
+                                ((det["rsi"]>50) if final_side=="多" else (det["rsi"]<50)),
+                                ((det["wr"]>-50) if final_side=="多" else (det["wr"]<-50)),
+                                ((det["k_trend"]=="多") if final_side=="多" else (det["k_trend"]=="空")),
+                                ((det["vol_trend"]>0) if final_side=="多" else (det["vol_trend"]<0)),
+                            ]
+                            strong = all(conds_ok)
 
-# ======= AI/规则判定 =======
-def rule_all_strong_long(f):
-    ok = []
-    ok.append(f["ema_trend"]=="多")
-    ok.append(f["ma20"]<f["entry"] and f["ema10"]>f["ema30"])
-    ok.append(f["macd_hist"]>0)
-    ok.append(f["vol_chg"]>0)             # 成交量放大
-    ok.append(f["k"]>f["d"])              # KDJ 同向
-    ok.append(f["rsi"]>=50)               # RSI 偏多
-    ok.append(f["wr"]>-50)                # WR 上半区
-    return all(ok)
+                        # 下单
+                        o = place_order(ex, symbol, final_side, entry, stop, target)
 
-def rule_all_strong_short(f):
-    ok = []
-    ok.append(f["ema_trend"]=="空")
-    ok.append(f["ma20"]>f["entry"] and f["ema10"]<f["ema30"])
-    ok.append(f["macd_hist"]<0)
-    ok.append(f["vol_chg"]<0)
-    ok.append(f["k"]<f["d"])
-    ok.append(f["rsi"]<=50)
-    ok.append(f["wr"]<-50)
-    return all(ok)
+                        msg = []
+                        if strong:
+                            msg.append("🔥🔥🔥 强烈高度动向捕捉到（满足所有条件）")
+                        else:
+                            msg.append("⚡ 三确认触发下单")
+                        msg.append(f"{symbol} 做{'多' if final_side=='多' else '空'}")
+                        msg.append(f"入场: {format_price(entry)}  目标: {format_price(target)}  止损: {format_price(stop)}")
+                        msg.append(f"一致性: {max(bull,bear)}/4 周期")
+                        tg_send("\n".join(msg))
 
-# 可选：AI 模型（如果 model.pkl 存在，用它做概率打分；否则用规则）
-clf = None
-if os.path.exists(MODEL_PATH):
-    try:
-        clf = joblib.load(MODEL_PATH)
-        log("🎯 已加载AI模型")
-    except Exception as e:
-        log(f"AI模型加载失败：{e}")
-        clf = None
+        except Exception as e:
+            log(f"[主循环异常] {e}\n{traceback.format_exc()}")
 
-def ai_direction_score(feature_dict):
-    # 返回 (p_long, p_short)
-    if clf is None:
-        # 规则回退：给个简单分
-        p_long  = 1.0 if rule_all_strong_long(feature_dict) else 0.3
-        p_short = 1.0 if rule_all_strong_short(feature_dict) else 0.3
-        return p_long, p_short
-    cols = ["ema5","ema10","ema30","ma20","macd_hist","rsi","wr","k","d","vol_chg"]
-    x = np.array([[feature_dict[c] for c in cols]], dtype=float)
-    proba = clf.predict_proba(x)[0]  # 假设 0=空仓/1=做多/2=做空（训练时自己定义）
-    # 如果你训练的是二分类，按你的顺序调整
-    p_long  = float(proba[1]) if len(proba)>=2 else 0.5
-    p_short = float(proba[2]) if len(proba)>=3 else 0.5
-    return p_long, p_short
+        # 快速轮询
+        used = time.time() - loop_start
+        sleep_s = max(1, POLL_INTERVAL - int(used))
+        time.sleep(sleep_s)
 
-# ===== 执行层：先用 PaperBroker，接口与实盘一致 =====
-class PaperBroker:
-    def __init__(self):
-        self.pos = {}  # symbol -> {"side":"多/空", "qty": float, "entry": float}
-        self.last_ts = {}  # 冷却
-    def can_trade(self, symbol):
-        t = self.last_ts.get(symbol)
-        return (t is None) or (datetime.now()-t >= timedelta(minutes=COOLDOWN_MIN))
-    def size_by_usdt(self, symbol, price):
-        # 极简：名义=MAX_POS_USDT，合约张数按名义/price
-        qty = MAX_POS_USDT / max(price,1e-9)
-        return round(qty, 4)
-    def open(self, symbol, side, price, stop, target):
-        if not self.can_trade(symbol):
-            return False, "冷却中"
-        qty = self.size_by_usdt(symbol, price)
-        self.pos[symbol] = {"side":side, "qty":qty, "entry":price, "stop":stop, "target":target}
-        self.last_ts[symbol] = datetime.now()
-        return True, f"OPEN {symbol} {side} qty={qty} entry={fmt(price)} SL={fmt(stop)} TP={fmt(target)}"
-    def close(self, symbol, reason):
-        if symbol in self.pos:
-            p = self.pos.pop(symbol)
-            return True, f"CLOSE {symbol} {p['side']} qty={p['qty']} ({reason})"
-        return False, "NO POS"
-    # 火币实盘时：实现 place_order/cancel/get_position 等方法，保持同名签名即可
-
-BROKER = PaperBroker()
-
-# ===== 监控主循环 =====
-last_hour_report = None
-strong_last_sent = {}  # 记录上次突发侧别，避免刷屏
-rolling_cache = {s:{k:deque(maxlen=1) for k in PERIODS} for s in SYMBOLS}
-
-def color_tag(cons_ok_count):
-    if cons_ok_count>=3: return "🟩(强)"
-    if cons_ok_count==2: return "🟨(中)"
-    return "🟥(弱)"
-
-def period_check(symbol, period):
-    df = get_binance_klines(symbol, interval=PERIODS[period], limit=240)
-    feats = compute_indicators(df)
-    return feats
-
-def format_signal_block(symbol, side, entry, stop, target, ok_cnt):
-    head = "⚠️ {} 做{}信号".format(symbol, "多" if side=="多" else "空")
-    return (f"{head}\n入场: {fmt(entry)}\n目标: {fmt(target)}\n止损: {fmt(stop)}\n\n"
-            f"⚡ 一致性: {ok_cnt}/3 周期 {color_tag(ok_cnt)}")
-
-def try_fire_breaking(symbol, multi_feats, final_side):
-    # 全部条件满足 → 突发
-    f1, f4, fD = multi_feats["1h"], multi_feats["4h"], multi_feats["1d"]
-    checks = []
-    if final_side=="多":
-        checks += [rule_all_strong_long(f1), rule_all_strong_long(f4), rule_all_strong_long(fD)]
-    else:
-        checks += [rule_all_strong_short(f1), rule_all_strong_short(f4), rule_all_strong_short(fD)]
-
-    if all(checks):
-        if strong_last_sent.get(symbol)!=final_side:
-            strong_last_sent[symbol]=final_side
-            stop, target = atr_stop_target(final_side, f1["entry"], f1["atr"], ATR_MULT)
-            msg = (f"🔥🔥🔥 强烈高度动向捕捉到（满足所有条件）\n"
-                   f"⚠️ {symbol} 做{final_side}信号\n入场: {fmt(f1['entry'])}\n目标: {fmt(target)}\n止损: {fmt(stop)}\n"
-                   f"⚡ 一致性: 3/3 周期")
-            tg(msg)
-
-def hourly_report(all_results):
-    lines = ["📢 每小时回报（按 1h/4h/1d/1w 指标 & 一致性分级）"]
-    for sym, res in all_results.items():
-        ok_cnt = res["ok_cnt"]
-        side   = res["side"]
-        entry  = res["entry"]; stop=res["stop"]; target=res["target"]
-        lines.append(format_signal_block(sym, side, entry, stop, target, ok_cnt))
-        # 把关键指标也列一下（你要的 EMA/MACD/RSI/WR/VOL）
-        for p in ["1h","4h","1d","1w"]:
-            f = res["feats"][p]
-            lines.append(f"{sym} {p} | EMA:{fmt(f['ema5'])}/{fmt(f['ema10'])}/{fmt(f['ema30'])} "
-                        f"MACDhist:{fmt(f['macd_hist'])} RSI:{fmt(f['rsi'])} WR:{fmt(f['wr'])} VOLΔ:{fmt(f['vol_chg'])}")
-        lines.append("-"*20)
-    tg("\n".join(lines))
-
-log(f"启动 AI 自动合约监控（每{POLL_INTERVAL}s 轮询；每小时汇总）")
-while True:
-    try:
-        now = datetime.now()
-        summary = {}
-
-        for sym in SYMBOLS:
-            feats_multi = {}
-            # 多周期抓取
-            for p in ["1h","4h","1d","1w"]:
-                f = period_check(sym, p)
-                if f is None: break
-                feats_multi[p] = f
-            if len(feats_multi)!=4:
-                log(f"{sym} 周期数据不足，跳过")
-                continue
-
-            # 以 1h 为入场，4h/1d 做一致性，1w 参考权重
-            f1,f4,fD,fW = feats_multi["1h"], feats_multi["4h"], feats_multi["1d"], feats_multi["1w"]
-
-            # AI 概率（可选）
-            pL1,pS1 = ai_direction_score(f1)
-            # 简单一致性：三周期同向计数
-            dir_1h = "多" if pL1>pS1 else "空"
-            dir_4h = "多" if f4["ema_trend"]=="多" else ("空" if f4["ema_trend"]=="空" else "中性")
-            dir_1d = "多" if fD["ema_trend"]=="多" else ("空" if fD["ema_trend"]=="空" else "中性")
-            consensus = [dir_1h, dir_4h, dir_1d]
-            side = "多" if consensus.count("多")>=2 else ("空" if consensus.count("空")>=2 else ("多" if dir_1h=="多" else "空"))
-            ok_cnt = max(consensus.count("多"), consensus.count("空"))
-
-            stop, target = atr_stop_target(side, f1["entry"], f1["atr"], ATR_MULT)
-
-            # 突发（所有条件都满足）
-            try_fire_breaking(sym, feats_multi, side)
-
-            # 如需自动开仓（纸交易）
-            if BROKER.can_trade(sym):
-                opened, info = BROKER.open(sym, side, f1["entry"], stop, target)
-                log(info)
-
-            summary[sym] = {
-                "side": side, "ok_cnt": ok_cnt, "entry": f1["entry"],
-                "stop": stop, "target": target, "feats": feats_multi
-            }
-
-        # 每小时汇总（你要的“每小时才回报”）
-        if (last_hour_report is None) or (now - last_hour_report >= timedelta(hours=1)):
-            if summary:
-                hourly_report(summary)
-            last_hour_report = now
-
-        time.sleep(POLL_INTERVAL)
-
-    except Exception as e:
-        log(f"[LOOP ERR] {e}")
-        time.sleep(5)
+if __name__ == "__main__":
+    main()
