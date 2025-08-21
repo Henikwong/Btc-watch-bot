@@ -1,248 +1,130 @@
-import os
 import time
+import logging
 import requests
-import pandas as pd
-import ta
-from datetime import datetime, timedelta
+import talib
+import numpy as np
+from datetime import datetime
 
-# ================== Telegram ==================
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ================= 日志配置 =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
-# ================== 工具函数：价格格式化 ==================
-def format_price(price: float) -> str:
-    """根据币价范围自动决定小数位"""
-    if price >= 100:        # BTC、BNB
-        return f"{price:.2f}"
-    elif price >= 1:        # ETH、XRP、LTC
-        return f"{price:.4f}"
-    elif price >= 0.01:     # DOGE、TRX
-        return f"{price:.6f}"
-    else:                   # SHIB、PEPE、BONK 等超小数
-        return f"{price:.8f}"
+# ================= 交易对 & 周期 =================
+symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "LTCUSDT"]
+timeframes = {"1h": "60min", "4h": "240min", "1d": "1day", "1w": "1week"}
 
-# ================== GPT 模拟分析 ==================
-def gpt_analysis(symbol, df, signal):
+# ================= 交易所 API =================
+def fetch_klines(exchange, symbol, interval, limit=200):
     try:
-        closes = df["close"].tail(50).tolist()
-        recent = closes[-5:]
-        avg = sum(closes) / len(closes)
-        support = min(closes[-20:])
-        resistance = max(closes[-20:])
+        if exchange == "binance":
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+            res = requests.get(url).json()
+            return [[float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in res]
 
-        shape = ""
-        if recent[-1] > recent[-2] > recent[-3]:
-            shape = "近期连续上涨，可能形成小W底"
-        elif recent[-1] < recent[-2] < recent[-3]:
-            shape = "近期连续下跌，可能构成M头或弱势下跌"
+        elif exchange == "okx":
+            url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={interval}&limit={limit}"
+            res = requests.get(url).json()["data"]
+            return [[float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in res][::-1]
 
-        news_factor = "近期宏观市场消息或交易所动态可能带来不确定性"
-
-        return (f"{symbol.upper()} 当前信号：{signal}\n"
-                f"- K线形态：{shape}\n"
-                f"- 支撑位：{format_price(support)}, 阻力位：{format_price(resistance)}\n"
-                f"- 技术均价：{format_price(avg)}\n"
-                f"- 外部因子：{news_factor}\n"
-                f"📌 建议结合多周期和成交量观察。")
+        elif exchange == "huobi":
+            url = f"https://api.huobi.pro/market/history/kline?symbol={symbol.lower()}&period={interval}&size={limit}"
+            res = requests.get(url).json()["data"]
+            return [[float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]), float(x["vol"])] for x in res][::-1]
     except Exception as e:
-        return f"GPT 分析失败: {e}"
+        logging.error(f"[{exchange.upper()} ERROR] {symbol} {e}")
+        return []
 
-# ================== 币种 ==================
-main_coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt","trxusdt","adausdt","ltcusdt","linkusdt"]
-meme_coins = ["dogeusdt","shibusdt","pepeusdt","penguusdt","bonkusdt","trumpusdt","spkusdt","flokusdt"]
-main_periods = ["60min","4hour","1day"]
+# ================= 指标计算 =================
+def calc_indicators(data):
+    closes = np.array([x[3] for x in data], dtype=float)
+    highs = np.array([x[1] for x in data], dtype=float)
+    lows = np.array([x[2] for x in data], dtype=float)
+    vols = np.array([x[4] for x in data], dtype=float)
 
-# ================== K线获取 ==================
-def get_kline_huobi(symbol, period="60min", size=120):
-    url = "https://api.huobi.pro/market/history/kline"
-    try:
-        r = requests.get(url, params={"symbol": symbol, "period": period, "size": size})
-        data = r.json()
-        if "data" not in data:
-            return None
-        df = pd.DataFrame(data["data"]).sort_values("id")
-        for col in ["open","high","low","close","vol"]:
-            df[col] = df[col].astype(float)
-        return df
-    except:
-        return None
+    ema_short = talib.EMA(closes, 12)
+    ema_long = talib.EMA(closes, 26)
+    macd, macd_signal, _ = talib.MACD(closes)
+    rsi = talib.RSI(closes, 14)
+    wr = talib.WILLR(highs, lows, closes, 14)
+    vol_delta = (vols[-1] - np.mean(vols[-10:])) / np.mean(vols[-10:])
 
-def get_kline_binance(symbol, period="1h", limit=120):
-    url = "https://api.binance.com/api/v3/klines"
-    try:
-        r = requests.get(url, params={"symbol": symbol.upper(), "interval": period, "limit": limit})
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","vol","close_time",
-            "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"])
-        for col in ["open","high","low","close","vol"]:
-            df[col] = df[col].astype(float)
-        return df
-    except:
-        return None
+    return {
+        "EMA_trend": "多" if ema_short[-1] > ema_long[-1] else "空",
+        "MACD": macd[-1] - macd_signal[-1],
+        "RSI": rsi[-1],
+        "WR": wr[-1],
+        "VOLΔ": vol_delta,
+        "close": closes[-1],
+    }
 
-def get_kline_bybit(symbol, period="60", limit=120):
-    url = "https://api.bybit.com/v2/public/kline/list"
-    try:
-        r = requests.get(url, params={"symbol": symbol.upper(), "interval": period, "limit": limit})
-        j = r.json()
-        if j.get("ret_code") != 0:
-            return None
-        df = pd.DataFrame(j["result"])
-        for col in ["open","high","low","close","volume"]:
-            if col in df:
-                df[col] = df[col].astype(float)
-        return df.rename(columns={"volume":"vol"})
-    except:
-        return None
-
-# ================== 信号计算 ==================
-def calc_signal(df):
-    if len(df) > 0:  # 丢掉最后一根未收盘K
-        df = df.iloc[:-1].copy()
-
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    ema5 = close.ewm(span=5).mean()
-    ema10 = close.ewm(span=10).mean()
-    ema30 = close.ewm(span=30).mean()
-    macd = ta.trend.MACD(close)
-    macd_diff = macd.macd_diff()
-    rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
-    stoch = ta.momentum.StochasticOscillator(high, low, close, window=9, smooth_window=3)
-    k = stoch.stoch()
-    d = stoch.stoch_signal()
-    j = 3*k - 2*d
-
-    long_signal = (ema5.iloc[-1] > ema10.iloc[-1] > ema30.iloc[-1]) and (macd_diff.iloc[-1] > 0) and (rsi.iloc[-1] < 70) and (j.iloc[-1] > d.iloc[-1])
-    short_signal = (ema5.iloc[-1] < ema10.iloc[-1] < ema30.iloc[-1]) and (macd_diff.iloc[-1] < 0) and (rsi.iloc[-1] > 30) and (j.iloc[-1] < d.iloc[-1])
-
-    entry = close.iloc[-1]
-
-    if long_signal:
-        return "做多", entry
-    elif short_signal:
-        return "做空", entry
-    else:
-        return None, entry
-
-def calc_stop_loss(df, signal, entry, lookback=10):
-    support = df["low"].tail(lookback).min()
-    resistance = df["high"].tail(lookback).max()
-    if signal and "多" in signal:
-        return support
-    elif signal and "空" in signal:
-        return resistance
+# ================= 信号判断 =================
+def check_signal(indicators_all):
+    trends = [i["EMA_trend"] for i in indicators_all]
+    if all(t == "多" for t in trends):
+        return "多"
+    elif all(t == "空" for t in trends):
+        return "空"
     return None
 
-# ================== Telegram 推送 ==================
-def send_telegram_message(message):
-    if TOKEN and CHAT_ID:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        try:
-            requests.post(url, data={"chat_id": CHAT_ID, "text": message})
-            print("✅ 已发送信号到 Telegram")
-        except Exception as e:
-            print(f"消息发送失败: {e}")
+# ================= Telegram 推送 =================
+def send_telegram(msg):
+    token = "你的TOKEN"
+    chat_id = "你的CHAT_ID"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, data={"chat_id": chat_id, "text": msg})
 
-# ================== 主循环 ==================
-kline_cache = {}
-last_send = datetime.utcnow() - timedelta(hours=1)
-prev_signals = {}
+# ================= 主循环 =================
+def main():
+    logging.info("启动 Bot - 多交易所多周期监控")
+    last_hour = -1  # 控制普通信息每小时一次
 
-while True:
-    now = datetime.utcnow()
-    try:
-        coins = main_coins + meme_coins
-        kline_cache = {c: {"60min":{}, "4hour":{}, "1day":{}} for c in coins}
+    while True:
+        now = datetime.now()
+        hour = now.hour
 
-        for coin in coins:
-            # Huobi
-            kline_cache[coin]["60min"]["huobi"] = get_kline_huobi(coin, "60min")
-            kline_cache[coin]["4hour"]["huobi"] = get_kline_huobi(coin, "4hour")
-            kline_cache[coin]["1day"]["huobi"]  = get_kline_huobi(coin, "1day")
-            # Binance
-            kline_cache[coin]["60min"]["binance"] = get_kline_binance(coin, "1h")
-            kline_cache[coin]["4hour"]["binance"] = get_kline_binance(coin, "4h")
-            kline_cache[coin]["1day"]["binance"]  = get_kline_binance(coin, "1d")
-            # Bybit
-            kline_cache[coin]["60min"]["bybit"] = get_kline_bybit(coin, "60")
-            kline_cache[coin]["4hour"]["bybit"] = get_kline_bybit(coin, "240")
-            kline_cache[coin]["1day"]["bybit"]  = get_kline_bybit(coin, "D")
+        all_results = {}
 
-        if (now - last_send).total_seconds() >= 3600:
-            messages = []
-            for coin in coins:
-                period_signals, period_entries = {}, {}
+        for symbol in symbols:
+            all_results[symbol] = {}
 
-                for period in main_periods:
-                    signals, entries = [], []
-                    dfs = kline_cache[coin].get(period, {})
-                    for ex, df in dfs.items():
-                        if df is not None and len(df) > 35:
-                            sig, entry = calc_signal(df)
-                            if sig:
-                                signals.append(sig)
-                                entries.append(entry)
+            for tf_name, tf_api in timeframes.items():
+                results = []
+                for ex in ["binance", "okx", "huobi"]:
+                    data = fetch_klines(ex, symbol, tf_api, 200)
+                    if len(data) > 50:
+                        indicators = calc_indicators(data)
+                        results.append(indicators)
+                        all_results[symbol][tf_name] = indicators
+                        logging.info(f"{symbol} {tf_name} {ex}: {indicators}")
 
-                    if signals:
-                        final_sig = max(set(signals), key=signals.count)
-                        period_signals[period] = final_sig
-                        period_entries[period] = sum(entries)/len(entries)
+                # 检查突发信号
+                if len(results) == 3:
+                    signal = check_signal(results)
+                    if signal:
+                        price = results[0]["close"]
+                        entry = price
+                        tp = price * (1.02 if signal == "多" else 0.98)
+                        sl = price * (0.98 if signal == "多" else 1.02)
 
-                if period_signals:
-                    sig_values = list(period_signals.values())
-                    unique_count = len(set(sig_values))
-                    color = "🟢 绿色"
-                    if unique_count == 1 and len(sig_values) == 3:
-                        color = "🔴 红色"
-                    elif len(sig_values) >= 2:
-                        color = "🟡 黄色"
+                        msg = f"🔥🔥🔥 强烈高度动向捕捉到（满足所有条件）\n⚠️ {symbol} {signal} 信号\n入场: {entry:.2f}\n目标: {tp:.2f}\n止损: {sl:.2f}"
+                        logging.info(msg)
+                        send_telegram(msg)
 
-                    msg_lines = [f"📊 {coin.upper()} 信号 ({color})"]
-                    for p in main_periods:
-                        if p in period_signals:
-                            entry = period_entries[p]
-                            stop_loss = calc_stop_loss(dfs["huobi"], period_signals[p], entry)
-                            target = entry*(1.01 if "多" in period_signals[p] else 0.99)
-                            line = f"{p} → {period_signals[p]} | 入场:{format_price(entry)} 目标:{format_price(target)} 止损:{format_price(stop_loss)}"
-                            prev_sig = prev_signals.get(coin, {}).get(p)
-                            if prev_sig and prev_sig != period_signals[p]:
-                                line += " ⚡ 信号变化"
-                                # 突发时也推 GPT 分析
-                                df_ref = dfs.get("huobi")
-                                if df_ref is None or df_ref.empty:
-                                    df_ref = next((df for df in dfs.values() if df is not None and not df.empty), None)
-                                if df_ref is not None:
-                                    analysis = gpt_analysis(coin, df_ref, period_signals[p])
-                                    send_telegram_message(f"🧠 突发 GPT 分析\n{analysis[:3000]}")
-                            msg_lines.append(line)
+        # 每小时推送普通信息
+        if hour != last_hour:
+            last_hour = hour
+            report = "📢 每小时普通信息\n"
+            for symbol, tf_data in all_results.items():
+                report += f"\n{symbol}:\n"
+                for tf, ind in tf_data.items():
+                    report += f" ⏱ {tf} | 趋势={ind['EMA_trend']} MACD={ind['MACD']:.4f} RSI={ind['RSI']:.2f} WR={ind['WR']:.2f} VOLΔ={ind['VOLΔ']:.2f}\n"
+            send_telegram(report)
 
-                    if len(set(sig_values)) == 1 and len(sig_values) == 3:
-                        msg_lines.append("🌟 强信号！三周期一致")
+        logging.info("等待 60 秒后继续...")
+        time.sleep(60)
 
-                    messages.append("\n".join(msg_lines))
-                    prev_signals[coin] = period_signals
-
-                    # 每轮都推 GPT 综合分析
-                    try:
-                        df_ref = dfs.get("huobi")
-                        if df_ref is None or df_ref.empty:
-                            df_ref = next((df for df in dfs.values() if df is not None and not df.empty), None)
-
-                        if df_ref is not None:
-                            analysis = gpt_analysis(coin, df_ref, period_signals)
-                            send_telegram_message(f"🧠 GPT 综合分析\n{analysis[:3000]}")
-                    except Exception as e:
-                        print(f"[GPT ERROR] {e}")
-
-            if messages:
-                send_telegram_message("\n\n".join(messages))
-            last_send = now
-
-    except Exception as e:
-        print(f"循环错误: {e}")
-
-    time.sleep(900)
+if __name__ == "__main__":
+    main()
