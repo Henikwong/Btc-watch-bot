@@ -1,7 +1,6 @@
 requests
 pandas
 numpy
-pandas-ta
-scikit-learn
+ta
 python-dotenv
-ccxt
+feedparser
