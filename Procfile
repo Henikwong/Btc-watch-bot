@@ -1,1 +1,2 @@
-worker: python3 Bot.py
+bot: python3 Bot.py
+trader: python3 autotrader.py
