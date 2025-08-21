@@ -5,3 +5,4 @@ ta
 python-dotenv
 feedparser
 TA-Lib
+ccxt
