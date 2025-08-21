@@ -1,0 +1,167 @@
+import os
+import time
+import requests
+import pandas as pd
+import ta
+from datetime import datetime, timedelta
+
+# ================== Telegram ==================
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# ================== 币种和周期 ==================
+coins = ["btcusdt","ethusdt","xrpusdt","bnbusdt","solusdt","dogeusdt"]
+periods = {
+    "1h": "60min",
+    "4h": "4hour",
+    "1d": "1day",
+    "1w": "1week"
+}
+exchanges = ["okx","huobi","binance","bitget"]
+
+# ================== 工具函数 ==================
+def format_price(price):
+    if price >= 100:
+        return f"{price:.2f}"
+    elif price >= 1:
+        return f"{price:.4f}"
+    elif price >= 0.01:
+        return f"{price:.6f}"
+    else:
+        return f"{price:.8f}"
+
+def send_telegram(message):
+    if TOKEN and CHAT_ID:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        try:
+            requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+        except:
+            pass
+
+# ================== K线获取（示例：Huobi/Binance/OKX/Bitget） ==================
+def get_kline(exchange, symbol, period, limit=120):
+    try:
+        if exchange == "huobi":
+            url = "https://api.huobi.pro/market/history/kline"
+            r = requests.get(url, params={"symbol": symbol, "period": period, "size": limit})
+            data = r.json()
+            df = pd.DataFrame(data.get("data", [])).sort_values("id")
+            for col in ["open","high","low","close","vol"]:
+                df[col] = df[col].astype(float)
+            return df
+        elif exchange == "binance":
+            url = f"https://api.binance.com/api/v3/klines"
+            interval_map = {"1h":"1h","4h":"4h","1d":"1d","1w":"1w"}
+            r = requests.get(url, params={"symbol": symbol.upper(), "interval": interval_map[period], "limit": limit})
+            data = r.json()
+            df = pd.DataFrame(data, columns=[
+                "open_time","open","high","low","close","vol","close_time",
+                "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"])
+            for col in ["open","high","low","close","vol"]:
+                df[col] = df[col].astype(float)
+            return df
+        elif exchange == "okx":
+            url = f"https://www.okx.com/api/v5/market/candles?instId={symbol.upper()}-SPOT&bar={period}&limit={limit}"
+            r = requests.get(url)
+            data = r.json().get("data", [])
+            df = pd.DataFrame(data, columns=["ts","open","high","low","close","vol","other"])
+            for col in ["open","high","low","close","vol"]:
+                df[col] = df[col].astype(float)
+            return df
+        elif exchange == "bitget":
+            url = f"https://api.bitget.com/api/spot/v1/market/candles?symbol={symbol.upper()}&granularity={period}&limit={limit}"
+            r = requests.get(url)
+            data = r.json().get("data", [])
+            df = pd.DataFrame(data, columns=["ts","open","high","low","close","vol"])
+            for col in ["open","high","low","close","vol"]:
+                df[col] = df[col].astype(float)
+            return df
+    except:
+        return None
+
+# ================== 技术指标分析 ==================
+def analyze(df):
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    vol = df["vol"]
+
+    ema5 = close.ewm(span=5).mean().iloc[-1]
+    ema10 = close.ewm(span=10).mean().iloc[-1]
+    ema30 = close.ewm(span=30).mean().iloc[-1]
+
+    macd = ta.trend.MACD(close)
+    macd_diff = macd.macd_diff().iloc[-1]
+
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+
+    wr = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r().iloc[-1]
+
+    # 简单信号判定
+    long = ema5>ema10>ema30 and macd_diff>0 and rsi<70 and wr<-20
+    short = ema5<ema10<ema30 and macd_diff<0 and rsi>30 and wr>-80
+
+    if long and short:
+        signal = "观望"
+        strength = "🟡 中"
+    elif long:
+        signal = "做多"
+        strength = "🔴 强"
+    elif short:
+        signal = "做空"
+        strength = "🔴 强"
+    else:
+        signal = "无信号"
+        strength = "🟢 弱"
+
+    return {
+        "signal": signal,
+        "strength": strength,
+        "ema5": ema5,
+        "ema10": ema10,
+        "ema30": ema30,
+        "macd_diff": macd_diff,
+        "rsi": rsi,
+        "wr": wr,
+        "vol": vol.iloc[-1],
+        "entry": close.iloc[-1],
+        "target": None,
+        "stop_loss": None
+    }
+
+# ================== GPT 分析占位 ==================
+def gpt_advice(symbol, signal):
+    advice = f"📌 {symbol.upper()} 分析:\n"
+    advice += f"- 当前信号: {signal}\n"
+    advice += "- K线形态：近期趋势参考技术指标\n"
+    advice += "- 外部因子：注意市场消息和交易所动态\n"
+    advice += "- 建议：结合多周期、量价观察谨慎操作"
+    return advice
+
+# ================== 主循环 ==================
+last_send = datetime.utcnow() - timedelta(hours=1)
+while True:
+    now = datetime.utcnow()
+    report_lines = []
+    for coin in coins:
+        for period_key, period_val in periods.items():
+            for ex in exchanges:
+                df = get_kline(ex, coin, period_val)
+                if df is None or len(df)<20:
+                    continue
+                res = analyze(df)
+                # 只在每小时生成 Telegram
+                if (now - last_send).total_seconds() >= 3600:
+                    line = f"{coin.upper()} | {period_key} | {ex} | {res['signal']} {res['strength']}\n"
+                    line += f"入场: {format_price(res['entry'])} | EMA5:{format_price(res['ema5'])} EMA10:{format_price(res['ema10'])} EMA30:{format_price(res['ema30'])}\n"
+                    line += f"MACD_diff:{format_price(res['macd_diff'])} RSI:{format_price(res['rsi'])} WR:{format_price(res['wr'])} VOL:{format_price(res['vol'])}"
+                    report_lines.append(line)
+                    # GPT 占位分析
+                    report_lines.append(gpt_advice(coin, res['signal']))
+
+    if report_lines and (now - last_send).total_seconds() >= 3600:
+        send_telegram("\n\n".join(report_lines))
+        last_send = now
+
+    # 每分钟更新数据
+    time.sleep(60)
