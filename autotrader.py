@@ -1,4 +1,9 @@
-# autotrader_debug.py
+# autotrader.py
+# 三确认（≥3/4 周期）才下单 + 多指标同向确认 + Telegram 推送 + ccxt 实盘/纸面切换
+# 支持：huobi / binance / okx （默认现货，MARKET_TYPE=swap 时尝试合约）
+# 周期：1h, 4h, 1d, 1w；满足 >=3 个周期同方向 -> 触发下单
+# 指标：EMA(5/10/30)趋势、MACD hist、RSI(14)、WR(14)、K/D(金叉/死叉)、VOL变化、ATR止损止盈
+
 import os, time, traceback
 import ccxt
 import requests
@@ -109,5 +114,75 @@ def indicators_and_side(df):
     if vol_trend<0: score_bear+=1
 
     side=None
-    if score_bull>=4 and score_bull>=score_bear+2: side="多"
-    elif score_bear>=4 and score_bear>=score_bull+2
+    if score_bull>=4 and score_bull>=score_bear+2:
+        side="多"
+    elif score_bear>=4 and score_bear>=score_bull+2:
+        side="空"
+
+    details={
+        "ema_trend": ema_trend,
+        "ema_vals":[float(ema5),float(ema10),float(ema30)],
+        "macd":float(macd_hist),
+        "rsi":float(rsi),
+        "wr":float(wr),
+        "k_trend":k_trend,
+        "vol_trend":float(vol_trend),
+        "entry":float(close.iloc[-1])
+    }
+    return side, details
+
+def calc_stop_target(df, side, entry):
+    atr=compute_atr(df)
+    if atr is None: return None, None
+    if side=="多": return entry-ATR_MULT*atr, entry+ATR_MULT*atr
+    else: return entry+ATR_MULT*atr, entry-ATR_MULT*atr
+
+def format_price(p):
+    try:
+        p=float(p)
+        if p>=100: return f"{p:.2f}"
+        if p>=1: return f"{p:.4f}"
+        if p>=0.01: return f"{p:.6f}"
+        return f"{p:.8f}"
+    except: return "-"
+
+def place_order(ex, symbol, side, entry, stop, target):
+    qty=max(1e-8, BASE_USDT/max(entry,1e-8))
+    order_side="buy" if side=="多" else "sell"
+    if LIVE_TRADE!=1:
+        log(f"[纸面单] {symbol} {side} 市价数量≈{qty}")
+        return {"id":"paper","status":"simulated","side":order_side,"amount":qty}
+    try:
+        if MARKET_TYPE=="swap":
+            try: ex.set_leverage(LEVERAGE, symbol)
+            except Exception as e: log(f"{symbol} 设置杠杆失败: {e}")
+        o=ex.create_order(symbol, type="market", side=order_side, amount=qty)
+        log(f"[下单成功] {o}")
+        return o
+    except Exception as e:
+        log(f"[下单失败] {e}")
+        return None
+
+def summarize_details(tf, side, det):
+    return (f"{tf} | 方向:{side or '无'}  入场:{format_price(det['entry']) if det else '-'} | "
+            f"EMA:{det['ema_trend'] if det else '-'} MACD:{det['macd'] if det else '-'} "
+            f"RSI:{det['rsi'] if det else '-'} WR:{det['wr'] if det else '-'} "
+            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'}")
+
+def main():
+    ex=build_exchange()
+    mode="实盘" if LIVE_TRADE==1 else "纸面"
+    log(f"启动交易Bot | {EXCHANGE_NAME} {MARKET_TYPE} 轮询{POLL_INTERVAL}s 模式={mode}")
+    tg_send(f"🤖 交易Bot已启动：{EXCHANGE_NAME}/{MARKET_TYPE} 轮询{POLL_INTERVAL}s 模式={mode}")
+
+    last_hourly_push_ts=0
+
+    while True:
+        loop_start=time.time()
+        try:
+            ex.load_markets()
+            for symbol in SYMBOLS:
+                sides=[]; details_map={}
+                for tf in ["1h","4h","1d","1w"]:
+                    try:
+                        ohlcv=fetch_ohlcv
