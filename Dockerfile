@@ -1,18 +1,20 @@
-# 使用 Python 3.12 官方 slim 镜像
+# 基础镜像
 FROM python:3.12-slim
 
-# 安装系统证书和依赖
-RUN apt-get update && apt-get install -y ca-certificates && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# 安装系统依赖和证书
+RUN apt-get update && \
+    apt-get install -y ca-certificates build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
 WORKDIR /app
 
-# 复制代码到容器
+# 复制代码
 COPY . .
 
-# 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+# 使用国内镜像安装 Python 依赖，加快速度
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 # 启动脚本
 CMD ["python", "autotrader.py"]
