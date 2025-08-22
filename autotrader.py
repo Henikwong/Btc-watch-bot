@@ -1,6 +1,4 @@
-import os
-import time
-import traceback
+import os, time, traceback, ssl
 from datetime import datetime
 import ccxt
 import pandas as pd
@@ -8,6 +6,9 @@ import numpy as np
 import ta
 import requests
 from dotenv import load_dotenv
+
+# ================== SSL 修复 ==================
+ssl._create_default_https_context = ssl._create_unverified_context
 
 load_dotenv()
 
@@ -25,15 +26,11 @@ LEVERAGE           = int(os.getenv("LEVERAGE", "5"))
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL", "60"))
 LIVE_TRADE         = int(os.getenv("LIVE_TRADE", "0"))
 
-REQUIRED_CONFIRMS = 3  # 多周期确认数量
-PERIODS = ["1h", "4h", "1d", "1w"]
+REQUIRED_CONFIRMS = 3  # 4个周期中至少3个同向
 
 # ================== 工具函数 ==================
 def nowstr(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def log(msg):
-    print(f"[{nowstr()}] {msg}", flush=True)
-
+def log(msg): print(f"[{nowstr()}] {msg}", flush=True)
 def tg_send(msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -42,22 +39,20 @@ def tg_send(msg):
         except Exception as e:
             log(f"TG发送失败: {e}")
 
+# ================== 构建交易所 ==================
 def build_exchange():
     params = {"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True}
-    if EXCHANGE_NAME=="huobi":
+
+    if MARKET_TYPE == "spot":
         ex = ccxt.huobi(params)
-    elif EXCHANGE_NAME=="binance":
-        ex = ccxt.binance(params)
-    elif EXCHANGE_NAME=="okx":
-        ex = ccxt.okx(params)
+    elif MARKET_TYPE == "swap":
+        ex = ccxt.huobi_swap(params)
+        ex.options["defaultType"] = "swap"
     else:
-        raise ValueError("只支持 huobi/binance/okx")
-    
-    if MARKET_TYPE=="swap":
-        try: ex.options["defaultType"] = "swap"
-        except: pass
+        raise ValueError("MARKET_TYPE 只能是 spot 或 swap")
     return ex
 
+# ================== 数据与指标 ==================
 def fetch_df(ex, symbol, tf="1h", limit=200):
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
@@ -75,41 +70,30 @@ def indicators_and_side(df):
     if len(df)<35: return None, None
     df_work = df.iloc[:-1]
     close, high, low, vol = df_work["close"], df_work["high"], df_work["low"], df_work["vol"]
-    
     ema5, ema10, ema30 = close.ewm(span=5).mean().iloc[-1], close.ewm(span=10).mean().iloc[-1], close.ewm(span=30).mean().iloc[-1]
     ema_trend = "多" if ema5>ema10>ema30 else ("空" if ema5<ema10<ema30 else "中性")
-    
     macd_hist = ta.trend.MACD(close).macd_diff().iloc[-1]
     rsi = ta.momentum.RSIIndicator(close,14).rsi().iloc[-1]
     wr = ta.momentum.WilliamsRIndicator(high, low, close, 14).williams_r().iloc[-1]
-    
-    stoch = ta.momentum.StochasticOscillator(high, low, close, 9, 3)
+    stoch = ta.momentum.StochasticOscillator(high, low, close,9,3)
     k_trend = "多" if stoch.stoch().iloc[-1] > stoch.stoch_signal().iloc[-1] else "空"
-    
     vol_trend = (vol.iloc[-1]-vol.iloc[-2])/(vol.iloc[-2]+1e-12)
-    
     score_bull = sum([ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0])
     score_bear = sum([ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0])
-    
     side = "多" if score_bull>=4 and score_bull>=score_bear+2 else ("空" if score_bear>=4 and score_bear>=score_bull+2 else None)
-    details = {"ema_trend":ema_trend, "macd":float(macd_hist), "rsi":float(rsi), "wr":float(wr),
-               "k_trend":k_trend, "vol_trend":float(vol_trend), "entry":float(close.iloc[-1])}
+    details = {"ema_trend":ema_trend,"macd":float(macd_hist),"rsi":float(rsi),"wr":float(wr),"k_trend":k_trend,"vol_trend":float(vol_trend),"entry":float(close.iloc[-1])}
     return side, details
 
+# ================== 下单 ==================
 def place_order(ex, symbol, side, entry):
     qty = max(1e-8, BASE_USDT / max(entry,1e-8))
     order_side = "buy" if side=="多" else "sell"
-    
-    if LIVE_TRADE != 1:
-        log(f"[纸面单] {symbol} {side} 数量≈{qty:.6f}")
+    if LIVE_TRADE!=1:
+        log(f"[纸面单] {symbol} {side} 数量≈{qty}")
         return {"id":"paper"}
-    
     try:
-        if MARKET_TYPE=="spot":
-            o = ex.create_order(symbol,"market",order_side,qty)
-        else:
-            o = ex.create_order(symbol,"market",order_side,qty)
-        log(f"[下单成功] {symbol} {side} 数量≈{qty:.6f}")
+        o = ex.create_order(symbol,"market",order_side,qty)
+        log(f"[下单成功] {symbol} {side} 数量≈{qty}")
         return o
     except Exception as e:
         log(f"[下单失败] {e}")
@@ -120,46 +104,41 @@ def main():
     ex = build_exchange()
     log(f"启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} LIVE={LIVE_TRADE}")
     tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'}")
-    
+
     while True:
         try:
             ex.load_markets()
             for symbol in SYMBOLS:
-                sides = []
-                details_map = {}
-                
-                # 多周期分析
-                for tf in PERIODS:
+                sides=[]
+                details_map={}
+                for tf in ["1h","4h","1d","1w"]:
                     try:
-                        df = fetch_df(ex, symbol, tf)
+                        df = fetch_df(ex,symbol,tf)
                         side, det = indicators_and_side(df)
-                        details_map[tf] = (side, det)
+                        details_map[tf]=(side,det)
                         sides.append(side)
                     except Exception as e_tf:
                         log(f"{symbol} {tf} 指标异常: {e_tf}")
-                        details_map[tf] = (None, None)
-                
-                # 判断最终方向
+                        details_map[tf]=(None,None)
                 bull = sides.count("多")
                 bear = sides.count("空")
                 final_side = None
-                if bull >= REQUIRED_CONFIRMS and bull > bear:
-                    final_side = "多"
-                elif bear >= REQUIRED_CONFIRMS and bear > bull:
-                    final_side = "空"
-                
-                # 下单与推送
+                if bull>=REQUIRED_CONFIRMS and bull>bear:
+                    final_side="多"
+                elif bear>=REQUIRED_CONFIRMS and bear>bull:
+                    final_side="空"
+
                 if final_side:
                     side1h, det1h = details_map["1h"]
                     entry = det1h["entry"]
                     o = place_order(ex, symbol, final_side, entry)
-                    tg_send(f"下单触发 {symbol} {final_side} 入场价 {entry:.2f} 数量≈{BASE_USDT/entry:.6f}")
-                    
+                    tg_send(f"下单触发 {symbol} {final_side} 入场价 {entry:.6f} 数量≈{BASE_USDT/entry:.6f}")
+
+            time.sleep(POLL_INTERVAL)
         except Exception as e:
             log(f"循环异常: {e}")
-            log(traceback.format_exc())
-        
-        time.sleep(POLL_INTERVAL)
+            traceback.print_exc()
+            time.sleep(POLL_INTERVAL)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
