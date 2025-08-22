@@ -1,1 +1,1 @@
-trader: python autotrader.py
+trader: python test_tg.py
