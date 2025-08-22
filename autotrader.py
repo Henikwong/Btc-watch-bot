@@ -131,8 +131,12 @@ def main():
                 if bull>=REQUIRED_CONFIRMS and bull>bear: final_side="多"
                 elif bear>=REQUIRED_CONFIRMS and bear>bull: final_side="空"
                 
-                if final_side:
+                 if final_side:
                     side1h, det1h = details_map["1h"]
                     entry = det1h["entry"]
                     o = place_order(ex, symbol, final_side, entry)
-                    tg_send(f"下单触发 {symbol} {final_side} 入
+                    tg_send(f"下单触发 {symbol}if final_side:
+    side1h, det1h = details_map["1h"]
+    entry = det1h["entry"]
+    o = place_order(ex, symbol, final_side, entry)
+    tg_send(f"下单触发 {symbol} {final_side} 入场价 {entry} 数量≈{BASE_USDT/entry:.6f}")
