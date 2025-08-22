@@ -1,71 +1,64 @@
-# ==========================================================
-# 导入所需的库
-# ==========================================================
 import os
 import time
-import ccxt
-import ssl
+import requests
+import certifi
+from dotenv import load_dotenv
 
-# ==========================================================
-# 从环境变量安全地获取API密钥和配置
-# ==========================================================
-# 密钥和配置应从环境变量中安全读取，而不是硬编码在代码中 [1]。
-# 请在 Railway 的“Variables”面板中设置这些变量。
-try:
-    API_KEY = os.environ.get('HUOBI_API_KEY')
-    SECRET_KEY = os.environ.get('HUOBI_SECRET_KEY')
-    LIVE_TRADE = int(os.environ.get('LIVE_TRADE', '0')) # '0'表示纸上交易，'1'表示实盘交易
-    
-    if not API_KEY or not SECRET_KEY:
-        raise ValueError("API keys are not set in environment variables.")
+# 载入 .env 环境变量
+load_dotenv()
 
-except (ValueError, TypeError) as e:
-    print(f"Error: {e}")
-    # 缺少关键配置，退出程序。
-    exit()
+# ========== 配置 ==========
+TG_TOKEN = os.getenv("TG_TOKEN")       # Telegram Bot Token
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")   # Telegram Chat ID
+EXCHANGE = os.getenv("EXCHANGE", "huobi")  # 默认交易所
+MARKET = os.getenv("MARKET", "spot")       # 默认市场类型
+LIVE = int(os.getenv("LIVE", 0))           # 0=纸面测试, 1=实盘
+SLEEP = int(os.getenv("SLEEP", 30))        # 循环间隔秒
 
-# ==========================================================
-# 初始化交易所
-# ==========================================================
-# CCXT 库提供了一个统一的接口来与加密货币交易所交互 [2, 3]。
-exchange = ccxt.huobi({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-})
+# API Endpoint (Huobi 合约 API)
+HUOBI_SWAP_URL = "https://api.hbdm.com/linear-swap-api/v1/swap_contract_info?business_type=all"
 
-print("交易脚本已启动...")
 
-# ==========================================================
-# 核心交易逻辑循环
-# ==========================================================
-# 交易脚本作为一个“后台工作者”需要持续运行 [4]。
-# `while True` 循环可以防止脚本在执行一次后立即退出。
-while True:
+# ========== 工具函数 ==========
+def tg_send(msg: str):
+    """发送消息到 Telegram"""
     try:
-        print("正在获取最新市场数据...")
-        
-        # 在这里添加您自己的交易逻辑。
-        # 以下是获取 BTC/USDT 最新价格的示例。
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        price = ticker['last']
-        
-        print(f"BTC/USDT 最新价格：{price}")
-
-        # 根据您的策略执行交易。
-        if LIVE_TRADE == 1:
-            print("当前模式：实盘交易")
-            # 在这里放置您的实盘交易代码
-            # 例如: exchange.create_order(...)
-        else:
-            print("当前模式：纸上交易 (Dry-run)")
-            # 在这里放置您的模拟交易代码
-        
-        # 重要的：添加延迟以避免过于频繁的API调用，并遵守交易所的API限速。
-        time.sleep(60) # 每60秒运行一次
-        
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": msg}
+        requests.post(url, json=payload, timeout=10, verify=certifi.where())
     except Exception as e:
-        # 捕获任何可能发生的错误，并打印出来以便在 Railway 日志中查看。
-        print(f"发生错误：{e}")
-        # 如果出现错误，等待一段时间后重试，避免连续失败。
-        time.sleep(300)
+        print("❌ Telegram 发送失败:", e)
 
+
+def get_huobi_contracts():
+    """获取 Huobi 合约信息"""
+    try:
+        resp = requests.get(HUOBI_SWAP_URL, timeout=10, verify=certifi.where())
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+    except Exception as e:
+        tg_send(f"⚠️ Huobi API 请求失败: {e}")
+        return None
+
+
+# ========== 主循环 ==========
+def run_bot():
+    tg_send(f"🤖 Bot启动 {EXCHANGE}/{MARKET} 模式={'实盘' if LIVE else '纸面'}")
+
+    while True:
+        try:
+            contracts = get_huobi_contracts()
+            if contracts:
+                tg_send(f"✅ 成功获取 {len(contracts.get('data', []))} 个合约信息")
+            else:
+                tg_send("⚠️ 没有拿到合约数据")
+
+        except Exception as e:
+            tg_send(f"循环异常: {e}")
+
+        time.sleep(SLEEP)
+
+
+if __name__ == "__main__":
+    run_bot()
