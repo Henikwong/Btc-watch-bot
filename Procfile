@@ -1,1 +1,1 @@
-trader: python3 autotrader.py
+trader: python autotrader.py
