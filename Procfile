@@ -1,1 +1,1 @@
-worker: python autotrader.py
+worker: python3 autotrader.py
