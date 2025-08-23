@@ -42,7 +42,6 @@ TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
 PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))
 MACD_FILTER_TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 
-# Safety limits
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 
 # ========= helpers =========
@@ -61,10 +60,9 @@ def tg_send(text):
     except Exception as e:
         log(f"TG发送失败: {e}")
 
-# ========= exchange builder (优先 binanceusdm) =========
+# ========= exchange builder =========
 def build_exchange():
     ex = None
-    # try binanceusdm (preferred)
     try:
         if hasattr(ccxt, "binanceusdm"):
             ex = getattr(ccxt, "binanceusdm")({
@@ -78,8 +76,6 @@ def build_exchange():
             return ex
     except Exception as e:
         log(f"binanceusdm init failed: {e}")
-
-    # fallback to binance with defaultType future
     try:
         ex = getattr(ccxt, "binance")({
             "apiKey": API_KEY,
@@ -94,24 +90,13 @@ def build_exchange():
         log(f"ccxt.binance init failed: {e}")
         raise RuntimeError("初始化交易所失败，请检查 ccxt 版本与环境变量")
 
-# ========= safe leverage setter (多方法尝试) =========
+# ========= safe leverage setter =========
 def set_leverage_safe(ex, symbol, leverage):
-    """
-    兼容多种 ccxt 实现的方法，按优先顺序尝试：
-    1) fapiPrivate_post_leverage
-    2) private_post_leverage
-    3) unified set_leverage
-    4) ex.fapiPrivate_post_leverage with market id
-    若全部失败，记录日志但不抛出异常（非致命）。
-    """
     try:
         market = ex.market(symbol)
     except Exception as e:
         log(f"无法获取市场信息 {symbol}: {e}")
         return
-
-    # 方法序列
-    # 1) try fapiPrivate_post_leverage with market id
     try:
         if hasattr(ex, "fapiPrivate_post_leverage"):
             ex.fapiPrivate_post_leverage({"symbol": market["id"], "leverage": int(leverage)})
@@ -119,8 +104,6 @@ def set_leverage_safe(ex, symbol, leverage):
             return
     except Exception as e:
         log(f"尝试 fapiPrivate_post_leverage 失败: {e}")
-
-    # 2) try private_post_leverage (older naming)
     try:
         if hasattr(ex, "private_post_leverage"):
             ex.private_post_leverage({"symbol": market["id"], "leverage": int(leverage)})
@@ -128,35 +111,17 @@ def set_leverage_safe(ex, symbol, leverage):
             return
     except Exception as e:
         log(f"尝试 private_post_leverage 失败: {e}")
-
-    # 3) unified set_leverage
     try:
         if hasattr(ex, "set_leverage"):
             try:
-                # some ccxt versions expect market symbol
                 ex.set_leverage(int(leverage), market["symbol"])
             except Exception:
-                # try with market id
                 ex.set_leverage(int(leverage), market["id"])
             log(f"{symbol} 杠杆已设置为 {leverage}x (set_leverage)")
             return
     except Exception as e:
         log(f"尝试 set_leverage 失败: {e}")
-
-    # 4) private endpoints variations
-    try:
-        # some ccxt variants use ex.sapiPostMarginLeverage or other endpoints; try generic private POST
-        if hasattr(ex, "post"):
-            try:
-                ex.post("fapi/v1/leverage", {"symbol": market["id"], "leverage": int(leverage)})
-                log(f"{symbol} 杠杆已设置为 {leverage}x (post fallback)")
-                return
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    log(f"⚠️ 尝试设置杠杆失败（多重方法均失败） {symbol}")
+    log(f"⚠️ 尝试设置杠杆失败 {symbol}")
 
 # ========= OHLCV -> df =========
 def df_from_ohlcv(ohlcv):
@@ -292,7 +257,7 @@ def create_sl_tp_orders(ex, symbol, side, qty, sl_price, tp_price):
         log(f"创建SL/TP失败 {symbol}: {e}")
         return False
 
-# trail state
+# ========= trail logic =========
 trail_state = {}
 
 def update_trailing_stop(ex, symbol, last_price):
@@ -349,7 +314,7 @@ def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
     if LIVE_TRADE != 1:
         log(f"[纸面-提前止盈] {symbol} side={side} 减仓≈{reduce_qty} last≈{fmt_price(last_price)} entry≈{fmt_price(entry)} RSI4h={rsi4h:.2f}")
         trail_state[symbol]["partial_done"] = True
-        tg_send(f"🟡 提前止盈(纸面) {symbol} {side} 减仓≈{reduce_qty:.6f} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
+        tg_send(f"🟡 提前止盈(纸面) {symbol} {side} 减仓≈{reduce_qty} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
         return
     try:
         if side == "多":
@@ -388,116 +353,4 @@ def main():
         return
 
     tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
-    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS} OBSERVE_SYMBOLS={OBSERVE_SYMBOLS}")
-
-    # set leverage
-    if MARKET_TYPE == "future":
-        for s in TRADE_SYMBOLS:
-            try:
-                set_leverage_safe(ex, s, LEVERAGE)
-                log(f"{s} 尝试设置杠杆 {LEVERAGE}x")
-            except Exception as e:
-                log(f"设置杠杆失败 {s}: {e}")
-
-    while True:
-        loop_start = time.time()
-        try:
-            open_positions_count = len([k for k,v in trail_state.items() if v.get("qty",0)>0])
-
-            for symbol in ALL_SYMBOLS:
-                tf_sides = []
-                tf_details = {}
-
-                for tf in TIMEFRAMES:
-                    try:
-                        # ccxt fetch_ohlcv signature: (symbol, timeframe=timeframe, since=None, limit=None, params={})
-                        ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=200)
-                        df = df_from_ohlcv(ohlcv)
-                        side, det = analyze_one_df(df)
-                        tf_sides.append(side)
-                        tf_details[tf] = (side, det)
-                        log(summarize(tf, side, det))
-                    except Exception as e:
-                        log(f"❌ 获取/分析失败 {symbol} {tf}: {e}")
-                        tf_sides.append(None)
-                        tf_details[tf] = (None, None)
-
-                bull = sum(1 for s in tf_sides if s=="多")
-                bear = sum(1 for s in tf_sides if s=="空")
-                consensus = None
-                if bull>=REQUIRED_CONFIRMS and bull>bear:
-                    consensus="多"
-                elif bear>=REQUIRED_CONFIRMS and bear>bull:
-                    consensus="空"
-
-                lines = [f"{symbol} 当前多周期共识:（多:{bull} 空:{bear}）"]
-                for tf in TIMEFRAMES:
-                    s, det = tf_details[tf]
-                    lines.append(summarize(tf, s, det))
-                tg_send("\n".join(lines))
-
-                if symbol in TRADE_SYMBOLS and consensus in ("多","空"):
-                    if open_positions_count >= MAX_OPEN_POSITIONS:
-                        log(f"已达最大同时持仓 {MAX_OPEN_POSITIONS}，跳过新开仓 {symbol}")
-                        continue
-
-                    allow, s1h_status, s4h_status = should_open_trade(consensus, tf_details)
-                    if not allow:
-                        status = f"{s1h_status}/{s4h_status}"
-                        log(f"{symbol} {consensus} 被 MACD 动能过滤（1h+4h）— 跳过开仓 [{status}]")
-                        tg_send(f"⚠️ {symbol} {consensus} 被 MACD 动能过滤（1h+4h），取消本次开仓 [{status}]")
-                        continue
-
-                    s1h, d1h = tf_details.get("1h", (None, None))
-                    if not d1h:
-                        continue
-                    price = d1h["entry"]; atr1h = d1h["atr"]
-                    qty = amount_for_futures(ex, symbol, price)
-                    if qty <= 0:
-                        log(f"{symbol} 数量过小，跳过")
-                        continue
-                    if consensus == "多":
-                        sl = price - SL_ATR_MULT*atr1h
-                        tp = price + TP_ATR_MULT*atr1h
-                    else:
-                        sl = price + SL_ATR_MULT*atr1h
-                        tp = price - TP_ATR_MULT*atr1h
-
-                    if LIVE_TRADE != 1:
-                        log(f"[纸面单] {symbol} {consensus} 市价 数量≈{qty} 进场≈{fmt_price(price)} SL≈{fmt_price(sl)} TP≈{fmt_price(tp)} ATR1h≈{fmt_price(atr1h)}")
-                        tg_send(f"🧾 纸面单 {symbol} {consensus} qty≈{qty} entry≈{fmt_price(price)} SL≈{fmt_price(sl)} TP≈{fmt_price(tp)}")
-                    else:
-                        try:
-                            side_str = "buy" if consensus=="多" else "sell"
-                            ex.create_order(symbol, type="MARKET", side=side_str, amount=qty)
-                            log(f"[下单成功] {symbol} {side_str} qty={qty} entry≈{fmt_price(price)}")
-                            tg_send(f"⚡ 开仓 {symbol} {consensus} 价≈{fmt_price(price)} 数量≈{qty}\nSL:{fmt_price(sl)} TP:{fmt_price(tp)} ATR1h:{fmt_price(atr1h)}")
-                            ok = create_sl_tp_orders(ex, symbol, consensus, qty, sl, tp)
-                            if not ok:
-                                tg_send(f"⚠️ {symbol} SL/TP 挂单失败，请检查")
-                        except Exception as e:
-                            log(f"[下单失败] {symbol}: {e}")
-                            tg_send(f"❌ 下单失败 {symbol}: {e}")
-                            continue
-
-                    trail_state[symbol] = {"side": consensus, "best": price, "atr": atr1h, "qty": qty, "entry": price, "partial_done": False}
-                    open_positions_count = len([k for k,v in trail_state.items() if v.get("qty",0)>0])
-
-                try:
-                    ticker = ex.fetch_ticker(symbol)
-                    last_price = float(ticker.get("last") or ticker.get("close") or 0.0)
-                    if last_price:
-                        update_trailing_stop(ex, symbol, last_price)
-                        if symbol in trail_state and "4h" in tf_details:
-                            macd_weakening_and_partial_tp(ex, symbol, last_price, tf_details["4h"])
-                except Exception as e:
-                    log(f"获取价格/更新止盈失败 {symbol}: {e}")
-
-        except Exception as e:
-            log(f"[主循环异常] {e}\n{traceback.format_exc()}")
-
-        used = time.time() - loop_start
-        time.sleep(max(1, POLL_INTERVAL - int(used)))
-
-if __name__ == "__main__":
-    main()
+    log(f"TRADE_SYMBOLS={
