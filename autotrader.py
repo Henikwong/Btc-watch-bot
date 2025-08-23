@@ -34,6 +34,7 @@ REQUIRED_CONFIRMS = 2                         # 多周期至少同向数量
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))   # 止损=2*ATR
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))   # 止盈=3*ATR
 TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.5"))  # 跟踪止损抬升阈值
+PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))  # 提前止盈减仓比例（默认30%）
 
 # ========== 工具 ==========
 def nowstr():
@@ -73,7 +74,6 @@ def binance_set_leverage(ex, symbol, lev):
             "symbol": market["id"],
             "leverage": lev
         })
-        # 保证 reduceOnly 可用
         ex.fapiPrivate_post_margintype({
             "symbol": market["id"],
             "marginType": "CROSSED"  # 如需逐仓可改为 ISOLATED
@@ -102,7 +102,8 @@ def analyze_one_df(df):
     ema_trend = "多" if (ema5>ema10>ema30) else ("空" if (ema5<ema10<ema30) else "中性")
 
     macd = ta.trend.MACD(close)
-    macd_hist = float(macd.macd_diff().iloc[-1])
+    macd_hist_series = macd.macd_diff()
+    macd_hist = float(macd_hist_series.iloc[-1])
     rsi = float(ta.momentum.RSIIndicator(close, 14).rsi().iloc[-1])
     wr  = float(ta.momentum.WilliamsRIndicator(high, low, close, 14).williams_r().iloc[-1])
     stoch = ta.momentum.StochasticOscillator(high, low, close, 9, 3)
@@ -129,6 +130,7 @@ def analyze_one_df(df):
     det = {
         "ema_trend": ema_trend,
         "macd": macd_hist,
+        "macd_hist_series": macd_hist_series,  # 给4h弱化判断复用
         "rsi": rsi,
         "wr": wr,
         "k_trend": k_trend,
@@ -155,29 +157,19 @@ def fmt_price(p):
 def amount_for_futures(ex, symbol, price):
     # 合约名义： 用 BASE_USDT * LEVERAGE / price
     raw_qty = BASE_USDT * LEVERAGE / max(price, 1e-12)
-    market = ex.market(symbol)
-    # 将数量对齐到 step
-    step = market.get("limits", {}).get("amount", {}).get("min", None)
-    precision = market.get("precision", {}).get("amount", None)
     try:
         qty = ex.amount_to_precision(symbol, raw_qty)
     except Exception:
         qty = raw_qty
-        if precision is not None:
-            qty = float(f"{qty:.{precision}f}")
-    # 避免太小
-    if step and qty < step:
-        qty = step
-    return max(qty, 0.0)
+    return max(float(qty), 0.0)
 
 def create_sl_tp_orders(ex, symbol, side, qty, sl_price, tp_price):
     """在合约上创建止损/止盈减仓单（reduceOnly True）"""
-    market = ex.market(symbol)
     params_sl = {
         "reduceOnly": True,
         "stopPrice": ex.price_to_precision(symbol, sl_price),
         "timeInForce": "GTC",
-        "workingType": "CONTRACT_PRICE",  # or MARK_PRICE
+        "workingType": "CONTRACT_PRICE",  # 或 MARK_PRICE，看你偏好
     }
     params_tp = {
         "reduceOnly": True,
@@ -187,11 +179,9 @@ def create_sl_tp_orders(ex, symbol, side, qty, sl_price, tp_price):
     }
     try:
         if side == "多":
-            # 多单：止损卖出，止盈卖出
             ex.create_order(symbol, type="STOP_MARKET", side="sell", amount=qty, params=params_sl)
             ex.create_order(symbol, type="TAKE_PROFIT_MARKET", side="sell", amount=qty, params=params_tp)
         else:
-            # 空单：止损买入，止盈买入
             ex.create_order(symbol, type="STOP_MARKET", side="buy", amount=qty, params=params_sl)
             ex.create_order(symbol, type="TAKE_PROFIT_MARKET", side="buy", amount=qty, params=params_tp)
         return True
@@ -200,10 +190,10 @@ def create_sl_tp_orders(ex, symbol, side, qty, sl_price, tp_price):
         return False
 
 # 跟踪止盈状态（内存）
-trail_state = {}  # { symbol: {"side": "多"/"空", "best": float, "atr": float, "qty": float} }
+trail_state = {}  # { symbol: {"side": "多"/"空", "best": float, "atr": float, "qty": float, "entry": float, "partial_done": bool} }
 
 def update_trailing_stop(ex, symbol, last_price):
-    """价格向有利方向移动 >= TRAIL_ATR_MULT * ATR 时，上调止损（简单实现：取消旧SL后重挂更优SL）"""
+    """价格向有利方向移动 >= TRAIL_ATR_MULT * ATR 时，上调止损（简化示例：直接再挂更优STOP_MARKET）"""
     st = trail_state.get(symbol)
     if not st: 
         return
@@ -213,12 +203,9 @@ def update_trailing_stop(ex, symbol, last_price):
     if side == "多":
         if last_price > best:
             trail_state[symbol]["best"] = last_price
-        # 只在价格超出 (best + 1*ATR) 这种级别后上调一次（避免太频繁）
         if last_price >= best + TRAIL_ATR_MULT * atr:
-            # 新SL抬高到 (last_price - SL_ATR_MULT*atr)
             new_sl = last_price - SL_ATR_MULT * atr
             try:
-                # 简化：直接挂一个新的 STOP_MARKET（真实场景应先取消旧SL；这里示例化）
                 ex.create_order(symbol, type="STOP_MARKET", side="sell", amount=qty, params={
                     "reduceOnly": True,
                     "stopPrice": ex.price_to_precision(symbol, new_sl),
@@ -246,6 +233,74 @@ def update_trailing_stop(ex, symbol, last_price):
     if moved:
         tg_send(f"🔧 跟踪止损上调 {symbol} side={side} new_best={fmt_price(trail_state[symbol]['best'])}")
 
+def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
+    """
+    提前止盈逻辑（仅做一次）：
+    - 持仓已盈利 >= 1×ATR(1h)
+    - 4h MACD 柱子弱化：多单 正值且变小；空单 负值且绝对值变小（向0靠近）
+    - RSI 过滤：多>65，空<35
+    触发：reduceOnly 市价减仓 PARTIAL_TP_RATIO
+    """
+    st = trail_state.get(symbol)
+    if not st or st.get("partial_done"):
+        return
+    side = st["side"]; entry = st["entry"]; atr1h = st["atr"]; qty_total = st["qty"]
+
+    # 盈利判断
+    profit_ok = False
+    if side == "多":
+        profit_ok = (last_price - entry) >= (1.0 * atr1h)
+    else:
+        profit_ok = (entry - last_price) >= (1.0 * atr1h)
+    if not profit_ok:
+        return
+
+    # 4h 指标
+    s4h, d4h = tf4h_details
+    if not d4h or "macd_hist_series" not in d4h:
+        return
+
+    macd_hist_series = d4h["macd_hist_series"]
+    if len(macd_hist_series) < 3:
+        return
+    # 用已收盘柱：-2 和 -1（因为 analyze_one_df 已去掉最后一根，这里 -1 是最近收盘柱）
+    hist_prev = float(macd_hist_series.iloc[-2])
+    hist_last = float(macd_hist_series.iloc[-1])
+    rsi4h = float(d4h["rsi"])
+
+    macd_weak = False
+    if side == "多":
+        # 正值且变小（走弱）
+        macd_weak = (hist_last > 0) and (hist_last < hist_prev) and (rsi4h > 65)
+    else:
+        # 负值且绝对值变小（走弱）
+        macd_weak = (hist_last < 0) and (abs(hist_last) < abs(hist_prev)) and (rsi4h < 35)
+
+    if not macd_weak:
+        return
+
+    reduce_qty = max(qty_total * PARTIAL_TP_RATIO, 0.0)
+    if reduce_qty <= 0:
+        return
+
+    if LIVE_TRADE != 1:
+        log(f"[纸面-提前止盈] {symbol} side={side} 减仓≈{reduce_qty} last≈{fmt_price(last_price)} entry≈{fmt_price(entry)} RSI4h={rsi4h:.2f}")
+        trail_state[symbol]["partial_done"] = True
+        tg_send(f"🟡 提前止盈(纸面) {symbol} {side} 减仓≈{reduce_qty:.6f} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
+        return
+
+    try:
+        if side == "多":
+            ex.create_order(symbol, type="MARKET", side="sell", amount=reduce_qty, params={"reduceOnly": True})
+        else:
+            ex.create_order(symbol, type="MARKET", side="buy", amount=reduce_qty, params={"reduceOnly": True})
+        trail_state[symbol]["partial_done"] = True
+        tg_send(f"🟢 提前止盈(已执行) {symbol} {side} 减仓≈{reduce_qty:.6f} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
+        log(f"[提前止盈成功] {symbol} side={side} reduce={reduce_qty}")
+    except Exception as e:
+        log(f"[提前止盈失败] {symbol}: {e}")
+        tg_send(f"❌ 提前止盈失败 {symbol}: {e}")
+
 # ========== 主循环 ==========
 def main():
     ex = build_exchange()
@@ -258,8 +313,6 @@ def main():
                 binance_set_leverage(ex, sym, LEVERAGE)
             except Exception as e:
                 log(f"设置杠杆失败 {sym}: {e}")
-
-    last_push_ts = 0
 
     while True:
         loop_start = time.time()
@@ -290,7 +343,7 @@ def main():
                 elif bear>=REQUIRED_CONFIRMS and bear>bull:
                     consensus="空"
 
-                # 每分钟也推一次（或你按小时推）
+                # 推送
                 lines = [f"{symbol} 当前多周期共识:（多:{bull} 空:{bear}）"]
                 for tf in TIMEFRAMES:
                     s, det = tf_details[tf]
@@ -299,62 +352,65 @@ def main():
 
                 # ======= 交易逻辑：仅对 TRADE_SYMBOLS 真下单 =======
                 if symbol in TRADE_SYMBOLS and consensus in ("多","空"):
-                    # 以 1h ATR 为基准风控（也可改成4h/加权）
+                    # 以 1h ATR 为基准风控
                     s1h, d1h = tf_details.get("1h", (None, None))
                     if not d1h:
                         continue
                     entry = d1h["entry"]
-                    atr   = d1h["atr"]
+                    atr1h = d1h["atr"]
                     price = entry
 
-                    # 计算数量
+                    # 数量
                     qty = amount_for_futures(ex, symbol, price)
                     if qty <= 0:
                         log(f"{symbol} 数量过小，跳过")
                         continue
 
-                    # 价格精度
-                    sl = None; tp=None
+                    # SL / TP
                     if consensus == "多":
-                        sl = price - SL_ATR_MULT*atr
-                        tp = price + TP_ATR_MULT*atr
+                        sl = price - SL_ATR_MULT*atr1h
+                        tp = price + TP_ATR_MULT*atr1h
                     else:
-                        sl = price + SL_ATR_MULT*atr
-                        tp = price - TP_ATR_MULT*atr
+                        sl = price + SL_ATR_MULT*atr1h
+                        tp = price - TP_ATR_MULT*atr1h
 
                     if LIVE_TRADE != 1:
-                        log(f"[纸面单] {symbol} {consensus} 市价 数量≈{qty} 进场≈{fmt_price(price)} SL≈{fmt_price(sl)} TP≈{fmt_price(tp)} ATR≈{fmt_price(atr)}")
-                        continue
+                        log(f"[纸面单] {symbol} {consensus} 市价 数量≈{qty} 进场≈{fmt_price(price)} SL≈{fmt_price(sl)} TP≈{fmt_price(tp)} ATR1h≈{fmt_price(atr1h)}")
+                    else:
+                        try:
+                            order_side = "buy" if consensus=="多" else "sell"
+                            ex.create_order(symbol, type="MARKET", side=order_side, amount=qty)
+                            log(f"[下单成功] {symbol} {order_side} qty={qty} price≈{fmt_price(price)}")
+                            tg_send(f"⚡ 开仓 {symbol} {consensus} 价≈{fmt_price(price)} 数量≈{qty}\nSL:{fmt_price(sl)} TP:{fmt_price(tp)} ATR1h:{fmt_price(atr1h)}")
+                            ok = create_sl_tp_orders(ex, symbol, consensus, qty, sl, tp)
+                            if not ok:
+                                tg_send(f"⚠️ {symbol} SL/TP 挂单失败，请检查")
+                        except Exception as e:
+                            log(f"[下单失败] {symbol}: {e}")
+                            tg_send(f"❌ 下单失败 {symbol}: {e}")
+                            continue
 
-                    try:
-                        # 开仓
-                        order_side = "buy" if consensus=="多" else "sell"
-                        o = ex.create_order(symbol, type="MARKET", side=order_side, amount=qty)
-                        log(f"[下单成功] {symbol} {order_side} qty={qty} price≈{fmt_price(price)}")
-                        tg_send(f"⚡ 开仓 {symbol} {consensus} 价≈{fmt_price(price)} 数量≈{qty}\nSL:{fmt_price(sl)} TP:{fmt_price(tp)} ATR:{fmt_price(atr)}")
+                    # 初始化跟踪/提前止盈状态（纸面/实盘都维护，便于观察）
+                    trail_state[symbol] = {
+                        "side": consensus,
+                        "best": price,
+                        "atr": atr1h,      # 用1h ATR 作为跟踪阈值与盈利阈值
+                        "qty": qty,
+                        "entry": price,
+                        "partial_done": False,
+                    }
 
-                        # 挂 SL / TP 减仓单
-                        ok = create_sl_tp_orders(ex, symbol, consensus, qty, sl, tp)
-                        if ok:
-                            # 初始化跟踪止盈状态
-                            trail_state[symbol] = {
-                                "side": consensus,
-                                "best": price,   # 多：最高价；空：最低价（简单用进场价初始化）
-                                "atr": atr,
-                                "qty": qty
-                            }
-                    except Exception as e:
-                        log(f"[下单失败] {symbol}: {e}")
-                        tg_send(f"❌ 下单失败 {symbol}: {e}")
-
-                # ======= 跟踪止盈：每轮更新 =======
+                # ======= 每轮：更新跟踪止盈 + 检查4h MACD弱化提前止盈 =======
                 try:
                     ticker = ex.fetch_ticker(symbol)
                     last_price = float(ticker.get("last") or ticker.get("close") or 0.0)
                     if last_price:
                         update_trailing_stop(ex, symbol, last_price)
+                        # 只有持仓中的 symbol 才检查提前止盈
+                        if symbol in trail_state and "4h" in tf_details:
+                            macd_weakening_and_partial_tp(ex, symbol, last_price, tf_details["4h"])
                 except Exception as e:
-                    log(f"获取价格/更新跟踪失败 {symbol}: {e}")
+                    log(f"获取价格/更新止盈失败 {symbol}: {e}")
 
         except Exception as e:
             log(f"[主循环异常] {e}\n{traceback.format_exc()}")
