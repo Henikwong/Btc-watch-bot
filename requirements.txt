@@ -1,6 +1,6 @@
-ccxt
+ccxt>=3.0.0
 requests
 pandas
 numpy
 ta
-python-dotenv   
+python-dotenv 
