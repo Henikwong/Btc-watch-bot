@@ -1,4 +1,4 @@
-# autotrader.py  — 完整整合版（包含：ATR 止损/止盈、跟踪止盈、4h MACD弱化提前止盈、开仓前 MACD 动能过滤）
+# autotrader.py  — 完整整合版（已集成：1h+4h 同步 MACD 动能过滤 + ATR 止损/止盈、跟踪止盈、4h MACD弱化提前止盈）
 import os, time, math, traceback
 import requests
 import ccxt
@@ -35,7 +35,7 @@ SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))   # 止损=2*ATR
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))   # 止盈=3*ATR
 TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
 PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))  # 提前止盈减仓比例（默认30%）
-MACD_FILTER_TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")  # 用哪一个周期做开仓前的MACD动能过滤（默认4h）
+MACD_FILTER_TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")  # 保留但主逻辑改为1h+4h
 
 # ========= 小工具 =========
 def nowstr():
@@ -137,7 +137,7 @@ def analyze_one_df(df):
 # ==== 新版 MACD 动能判定 ====
 def get_macd_status(macd_hist_series):
     """
-    判断 MACD 动能状态（用于 4h 输出与开仓过滤）
+    判断 MACD 动能状态（用于 1h/4h 输出与开仓过滤）
     返回: '增强' / '减弱' / '翻转' / '未知'
     逻辑：
       - 比较最近两根已收盘柱（-2 与 -1）
@@ -289,36 +289,30 @@ def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
         log(f"[提前止盈失败] {symbol}: {e}")
         tg_send(f"❌ 提前止盈失败 {symbol}: {e}")
 
-# ========= 新增：开仓前的 MACD 动能过滤 =========
+# ========= 新版：同时检查 1h + 4h MACD 动能过滤 =========
 def should_open_trade(consensus, tf_details):
     """
-    consensus: '多' / '空'
-    tf_details: dict of {tf: (side, det)}
-    返回 True/False：是否允许开仓（基于 MACD 动能过滤）
-    逻辑：使用 MACD_FILTER_TIMEFRAME（默认4h）：
-      - 若 consensus == 多：要求 4h det['macd'] > 0 且 最近一根 macd_hist >= 上一根（即没有明显变弱）
-      - 若 consensus == 空：要求 4h det['macd'] < 0 且 最近一根 macd_hist <= 上一根（空头力度不减小）
+    更严格的开仓过滤：要求 1h 与 4h 的 MACD 动能 都为 '增强' 才允许开仓。
+    若任一为 '翻转' / '减弱' / '未知' / 数据缺失，则不允许开仓。
+    返回: (allow: bool, status_1h: str, status_4h: str)
     """
-    tf = MACD_FILTER_TIMEFRAME
-    s4, d4 = tf_details.get(tf, (None, None))
-    if not d4:
-        return True  # 没数据则不阻止（保守可以返回 False）
-    hist_series = d4.get("macd_hist_series")
-    if hist_series is None or len(hist_series) < 2:
-        return True
-    last = float(hist_series.iloc[-1]); prev = float(hist_series.iloc[-2])
-    # 检查翻转/减弱
-    status = get_macd_status(hist_series)
-    if status == "翻转":
-        return False
-    if consensus == "多":
-        if last <= 0 or last < prev:
-            return False
-        return True
-    else:
-        if last >= 0 or abs(last) < abs(prev):
-            return False
-        return True
+    def get_status_for(tf):
+        tpl = tf_details.get(tf)
+        if not tpl or tpl[1] is None:
+            return "未知"
+        det = tpl[1]
+        return get_macd_status(det.get("macd_hist_series"))
+
+    s1 = get_status_for("1h")
+    s4 = get_status_for("4h")
+
+    # 若任一翻转则直接拒绝
+    if s1 == "翻转" or s4 == "翻转":
+        return False, s1, s4
+    # 必须两者都是 增强 才允许
+    if s1 == "增强" and s4 == "增强":
+        return True, s1, s4
+    return False, s1, s4
 
 # ========= 主循环 =========
 def main():
@@ -366,12 +360,12 @@ def main():
 
                 # 交易（仅对 TRADE_SYMBOLS）
                 if symbol in TRADE_SYMBOLS and consensus in ("多","空"):
-                    # MACD 动能过滤（基于 4h 默认为 MACD_FILTER_TIMEFRAME）
-                    allow = should_open_trade(consensus, tf_details)
+                    # 严格：同时检查 1h & 4h MACD 动能
+                    allow, status1h, status4h = should_open_trade(consensus, tf_details)
                     if not allow:
-                        status = "翻转" if (tf_details.get(MACD_FILTER_TIMEFRAME) and tf_details[MACD_FILTER_TIMEFRAME][1] and get_macd_status(tf_details[MACD_FILTER_TIMEFRAME][1].get("macd_hist_series"))=="翻转") else "减弱/未通过"
-                        log(f"{symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}）— 跳过开仓 [{status}]")
-                        tg_send(f"⚠️ {symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}），取消本次开仓 [{status}]")
+                        status = f"{status1h}/{status4h}"
+                        log(f"{symbol} {consensus} 被 MACD 动能过滤（1h+4h）— 跳过开仓 [{status}]")
+                        tg_send(f"⚠️ {symbol} {consensus} 被 MACD 动能过滤（1h+4h），取消本次开仓 [{status}]")
                         continue
 
                     s1h, d1h = tf_details.get("1h", (None, None))
