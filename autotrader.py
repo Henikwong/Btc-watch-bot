@@ -26,7 +26,7 @@ LEVERAGE  = int(os.getenv("LEVERAGE", "10"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))
 
-REQUIRED_CONFIRMS = 2  # 多周期或多交易所共识
+REQUIRED_CONFIRMS = 2  # 多交易所或多周期共识
 TIMEFRAMES = ["1h", "4h", "1d"]
 
 def nowstr():
@@ -71,10 +71,10 @@ def fetch_df(ex, symbol, timeframe, limit=200):
 # ========= 指标计算 =========
 def compute_atr(df, period=14):
     high = df["high"]; low=df["low"]; close=df["close"]
-    tr1 = high-low
-    tr2 = (high-close.shift(1)).abs()
-    tr3 = (low-close.shift(1)).abs()
-    tr = pd.concat([tr1,tr2,tr3], axis=1).max(axis=1)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return float(tr.rolling(period).mean().iloc[-1])
 
 def indicators_and_side(df):
@@ -97,12 +97,8 @@ def indicators_and_side(df):
 
     vol_trend = (vol.iloc[-1]-vol.iloc[-2])/(vol.iloc[-2]+1e-12)
 
-    score_bull = sum([
-        ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0
-    ])
-    score_bear = sum([
-        ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0
-    ])
+    score_bull = sum([ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0])
+    score_bear = sum([ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0])
 
     side = None
     if score_bull>=4 and score_bull>=score_bear+2:
@@ -117,8 +113,7 @@ def indicators_and_side(df):
         "wr": float(wr),
         "k_trend": k_trend,
         "vol_trend": float(vol_trend),
-        "entry": float(close.iloc[-1]),
-        "atr": compute_atr(df)
+        "entry": float(close.iloc[-1])
     }
     return side, det
 
@@ -153,7 +148,7 @@ def summarize(tf, side, det):
     return (f"{tf} | 方向:{side or '无'} 入场:{format_price(det['entry']) if det else '-'} | "
             f"EMA:{det['ema_trend'] if det else '-'} MACD:{round(det['macd'],4) if det else '-'} "
             f"RSI:{round(det['rsi'],2) if det else '-'} WR:{round(det['wr'],2) if det else '-'} "
-            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'} ATR:{round(det['atr'],2) if det else '-'}")
+            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'}")
 
 # ========= 主循环 =========
 def main():
@@ -179,4 +174,8 @@ def main():
                             details[f"{ex.id}_{tf}"] = (side, det, df)
                         except Exception as e:
                             log(f"❌ 获取/计算失败 {symbol} {tf} {ex.id}: {e}")
-                            side_votes
+                            side_votes.append(None)
+
+                    # 多交易所共识
+                    bull = sum(1 for s in side_votes if s=="多")
+                    bear = sum(1 for s in side_votes if s
