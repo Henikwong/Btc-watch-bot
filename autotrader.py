@@ -353,4 +353,4 @@ def main():
         return
 
     tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
-    log(f"TRADE_SYMBOLS={
+    log(f"TRADE_SYMBOLS={）
