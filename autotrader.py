@@ -497,4 +497,7 @@ def main():
             log(f"[主循环异常] {e}\n{traceback.format_exc()}")
 
         used = time.time() - loop_start
-        time.sleep(max(1
+        time.sleep(max(1, POLL_INTERVAL - int(used)))
+
+if __name__ == "__main__":
+    main()
