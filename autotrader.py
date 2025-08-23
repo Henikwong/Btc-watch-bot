@@ -69,14 +69,6 @@ def fetch_df(ex, symbol, timeframe, limit=200):
     return df
 
 # ========= 指标计算 =========
-def compute_atr(df, period=14):
-    high = df["high"]; low=df["low"]; close=df["close"]
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
-
 def indicators_and_side(df):
     if df is None or len(df)<35:
         return None, None
@@ -92,7 +84,8 @@ def indicators_and_side(df):
     rsi = ta.momentum.RSIIndicator(close,14).rsi().iloc[-1]
     wr  = ta.momentum.WilliamsRIndicator(high, low, close,14).williams_r().iloc[-1]
     stoch = ta.momentum.StochasticOscillator(high, low, close,9,3)
-    k_val = stoch.stoch().iloc[-1]; d_val = stoch.stoch_signal().iloc[-1]
+    k_val = stoch.stoch().iloc[-1]
+    d_val = stoch.stoch_signal().iloc[-1]
     k_trend = "多" if k_val>d_val else ("空" if k_val<d_val else "中性")
 
     vol_trend = (vol.iloc[-1]-vol.iloc[-2])/(vol.iloc[-2]+1e-12)
@@ -156,7 +149,6 @@ def main():
     log(f"启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} LIVE={LIVE_TRADE}")
     tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'}")
 
-    last_push = 0
     while True:
         loop_start = time.time()
         try:
@@ -178,4 +170,27 @@ def main():
 
                     # 多交易所共识
                     bull = sum(1 for s in side_votes if s=="多")
-                    bear = sum(1 for s in side_votes if s
+                    bear = sum(1 for s in side_votes if s=="空")
+                    final_tf_side = None
+                    if bull>=REQUIRED_CONFIRMS and bull>bear:
+                        final_tf_side="多"
+                    elif bear>=REQUIRED_CONFIRMS and bear>bull:
+                        final_tf_side="空"
+                    all_sides.append(final_tf_side)
+                    log(f"{tf} 共识方向: {final_tf_side}")
+
+                # 最终多周期共识（1h+4h+1d）可以再处理
+                tg_message = f"{symbol} 当前多周期共识:\n"
+                for tf in TIMEFRAMES:
+                    side, det, _ = details.get(f"{EXCHANGE_NAME}_{tf}", (None, None, None))
+                    tg_message += summarize(tf, side, det) + "\n"
+                tg_send(tg_message)
+
+        except Exception as e:
+            log(f"主循环错误: {e}\n{traceback.format_exc()}")
+
+        elapsed = time.time() - loop_start
+        time.sleep(max(0, POLL_INTERVAL - elapsed))
+
+if __name__=="__main__":
+    main()
