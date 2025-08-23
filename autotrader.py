@@ -26,9 +26,10 @@ LEVERAGE  = int(os.getenv("LEVERAGE", "10"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))
 
-REQUIRED_CONFIRMS = 2  # 多交易所或多周期共识
+REQUIRED_CONFIRMS = 2  # 多周期共识
 TIMEFRAMES = ["1h", "4h", "1d"]
 
+# ========= 工具函数 =========
 def nowstr():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -44,12 +45,13 @@ def tg_send(text):
     except Exception as e:
         log(f"TG发送失败: {e}")
 
-# ========= CCXT 交易所构建 =========
+# ========= CCXT 构建交易所 =========
 def build_exchange(name, api_key, api_secret):
     params = {"apiKey": api_key, "secret": api_secret, "enableRateLimit": True}
     if name=="binance":
         ex = ccxt.binance(params)
         ex.options["defaultType"] = "future"
+        ex.set_sandbox_mode(False)
     elif name=="okx":
         ex = ccxt.okx(params)
         ex.options["defaultType"] = "future"
@@ -97,12 +99,8 @@ def indicators_and_side(df):
 
     vol_trend = (vol.iloc[-1]-vol.iloc[-2])/(vol.iloc[-2]+1e-12)
 
-    score_bull = sum([
-        ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0
-    ])
-    score_bear = sum([
-        ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0
-    ])
+    score_bull = sum([ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0])
+    score_bear = sum([ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0])
 
     side = None
     if score_bull>=4 and score_bull>=score_bear+2:
@@ -117,20 +115,23 @@ def indicators_and_side(df):
         "wr": float(wr),
         "k_trend": k_trend,
         "vol_trend": float(vol_trend),
-        "entry": float(close.iloc[-1])
+        "entry": float(close.iloc[-1]),
+        "atr": compute_atr(df)
     }
     return side, det
 
 # ========= 下单 =========
-def futures_qty(entry, leverage):
-    return max(0.0001, BASE_USDT * leverage / max(entry,1e-8))
+def futures_qty(entry, leverage, ex, symbol):
+    qty = BASE_USDT * leverage / max(entry,1e-8)
+    min_qty = ex.markets[symbol]['limits']['amount']['min']
+    return max(qty, min_qty)
 
 def place_order(ex, symbol, side, entry):
-    qty = futures_qty(entry, LEVERAGE)
+    qty = futures_qty(entry, LEVERAGE, ex, symbol)
     order_side = "buy" if side=="多" else "sell"
     params = {}
     if LIVE_TRADE!=1:
-        log(f"[纸面单] {symbol} {side} 市价 数量≈{qty}")
+        log(f"[纸面单] {symbol} {side} 市价 数量≈{qty:.6f}")
         return {"id":"paper","amount":qty,"side":order_side}
     try:
         o = ex.create_order(symbol, type="market", side=order_side, amount=qty, params=params)
@@ -152,11 +153,18 @@ def summarize(tf, side, det):
     return (f"{tf} | 方向:{side or '无'} 入场:{format_price(det['entry']) if det else '-'} | "
             f"EMA:{det['ema_trend'] if det else '-'} MACD:{round(det['macd'],4) if det else '-'} "
             f"RSI:{round(det['rsi'],2) if det else '-'} WR:{round(det['wr'],2) if det else '-'} "
-            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'}")
+            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'} ATR:{round(det['atr'],2) if det else '-'}")
 
 # ========= 主循环 =========
 def main():
-    exchanges = [build_exchange(EXCHANGE_NAME, API_KEY, API_SECRET)]
+    ex = build_exchange(EXCHANGE_NAME, API_KEY, API_SECRET)
+    # 设置杠杆
+    for sym in SYMBOLS:
+        try:
+            ex.fapiPrivate_post_leverage({"symbol": sym.replace("/",""), "leverage": LEVERAGE})
+        except Exception as e:
+            log(f"设置杠杆失败 {sym}: {e}")
+
     log(f"启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} LIVE={LIVE_TRADE}")
     tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'}")
 
@@ -165,27 +173,44 @@ def main():
         loop_start = time.time()
         try:
             for symbol in SYMBOLS:
-                all_sides=[]
+                sides=[]
                 details={}
-
                 for tf in TIMEFRAMES:
-                    side_votes=[]
-                    for ex in exchanges:
-                        try:
-                            df = fetch_df(ex, symbol, tf, 200)
-                            side, det = indicators_and_side(df)
-                            side_votes.append(side)
-                            details[f"{ex.id}_{tf}"] = (side, det, df)
-                        except Exception as e:
-                            log(f"❌ 获取/计算失败 {symbol} {tf} {ex.id}: {e}")
-                            side_votes.append(None)
-                    # 多交易所共识
-                    bull = sum(1 for s in side_votes if s=="多")
-                    bear = sum(1 for s in side_votes if s=="空")
-                    final_tf_side = None
-                    if bull>=REQUIRED_CONFIRMS and bull>bear:
-                        final_tf_side="多"
-                    elif bear>=REQUIRED_CONFIRMS and bear>bull:
-                        final_tf_side="空"
-                    all_sides.append(final_tf_side)
-                    log(f"{tf} 共识方向: {final_tf
+                    df = fetch_df(ex, symbol, tf, 200)
+                    side, det = indicators_and_side(df)
+                    sides.append(side)
+                    details[tf] = (side, det, df)
+                    log(summarize(tf, side, det))
+
+                bull = sum(1 for s in sides if s=="多")
+                bear = sum(1 for s in sides if s=="空")
+                final_side = None
+                if bull>=REQUIRED_CONFIRMS and bull>bear:
+                    final_side="多"
+                elif bear>=REQUIRED_CONFIRMS and bear>bull:
+                    final_side="空"
+
+                # 每小时推送
+                now_ts = int(time.time())
+                if now_ts - last_push >= 3600:
+                    tg_send(f"⏰ [{symbol}] 多周期评级: 多:{bull} 空:{bear}")
+                    for tf in TIMEFRAMES:
+                        s, det, _ = details[tf]
+                        tg_send(summarize(tf, s, det))
+                    last_push = now_ts
+
+                # 下单
+                if final_side:
+                    s1h, d1h, _ = details["1h"]
+                    if d1h:
+                        entry = d1h["entry"]
+                        place_order(ex, symbol, final_side, entry)
+
+        except Exception as e:
+            log(f"[主循环异常] {e}\n{traceback.format_exc()}")
+
+        used = time.time() - loop_start
+        time.sleep(max(1, POLL_INTERVAL - int(used)))
+
+if __name__=="__main__":
+    main()
