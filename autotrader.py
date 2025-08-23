@@ -57,7 +57,7 @@ def tg_send(text):
 def build_exchange():
     if EXCHANGE_NAME != "binance":
         raise RuntimeError(f"当前脚本仅示例 binance，收到: {EXCHANGE_NAME}")
-    ex = ccxt.binance({
+    ex = ccxt.binance({...})
         "apiKey": API_KEY,
         "secret": API_SECRET,
         "enableRateLimit": True,
