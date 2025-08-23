@@ -275,6 +275,21 @@ def should_open_trade(consensus, tf_details):
       - 若 consensus == 多：要求 4h det['macd'] > 0 且 最近一根 macd_hist >= 上一根（即没有明显变弱）
       - 若 consensus == 空：要求 4h det['macd'] < 0 且 最近一根 macd_hist <= 上一根（空头力度不减小）
     """
+    def get_macd_status(macd_hist):
+    if len(macd_hist) < 2:
+        return "未知"
+    prev, curr = macd_hist[-2], macd_hist[-1]
+    if curr > prev and curr > 0:
+        return "增强"
+    elif curr < prev and curr > 0:
+        return "减弱"
+    elif curr < prev and curr < 0:
+        return "增强"
+    elif curr > prev and curr < 0:
+        return "减弱"
+    elif (prev <= 0 and curr > 0) or (prev >= 0 and curr < 0):
+        return "翻转"
+    return "未知"
     tf = MACD_FILTER_TIMEFRAME
     s4, d4 = tf_details.get(tf, (None, None))
     if not d4:
