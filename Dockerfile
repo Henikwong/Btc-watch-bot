@@ -18,3 +18,4 @@ COPY . .
 
 # 启动
 CMD ["python", "autotrader.py"]
+ENV PYTHONUNBUFFERED=1
