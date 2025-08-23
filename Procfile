@@ -1,1 +1,1 @@
-test: python3 test_tg.py
+worker: python autotrader.py
