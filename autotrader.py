@@ -1,196 +1,110 @@
-import os, time, math, traceback
-import requests
+import os
 import ccxt
 import pandas as pd
 import numpy as np
 import ta
-from datetime import datetime
+import time
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========= ENV =========
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+# ============ 环境变量 ============
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower()
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT").split(",")
+MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
 
-EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower()  # binance / okx / huobi
-API_KEY   = os.getenv("API_KEY", "")
-API_SECRET= os.getenv("API_SECRET", "")
-
-MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()  # future / spot
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
-
-BASE_USDT = float(os.getenv("BASE_USDT", "15"))
-ATR_MULT  = float(os.getenv("RISK_ATR_MULT", "1.5"))
-LEVERAGE  = int(os.getenv("LEVERAGE", "10"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))
-
-REQUIRED_CONFIRMS = 2  # 多交易所或多周期共识
-TIMEFRAMES = ["1h", "4h", "1d"]
-
-def nowstr():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def log(msg):
-    print(f"[{nowstr()}] {msg}", flush=True)
-
-def tg_send(text):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TG_CHAT, "text": text})
-    except Exception as e:
-        log(f"TG发送失败: {e}")
-
-# ========= CCXT 交易所构建 =========
+# ============ 初始化交易所 ============
 def build_exchange(name, api_key, api_secret):
-    params = {"apiKey": api_key, "secret": api_secret, "enableRateLimit": True}
-    if name=="binance":
-        ex = ccxt.binance(params)
-        ex.options["defaultType"] = "future"
-    elif name=="okx":
-        ex = ccxt.okx(params)
-        ex.options["defaultType"] = "future"
-    elif name=="huobi":
-        ex = ccxt.huobi(params)
-        ex.options["defaultType"] = "swap"
+    if name == "binance":
+        exchange = ccxt.binance({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": MARKET_TYPE}
+        })
     else:
         raise RuntimeError(f"不支持交易所: {name}")
-    return ex
+    return exchange
 
-# ========= OHLCV 抓取 =========
-def fetch_df(ex, symbol, timeframe, limit=200):
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-    for c in ["open","high","low","close","vol"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+# ============ 技术指标分析 ============
+def analyze(df: pd.DataFrame):
+    # 计算 EMA
+    df["ema"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
+    # MACD
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd_diff()
+    # RSI
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+    # Williams %R
+    df["wr"] = ta.momentum.WilliamsRIndicator(df["high"], df["low"], df["close"], lbp=14).williams_r()
+    # KDJ (用随机指标近似)
+    stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
+    df["kdj"] = stoch.stoch()
+    # 成交量变化率
+    df["vol_delta"] = df["volume"].pct_change()
+    # 🔥 新增 ATR
+    df["atr"] = ta.volatility.AverageTrueRange(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    ).average_true_range()
 
-# ========= 指标计算 =========
-def indicators_and_side(df):
-    if df is None or len(df)<35:
-        return None, None
-    work = df.iloc[:-1].copy()
-    close, high, low, vol = work["close"], work["high"], work["low"], work["vol"]
-
-    ema5  = close.ewm(span=5).mean().iloc[-1]
-    ema10 = close.ewm(span=10).mean().iloc[-1]
-    ema30 = close.ewm(span=30).mean().iloc[-1]
-    ema_trend = "多" if (ema5>ema10>ema30) else ("空" if (ema5<ema10<ema30) else "中性")
-
-    macd_hist = ta.trend.MACD(close).macd_diff().iloc[-1]
-    rsi = ta.momentum.RSIIndicator(close,14).rsi().iloc[-1]
-    wr  = ta.momentum.WilliamsRIndicator(high, low, close,14).williams_r().iloc[-1]
-    stoch = ta.momentum.StochasticOscillator(high, low, close,9,3)
-    k_val = stoch.stoch().iloc[-1]
-    d_val = stoch.stoch_signal().iloc[-1]
-    k_trend = "多" if k_val>d_val else ("空" if k_val<d_val else "中性")
-
-    vol_trend = (vol.iloc[-1]-vol.iloc[-2])/(vol.iloc[-2]+1e-12)
-
-    score_bull = sum([ema_trend=="多", macd_hist>0, rsi>50, wr>-50, k_trend=="多", vol_trend>0])
-    score_bear = sum([ema_trend=="空", macd_hist<0, rsi<50, wr<-50, k_trend=="空", vol_trend<0])
-
-    side = None
-    if score_bull>=4 and score_bull>=score_bear+2:
-        side="多"
-    elif score_bear>=4 and score_bear>=score_bull+2:
-        side="空"
-
-    det = {
-        "ema_trend": ema_trend,
-        "macd": float(macd_hist),
-        "rsi": float(rsi),
-        "wr": float(wr),
-        "k_trend": k_trend,
-        "vol_trend": float(vol_trend),
-        "entry": float(close.iloc[-1])
+    latest = df.iloc[-1]
+    return {
+        "ema": "多" if latest["close"] > latest["ema"] else "空" if latest["close"] < latest["ema"] else "中性",
+        "macd": latest["macd"],
+        "rsi": latest["rsi"],
+        "wr": latest["wr"],
+        "kdj": "多" if latest["kdj"] > 50 else "空",
+        "vol_delta": latest["vol_delta"],
+        "atr": latest["atr"],   # 🔥 加上 ATR
     }
-    return side, det
 
-# ========= 下单 =========
-def futures_qty(entry, leverage):
-    return max(0.0001, BASE_USDT * leverage / max(entry,1e-8))
-
-def place_order(ex, symbol, side, entry):
-    qty = futures_qty(entry, LEVERAGE)
-    order_side = "buy" if side=="多" else "sell"
-    params = {}
-    if LIVE_TRADE!=1:
-        log(f"[纸面单] {symbol} {side} 市价 数量≈{qty}")
-        return {"id":"paper","amount":qty,"side":order_side}
+# ============ Telegram 推送 ============
+def send_telegram(msg: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     try:
-        o = ex.create_order(symbol, type="market", side=order_side, amount=qty, params=params)
-        log(f"[下单成功] {o}")
-        return o
+        requests.post(url, data=data)
     except Exception as e:
-        log(f"[下单失败] {e}")
-        tg_send(f"❌ 下单失败 {symbol} {side}: {e}")
-        return None
+        print("发送Telegram失败:", e)
 
-def format_price(p):
-    p = float(p)
-    if p>=100: return f"{p:.2f}"
-    if p>=1:   return f"{p:.4f}"
-    if p>=0.01:return f"{p:.6f}"
-    return f"{p:.8f}"
-
-def summarize(tf, side, det):
-    return (f"{tf} | 方向:{side or '无'} 入场:{format_price(det['entry']) if det else '-'} | "
-            f"EMA:{det['ema_trend'] if det else '-'} MACD:{round(det['macd'],4) if det else '-'} "
-            f"RSI:{round(det['rsi'],2) if det else '-'} WR:{round(det['wr'],2) if det else '-'} "
-            f"KDJ:{det['k_trend'] if det else '-'} VOLΔ:{round(det['vol_trend'],3) if det else '-'}")
-
-# ========= 主循环 =========
+# ============ 主循环 ============
 def main():
-    exchanges = [build_exchange(EXCHANGE_NAME, API_KEY, API_SECRET)]
-    log(f"启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} LIVE={LIVE_TRADE}")
-    tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'}")
+    ex = build_exchange(EXCHANGE_NAME, API_KEY, API_SECRET)
+    timeframes = ["1h", "4h", "1d"]
 
     while True:
-        loop_start = time.time()
-        try:
-            for symbol in SYMBOLS:
-                all_sides=[]
-                details={}
+        all_msgs = []
+        for sym in SYMBOLS:
+            sym = sym.strip()
+            sym_msgs = [f"{sym} 当前多周期共识:"]
+            for tf in timeframes:
+                ohlcv = ex.fetch_ohlcv(sym, tf, limit=200)
+                df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+                info = analyze(df)
 
-                for tf in TIMEFRAMES:
-                    side_votes=[]
-                    for ex in exchanges:
-                        try:
-                            df = fetch_df(ex, symbol, tf, 200)
-                            side, det = indicators_and_side(df)
-                            side_votes.append(side)
-                            details[f"{ex.id}_{tf}"] = (side, det, df)
-                        except Exception as e:
-                            log(f"❌ 获取/计算失败 {symbol} {tf} {ex.id}: {e}")
-                            side_votes.append(None)
+                direction = "多" if info["macd"] > 0 and info["rsi"] > 55 else "空" if info["macd"] < 0 and info["rsi"] < 45 else "无"
+                price = df["close"].iloc[-1]
 
-                    # 多交易所共识
-                    bull = sum(1 for s in side_votes if s=="多")
-                    bear = sum(1 for s in side_votes if s=="空")
-                    final_tf_side = None
-                    if bull>=REQUIRED_CONFIRMS and bull>bear:
-                        final_tf_side="多"
-                    elif bear>=REQUIRED_CONFIRMS and bear>bull:
-                        final_tf_side="空"
-                    all_sides.append(final_tf_side)
-                    log(f"{tf} 共识方向: {final_tf_side}")
+                line = (
+                    f"{tf} | 方向:{direction} 入场:{price:.2f} | "
+                    f"EMA:{info['ema']} MACD:{info['macd']:.4f} RSI:{info['rsi']:.2f} "
+                    f"WR:{info['wr']:.2f} KDJ:{info['kdj']} VOLΔ:{info['vol_delta']:.3f} ATR:{info['atr']:.2f}"
+                )
+                sym_msgs.append(line)
 
-                # 最终多周期共识（1h+4h+1d）可以再处理
-                tg_message = f"{symbol} 当前多周期共识:\n"
-                for tf in TIMEFRAMES:
-                    side, det, _ = details.get(f"{EXCHANGE_NAME}_{tf}", (None, None, None))
-                    tg_message += summarize(tf, side, det) + "\n"
-                tg_send(tg_message)
+            all_msgs.append("\n".join(sym_msgs))
 
-        except Exception as e:
-            log(f"主循环错误: {e}\n{traceback.format_exc()}")
+        send_telegram("加密bot:\n" + "\n\n".join(all_msgs))
+        time.sleep(POLL_INTERVAL)
 
-        elapsed = time.time() - loop_start
-        time.sleep(max(0, POLL_INTERVAL - elapsed))
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
