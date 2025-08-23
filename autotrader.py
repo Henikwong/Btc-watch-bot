@@ -71,7 +71,7 @@ def binance_set_leverage(ex, symbol, lev):
         return
     try:
         market = ex.market(symbol)
-        # 设置杠杆（部分 ccxt 版本不同，API 路径可能需要调整）
+        # 设置杠杆（对某些 ccxt 版本可能需改 API 路径）
         ex.fapiPrivate_post_leverage({"symbol": market["id"], "leverage": int(lev)})
     except Exception as e:
         log(f"设置杠杆失败 {symbol}: {e}")
@@ -96,6 +96,7 @@ def analyze_one_df(df):
     ema30 = close.ewm(span=30).mean().iloc[-1]
     ema_trend = "多" if (ema5>ema10>ema30) else ("空" if (ema5<ema10<ema30) else "中性")
 
+    # MACD via ta
     macd = ta.trend.MACD(close)
     macd_hist_series = macd.macd_diff()
     macd_hist = float(macd_hist_series.iloc[-1])
@@ -133,20 +134,43 @@ def analyze_one_df(df):
     }
     return side, det
 
-def macd_strength_label(macd_hist_series):
+# ==== 新版 MACD 动能判定 ====
+def get_macd_status(macd_hist_series):
+    """
+    判断 MACD 动能状态（用于 4h 输出与开仓过滤）
+    返回: '增强' / '减弱' / '翻转' / '未知'
+    逻辑：
+      - 比较最近两根已收盘柱（-2 与 -1）
+      - 若 curr > prev 且 curr > 0 => 增强（多头增强）
+      - 若 curr < prev 且 curr > 0 => 减弱（多头减弱）
+      - 若 curr < prev 且 curr < 0 => 增强（空头增强）
+      - 若 curr > prev 且 curr < 0 => 减弱（空头减弱）
+      - 若 prev 与 curr 异号 => 翻转
+    """
     try:
-        if macd_hist_series is None or len(macd_hist_series) < 3:
-            return "—"
-        prev_ = float(macd_hist_series.iloc[-2])
-        last_ = float(macd_hist_series.iloc[-1])
-        if last_ > prev_:
+        if macd_hist_series is None or len(macd_hist_series) < 2:
+            return "未知"
+        prev = float(macd_hist_series.iloc[-2])
+        curr = float(macd_hist_series.iloc[-1])
+        # 翻转优先判断（由负到正或正到负）
+        if (prev <= 0 and curr > 0) or (prev >= 0 and curr < 0):
+            return "翻转"
+        if curr > prev and curr > 0:
             return "增强"
-        elif last_ < prev_:
+        elif curr < prev and curr > 0:
             return "减弱"
-        else:
-            return "持平"
+        elif curr < prev and curr < 0:
+            return "增强"
+        elif curr > prev and curr < 0:
+            return "减弱"
+        return "未知"
     except Exception:
-        return "—"
+        return "未知"
+
+def macd_strength_label(macd_hist_series):
+    """兼容旧处使用：调用 get_macd_status 并返回直观标签（或短横线）"""
+    s = get_macd_status(macd_hist_series)
+    return s if s else "—"
 
 def summarize(tf, side, det):
     if not det:
@@ -275,21 +299,6 @@ def should_open_trade(consensus, tf_details):
       - 若 consensus == 多：要求 4h det['macd'] > 0 且 最近一根 macd_hist >= 上一根（即没有明显变弱）
       - 若 consensus == 空：要求 4h det['macd'] < 0 且 最近一根 macd_hist <= 上一根（空头力度不减小）
     """
-    def get_macd_status(macd_hist):
-    if len(macd_hist) < 2:
-        return "未知"
-    prev, curr = macd_hist[-2], macd_hist[-1]
-    if curr > prev and curr > 0:
-        return "增强"
-    elif curr < prev and curr > 0:
-        return "减弱"
-    elif curr < prev and curr < 0:
-        return "增强"
-    elif curr > prev and curr < 0:
-        return "减弱"
-    elif (prev <= 0 and curr > 0) or (prev >= 0 and curr < 0):
-        return "翻转"
-    return "未知"
     tf = MACD_FILTER_TIMEFRAME
     s4, d4 = tf_details.get(tf, (None, None))
     if not d4:
@@ -298,8 +307,12 @@ def should_open_trade(consensus, tf_details):
     if hist_series is None or len(hist_series) < 2:
         return True
     last = float(hist_series.iloc[-1]); prev = float(hist_series.iloc[-2])
+    # 检查翻转/减弱
+    status = get_macd_status(hist_series)
+    if status == "翻转":
+        return False
     if consensus == "多":
-        if last <= 0 or last < prev: 
+        if last <= 0 or last < prev:
             return False
         return True
     else:
@@ -356,8 +369,9 @@ def main():
                     # MACD 动能过滤（基于 4h 默认为 MACD_FILTER_TIMEFRAME）
                     allow = should_open_trade(consensus, tf_details)
                     if not allow:
-                        log(f"{symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}）— 跳过开仓")
-                        tg_send(f"⚠️ {symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}），取消本次开仓")
+                        status = "翻转" if (tf_details.get(MACD_FILTER_TIMEFRAME) and tf_details[MACD_FILTER_TIMEFRAME][1] and get_macd_status(tf_details[MACD_FILTER_TIMEFRAME][1].get("macd_hist_series"))=="翻转") else "减弱/未通过"
+                        log(f"{symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}）— 跳过开仓 [{status}]")
+                        tg_send(f"⚠️ {symbol} {consensus} 被 MACD 动能过滤（{MACD_FILTER_TIMEFRAME}），取消本次开仓 [{status}]")
                         continue
 
                     s1h, d1h = tf_details.get("1h", (None, None))
