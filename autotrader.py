@@ -235,4 +235,16 @@ def main():
                     if symbol not in trail_state:
                         trail_state[symbol]={"side":side_final,"best":last_price,"atr":atr,"qty":qty,"entry":last_price,"partial_done":False}
                         tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}")
-                        if LIVE_TRADE
+                         # 开仓逻辑
+if symbol not in trail_state:
+    trail_state[symbol] = {"side": side_final, "best": last_price, "atr": atr,
+                            "qty": qty, "entry": last_price, "partial_done": False}
+    tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}
+        if LIVE_TRADE:  # ✅ 注意冒号
+        if side_final == "多":
+            ex.create_order(symbol, "MARKET", "buy", qty)
+        else:
+            ex.create_order(symbol, "MARKET", "sell", qty)
+        
+        # 创建止损止盈
+        create_sl_tp_orders(ex, symbol, side_final, qty, atr, last_price)
