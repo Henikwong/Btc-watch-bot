@@ -236,15 +236,131 @@ def main():
                         trail_state[symbol]={"side":side_final,"best":last_price,"atr":atr,"qty":qty,"entry":last_price,"partial_done":False}
                         tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}")
                          # 开仓逻辑
-if symbol not in trail_state:
-    trail_state[symbol] = {"side": side_final, "best": last_price, "atr": atr,
-                            "qty": qty, "entry": last_price, "partial_done": False}
-    tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}
-        if LIVE_TRADE:  # ✅ 注意冒号
-        if side_final == "多":
-            ex.create_order(symbol, "MARKET", "buy", qty)
-        else:
-            ex.create_order(symbol, "MARKET", "sell", qty)
-        
-        # 创建止损止盈
-        create_sl_tp_orders(ex, symbol, side_final, qty, atr, last_price)
+# ========= main loop =========
+def main():
+    try:
+        ex = build_exchange()
+    except Exception as e:
+        log(f"交易所初始化失败: {e}")
+        return
+
+    tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
+    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS}")
+
+    # 设置杠杆
+    for sym in TRADE_SYMBOLS:
+        set_leverage_safe(ex, sym, LEVERAGE)
+
+    while True:
+        try:
+            for symbol in ALL_SYMBOLS:
+                # 获取1h和4h的OHLCV
+                ohlcv_1h = ex.fetch_ohlcv(symbol, "1h", limit=100)
+                ohlcv_4h = ex.fetch_ohlcv(symbol, "4h", limit=100)
+
+                df_1h = df_from_ohlcv(ohlcv_1h)
+                df_4h = df_from_ohlcv(ohlcv_4h)
+
+                side1, det1 = analyze_one_df(df_1h)
+                side4, det4 = analyze_one_df(df_4h)
+
+                # 汇总分析
+                tf_details = {"1h": (side1, det1), "4h": (side4, det4)}
+                open_ok, s1_macd, s4_macd = should_open_trade((side1, side4), tf_details)
+
+                # Telegram/日志分析
+                summary1 = summarize("1h", side1, det1)
+                summary4 = summarize("4h", side4, det4)
+                log(f"{symbol} 分析:\n{summary1}\n{summary4}")
+
+                if open_ok and side1:
+                    side_final = side1
+                    last_price = det1["entry"]
+                    atr = det1["atr"]
+                    qty = amount_for_futures(ex, symbol, last_price)
+
+                    # 初始化跟踪止损状态
+                    if symbol not in trail_state:
+                        trail_state[symbol] = {
+                            "side": side_final,
+                            "best": last_price,
+                            "atr": atr,
+                            "qty": qty,
+                            "entry": last_price,
+                            "partial_done": False
+                        }
+                        tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}")# ========= main loop =========
+def main():
+    try:
+        ex = build_exchange()
+    except Exception as e:
+        log(f"交易所初始化失败: {e}")
+        return
+
+    tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
+    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS}")
+
+    # 设置杠杆
+    for sym in TRADE_SYMBOLS:
+        set_leverage_safe(ex, sym, LEVERAGE)
+
+    while True:
+        try:
+            for symbol in ALL_SYMBOLS:
+                # 获取1h和4h的OHLCV
+                ohlcv_1h = ex.fetch_ohlcv(symbol, "1h", limit=100)
+                ohlcv_4h = ex.fetch_ohlcv(symbol, "4h", limit=100)
+
+                df_1h = df_from_ohlcv(ohlcv_1h)
+                df_4h = df_from_ohlcv(ohlcv_4h)
+
+                side1, det1 = analyze_one_df(df_1h)
+                side4, det4 = analyze_one_df(df_4h)
+
+                # 汇总分析
+                tf_details = {"1h": (side1, det1), "4h": (side4, det4)}
+                open_ok, s1_macd, s4_macd = should_open_trade((side1, side4), tf_details)
+
+                # Telegram/日志分析
+                summary1 = summarize("1h", side1, det1)
+                summary4 = summarize("4h", side4, det4)
+                log(f"{symbol} 分析:\n{summary1}\n{summary4}")
+
+                if open_ok and side1:
+                    side_final = side1
+                    last_price = det1["entry"]
+                    atr = det1["atr"]
+                    qty = amount_for_futures(ex, symbol, last_price)
+
+                    # 初始化跟踪止损状态
+                    if symbol not in trail_state:
+                        trail_state[symbol] = {
+                            "side": side_final,
+                            "best": last_price,
+                            "atr": atr,
+                            "qty": qty,
+                            "entry": last_price,
+                            "partial_done": False
+                        }
+                        tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}")
+
+                        if LIVE_TRADE:
+                            try:
+                                if side_final == "多":
+                                    ex.create_order(symbol, "MARKET", "buy", qty)
+                                else:
+                                    ex.create_order(symbol, "MARKET", "sell", qty)
+                            except Exception as e:
+                                log(f"下单失败 {symbol}: {e}")
+
+                # 更新跟踪止损
+                if symbol in trail_state:
+                    last_close = float(df_1h["close"].iloc[-1])
+                    update_trailing_stop(ex, symbol, last_close)
+                    macd_weakening_and_partial_tp(ex, symbol, last_close, (side4, det4))
+
+            time.sleep(POLL_INTERVAL)
+
+        except Exception as e:
+            log(f"主循环错误: {e}")
+            time.sleep(POLL_INTERVAL)
