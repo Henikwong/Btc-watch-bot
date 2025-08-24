@@ -1,21 +1,16 @@
-# autotrader.py
-# Binance futures (USDM) + 多周期策略 + ATR SL/TP + 跟踪止盈 + 1h+4h MACD 过滤
+# autotrader_full.py
 import os
 import time
-import math
-import traceback
 from datetime import datetime
-
 import requests
 import ccxt
 import pandas as pd
-import numpy as np
 import ta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========= ENV =========
+# ===== ENV =====
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -23,27 +18,21 @@ EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower()
 API_KEY   = os.getenv("API_KEY", "").strip()
 API_SECRET= os.getenv("API_SECRET", "").strip()
 
-MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()  # future / spot
+MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()
 LEVERAGE  = int(os.getenv("LEVERAGE", "10"))
 BASE_USDT = float(os.getenv("BASE_USDT", "15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))  # 0 paper, 1 live
+LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))
 
 TRADE_SYMBOLS   = [s.strip() for s in os.getenv("TRADE_SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
-OBSERVE_SYMBOLS = [s.strip() for s in os.getenv("OBSERVE_SYMBOLS", "LTC/USDT,BNB/USDT,SOL/USDT,XRP/USDT").split(",") if s.strip()]
-ALL_SYMBOLS = TRADE_SYMBOLS + OBSERVE_SYMBOLS
-
-TIMEFRAMES = ["1h", "4h", "1d"]
-REQUIRED_CONFIRMS = int(os.getenv("REQUIRED_CONFIRMS", "2"))
+TIMEFRAMES = ["1h", "4h"]
 
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
 PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
-
-# ========= helpers =========
+# ===== helpers =====
 def nowstr():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -51,98 +40,52 @@ def log(msg):
     print(f"[{nowstr()}] {msg}", flush=True)
 
 def tg_send(text):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": TG_CHAT, "text": text}, timeout=10)
-    except Exception as e:
-        log(f"TG发送失败: {e}")
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          data={"chat_id": TG_CHAT, "text": text}, timeout=10)
+        except Exception as e:
+            log(f"TG发送失败: {e}")
 
-# ========= exchange builder =========
+# ===== Exchange =====
 def build_exchange():
-    ex = None
-    try:
-        if hasattr(ccxt, "binanceusdm"):
-            ex = getattr(ccxt, "binanceusdm")({
-                "apiKey": API_KEY,
-                "secret": API_SECRET,
-                "enableRateLimit": True,
-                "options": {"defaultType": "future"},
-            })
-            ex.load_markets()
-            log("使用 ccxt.binanceusdm 初始化（USDM futures）")
-            return ex
-    except Exception as e:
-        log(f"binanceusdm init failed: {e}")
-    try:
-        ex = getattr(ccxt, "binance")({
-            "apiKey": API_KEY,
-            "secret": API_SECRET,
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"}
-        })
-        ex.load_markets()
-        log("使用 ccxt.binance 初始化（fallback，options defaultType=future）")
-        return ex
-    except Exception as e:
-        log(f"ccxt.binance init failed: {e}")
-        raise RuntimeError("初始化交易所失败，请检查 ccxt 版本与环境变量")
+    ex = ccxt.binanceusdm({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"},
+    })
+    ex.load_markets()
+    log("Binance USDM futures 初始化成功")
+    return ex
 
-# ========= safe leverage setter =========
 def set_leverage_safe(ex, symbol, leverage):
     try:
         market = ex.market(symbol)
+        ex.fapiPrivate_post_leverage({"symbol": market["id"], "leverage": int(leverage)})
+        log(f"{symbol} 杠杆已设置为 {leverage}x")
     except Exception as e:
-        log(f"无法获取市场信息 {symbol}: {e}")
-        return
-    try:
-        if hasattr(ex, "fapiPrivate_post_leverage"):
-            ex.fapiPrivate_post_leverage({"symbol": market["id"], "leverage": int(leverage)})
-            log(f"{symbol} 杠杆已设置为 {leverage}x (fapiPrivate_post_leverage)")
-            return
-    except Exception as e:
-        log(f"尝试 fapiPrivate_post_leverage 失败: {e}")
-    try:
-        if hasattr(ex, "private_post_leverage"):
-            ex.private_post_leverage({"symbol": market["id"], "leverage": int(leverage)})
-            log(f"{symbol} 杠杆已设置为 {leverage}x (private_post_leverage)")
-            return
-    except Exception as e:
-        log(f"尝试 private_post_leverage 失败: {e}")
-    try:
-        if hasattr(ex, "set_leverage"):
-            try:
-                ex.set_leverage(int(leverage), market["symbol"])
-            except Exception:
-                ex.set_leverage(int(leverage), market["id"])
-            log(f"{symbol} 杠杆已设置为 {leverage}x (set_leverage)")
-            return
-    except Exception as e:
-        log(f"尝试 set_leverage 失败: {e}")
-    log(f"⚠️ 尝试设置杠杆失败 {symbol}")
+        log(f"设置杠杆失败 {symbol}: {e}")
 
-# ========= OHLCV -> df =========
 def df_from_ohlcv(ohlcv):
     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
     for c in ["open","high","low","close","vol"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-# ========= indicators & decision =========
-def analyze_one_df(df):
+# ===== Indicators =====
+def analyze_df(df):
     if df is None or len(df) < 50:
         return None, None
-    work = df.iloc[:-1].copy()
-    close = work["close"]
-    high = work["high"]
-    low = work["low"]
-    vol = work["vol"]
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    vol = df["vol"]
 
-    ema5  = close.ewm(span=5).mean().iloc[-1]
+    ema5 = close.ewm(span=5).mean().iloc[-1]
     ema10 = close.ewm(span=10).mean().iloc[-1]
     ema30 = close.ewm(span=30).mean().iloc[-1]
-    ema_trend = "多" if (ema5>ema10>ema30) else ("空" if (ema5<ema10<ema30) else "中性")
+    ema_trend = "多" if ema5>ema10>ema30 else ("空" if ema5<ema10<ema30 else "中性")
 
     macd = ta.trend.MACD(close)
     macd_hist_series = macd.macd_diff()
@@ -156,7 +99,7 @@ def analyze_one_df(df):
     k_trend = "多" if k_val>d_val else ("空" if k_val<d_val else "中性")
 
     vol_trend = float((vol.iloc[-1]-vol.iloc[-2])/(abs(vol.iloc[-2])+1e-12))
-    atr = float(ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1])
+    atr = float(ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1])
     entry = float(close.iloc[-1])
 
     score_bull = sum([ema_trend=="多", macd_hist>0, rsi>55, wr>-50, k_trend=="多", vol_trend>0])
@@ -168,47 +111,17 @@ def analyze_one_df(df):
     elif score_bear>=4 and score_bear>=score_bull+2:
         side="空"
 
-    det = {
-        "ema_trend": ema_trend,
-        "macd": macd_hist,
-        "macd_hist_series": macd_hist_series,
-        "rsi": rsi,
-        "wr": wr,
-        "k_trend": k_trend,
-        "vol_trend": vol_trend,
-        "atr": atr,
-        "entry": entry,
-    }
+    det = {"ema_trend": ema_trend, "macd": macd_hist, "macd_hist_series": macd_hist_series,
+           "rsi": rsi, "wr": wr, "k_trend": k_trend, "vol_trend": vol_trend,
+           "atr": atr, "entry": entry}
+
     return side, det
 
-def get_macd_status(macd_hist_series):
-    try:
-        if macd_hist_series is None or len(macd_hist_series) < 2:
-            return "未知"
-        prev = float(macd_hist_series.iloc[-2])
-        curr = float(macd_hist_series.iloc[-1])
-        if (prev <= 0 and curr > 0) or (prev >= 0 and curr < 0):
-            return "翻转"
-        if curr > prev and curr > 0:
-            return "增强"
-        elif curr < prev and curr > 0:
-            return "减弱"
-        elif curr < prev and curr < 0:
-            return "增强"
-        elif curr > prev and curr < 0:
-            return "减弱"
-        return "未知"
-    except Exception:
-        return "未知"
-
-def macd_strength_label(macd_hist_series):
-    return get_macd_status(macd_hist_series) or "—"
-
 def fmt_price(p):
-    p = float(p)
+    p=float(p)
     if p>=100: return f"{p:.2f}"
-    if p>=1:   return f"{p:.4f}"
-    if p>=0.01:return f"{p:.6f}"
+    if p>=1: return f"{p:.4f}"
+    if p>=0.01: return f"{p:.6f}"
     return f"{p:.8f}"
 
 def amount_for_futures(ex, symbol, price):
@@ -217,147 +130,109 @@ def amount_for_futures(ex, symbol, price):
         qty = ex.amount_to_precision(symbol, raw_qty)
     except Exception:
         qty = raw_qty
-    try:
-        return float(qty)
-    except Exception:
-        return float(raw_qty)
+    return float(qty)
 
-def create_sl_tp_orders(ex, symbol, side, qty, sl_price, tp_price):
+# ===== SL/TP =====
+def create_sl_tp_orders(ex, symbol, side, qty, atr, entry):
     try:
-        params_sl = {"reduceOnly": True, "workingType": "CONTRACT_PRICE"}
-        params_tp = {"reduceOnly": True, "workingType": "CONTRACT_PRICE"}
-        try:
-            params_sl["stopPrice"] = ex.price_to_precision(symbol, sl_price)
-            params_tp["stopPrice"] = ex.price_to_precision(symbol, tp_price)
-        except Exception:
-            params_sl["stopPrice"] = sl_price
-            params_tp["stopPrice"] = tp_price
-
-        if side == "多":
-            ex.create_order(symbol, type="STOP_MARKET", side="sell", amount=qty, params=params_sl)
-            ex.create_order(symbol, type="TAKE_PROFIT_MARKET", side="sell", amount=qty, params=params_tp)
+        sl_price = entry - SL_ATR_MULT*atr if side=="多" else entry + SL_ATR_MULT*atr
+        tp_price = entry + TP_ATR_MULT*atr if side=="多" else entry - TP_ATR_MULT*atr
+        params_sl = {"stopPrice": fmt_price(sl_price), "reduceOnly": True, "workingType":"CONTRACT_PRICE"}
+        params_tp = {"stopPrice": fmt_price(tp_price), "reduceOnly": True, "workingType":"CONTRACT_PRICE"}
+        if side=="多":
+            ex.create_order(symbol, "STOP_MARKET", "sell", qty, None, params_sl)
+            ex.create_order(symbol, "TAKE_PROFIT_MARKET", "sell", qty, None, params_tp)
         else:
-            ex.create_order(symbol, type="STOP_MARKET", side="buy", amount=qty, params=params_sl)
-            ex.create_order(symbol, type="TAKE_PROFIT_MARKET", side="buy", amount=qty, params=params_tp)
+            ex.create_order(symbol, "STOP_MARKET", "buy", qty, None, params_sl)
+            ex.create_order(symbol, "TAKE_PROFIT_MARKET", "buy", qty, None, params_tp)
         return True
     except Exception as e:
         log(f"创建SL/TP失败 {symbol}: {e}")
         return False
 
-# ========= trail logic =========
+# ===== Trailing + partial =====
 trail_state = {}
 
-def update_trailing_stop(ex, symbol, last_price):
+def update_trailing_and_partial(ex, symbol, last_price, tf4h_det):
     st = trail_state.get(symbol)
     if not st: return
-    side = st["side"]; best = st["best"]; atr = st["atr"]; qty = st["qty"]
+    side = st["side"]; best = st["best"]; atr = st["atr"]; qty = st["qty"]; entry = st["entry"]
     moved = False
-    if side == "多":
-        if last_price > best: trail_state[symbol]["best"] = last_price
-        if last_price >= best + TRAIL_ATR_MULT * atr:
-            new_sl = last_price - SL_ATR_MULT * atr
+
+    if side=="多":
+        if last_price>best: trail_state[symbol]["best"]=last_price
+        if last_price >= best+TRAIL_ATR_MULT*atr:
+            new_sl = last_price - SL_ATR_MULT*atr
             try:
-                ex.create_order(symbol, type="STOP_MARKET", side="sell", amount=qty, params={
-                    "reduceOnly": True, "stopPrice": ex.price_to_precision(symbol, new_sl), "workingType":"CONTRACT_PRICE"
-                })
-                trail_state[symbol]["best"] = last_price
-                moved = True
-            except Exception as e:
-                log(f"更新跟踪止损失败 {symbol}: {e}")
+                ex.create_order(symbol, "STOP_MARKET", "sell", qty, None, {"stopPrice": fmt_price(new_sl), "reduceOnly": True, "workingType":"CONTRACT_PRICE"})
+                moved=True
+            except: pass
     else:
-        if last_price < best: trail_state[symbol]["best"] = last_price
-        if last_price <= best - TRAIL_ATR_MULT * atr:
-            new_sl = last_price + SL_ATR_MULT * atr
+        if last_price<best: trail_state[symbol]["best"]=last_price
+        if last_price <= best-TRAIL_ATR_MULT*atr:
+            new_sl = last_price + SL_ATR_MULT*atr
             try:
-                ex.create_order(symbol, type="STOP_MARKET", side="buy", amount=qty, params={
-                    "reduceOnly": True, "stopPrice": ex.price_to_precision(symbol, new_sl), "workingType":"CONTRACT_PRICE"
-                })
-                trail_state[symbol]["best"] = last_price
-                moved = True
-            except Exception as e:
-                log(f"更新跟踪止损失败 {symbol}: {e}")
+                ex.create_order(symbol, "STOP_MARKET", "buy", qty, None, {"stopPrice": fmt_price(new_sl), "reduceOnly": True, "workingType":"CONTRACT_PRICE"})
+                moved=True
+            except: pass
+
     if moved:
-        tg_send(f"🔧 跟踪止损上调 {symbol} side={side} new_best={fmt_price(trail_state[symbol]['best'])}")
+        tg_send(f"🔧 跟踪止损 {symbol} side={side} new_best={fmt_price(trail_state[symbol]['best'])}")
 
-def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
-    st = trail_state.get(symbol)
-    if not st or st.get("partial_done"): return
-    side = st["side"]; entry = st["entry"]; atr1h = st["atr"]; qty_total = st["qty"]
-    profit_ok = (last_price - entry) >= (1.0 * atr1h) if side=="多" else (entry - last_price) >= (1.0 * atr1h)
-    if not profit_ok: return
-    det4h = tf4h_details[1] if tf4h_details else None
-    if not det4h or "macd_hist_series" not in det4h: return
-    macd_hist_series = det4h["macd_hist_series"]
-    if len(macd_hist_series) < 3: return
-    hist_prev = float(macd_hist_series.iloc[-2]); hist_last = float(macd_hist_series.iloc[-1]); rsi4h = float(det4h["rsi"])
-    macd_weak = False
-    if side == "多":
-        macd_weak = (hist_last > 0) and (hist_last < hist_prev) and (rsi4h > 65)
-    else:
-        macd_weak = (hist_last < 0) and (abs(hist_last) < abs(hist_prev)) and (rsi4h < 35)
-    if not macd_weak: return
-    reduce_qty = max(qty_total * PARTIAL_TP_RATIO, 0.0)
-    if reduce_qty <= 0: return
-    if LIVE_TRADE != 1:
-        log(f"[纸面-提前止盈] {symbol} side={side} 减仓≈{reduce_qty} last≈{fmt_price(last_price)} entry≈{fmt_price(entry)} RSI4h={rsi4h:.2f}")
-        trail_state[symbol]["partial_done"] = True
-        tg_send(f"🟡 提前止盈(纸面) {symbol} {side} 减仓≈{reduce_qty} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
-        return
-    try:
-        if side == "多":
-            ex.create_order(symbol, type="MARKET", side="sell", amount=reduce_qty, params={"reduceOnly": True})
+    if st.get("partial_done") or tf4h_det is None: return
+    macd_series = tf4h_det["macd_hist_series"]
+    if len(macd_series)<2: return
+    macd_prev = float(macd_series.iloc[-2])
+    macd_last = float(macd_series.iloc[-1])
+    rsi4h = float(tf4h_det["rsi"])
+    weak = False
+    if side=="多" and macd_last>0 and macd_last<macd_prev and rsi4h>65:
+        weak=True
+    if side=="空" and macd_last<0 and abs(macd_last)<abs(macd_prev) and rsi4h<35:
+        weak=True
+    if weak:
+        reduce_qty = max(qty*PARTIAL_TP_RATIO,0)
+        if reduce_qty<=0: return
+        if LIVE_TRADE==1:
+            if side=="多":
+                ex.create_order(symbol,"MARKET","sell",reduce_qty,None,{"reduceOnly":True})
+            else:
+                ex.create_order(symbol,"MARKET","buy",reduce_qty,None,{"reduceOnly":True})
+            tg_send(f"🟢 部分止盈 {symbol} side={side} qty≈{reduce_qty} (4h MACD弱化)")
         else:
-            ex.create_order(symbol, type="MARKET", side="buy", amount=reduce_qty, params={"reduceOnly": True})
-        trail_state[symbol]["partial_done"] = True
-        tg_send(f"🟢 提前止盈(已执行) {symbol} {side} 减仓≈{reduce_qty} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
-        log(f"[提前止盈成功] {symbol} side={side} reduce={reduce_qty}")
-    except Exception as e:
-        log(f"[提前止盈失败] {symbol}: {e}")
-        tg_send(f"❌ 提前止盈失败 {symbol}: {e}")
+            tg_send(f"🟡 纸面部分止盈 {symbol} side={side} qty≈{reduce_qty} (4h MACD弱化)")
+        trail_state[symbol]["partial_done"]=True
 
-def should_open_trade(consensus, tf_details):
-    def status_for(tf):
-        tpl = tf_details.get(tf)
-        if not tpl or tpl[1] is None:
-            return "未知"
-        det = tpl[1]
-        return get_macd_status(det.get("macd_hist_series"))
-    s1 = status_for("1h")
-    s4 = status_for("4h")
-    if s1 == "翻转" or s4 == "翻转":
-        return False, s1, s4
-    if s1 == "增强" and s4 == "增强":
-        return True, s1, s4
-    return False, s1, s4
-
-# ========= main loop =========
+# ===== Main =====
 def main():
-    try:
-        ex = build_exchange()
-    except Exception as e:
-        log(f"交易所初始化失败: {e}")
-        return
-
-    tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
-    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS} OBSERVE_SYMBOLS={OBSERVE_SYMBOLS} ALL_SYMBOLS={ALL_SYMBOLS}")
-
+    ex = build_exchange()
+    tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE else '纸面'} 杠杆x{LEVERAGE}")
     for sym in TRADE_SYMBOLS:
         set_leverage_safe(ex, sym, LEVERAGE)
 
     while True:
         try:
-            for sym in ALL_SYMBOLS:
-                tf_details = {}
-                consensus = None
-                for tf in ["1h", "4h"]:
-                    try:
-                        ohlcv = ex.fetch_ohlcv(sym, timeframe=tf, limit=100)
-                        df = df_from_ohlcv(ohlcv)
-                        side, det = analyze_one_df(df)
-                        tf_details[tf] = (side, det)
-                    except Exception as e:
-                        log(f"拉取或分析 {sym} {tf} 出错: {e}")
-                        tf_details[tf] = (None, None)
+            for symbol in TRADE_SYMBOLS:
+                tf_details={}
+                side_final=None
+                for tf in TIMEFRAMES:
+                    ohlcv = ex.fetch_ohlcv(symbol, tf)
+                    df = df_from_ohlcv(ohlcv)
+                    side, det = analyze_df(df)
+                    tf_details[tf]=(side,det)
+                    if det:
+                        summary=f"{symbol} {tf}: {side or '无'} | EMA:{det['ema_trend']} MACD:{det['macd']:.4f} RSI:{det['rsi']:.2f} WR:{det['wr']:.2f} KDJ:{det['k_trend']} VOLΔ:{det['vol_trend']:.3f} ATR:{det['atr']:.2f}"
+                        log(summary)
+                        tg_send(summary)
 
-                open_ok, s1, s4 = should_open_trade(consensus, tf_details)
-                if open
+                side1, det1=tf_details["1h"]
+                side4, det4=tf_details["4h"]
+                if side1==side4 and side1 is not None:
+                    side_final=side1
+                    last_price=det1["entry"]
+                    atr=det1["atr"]
+                    qty=amount_for_futures(ex, symbol, last_price)
+                    if symbol not in trail_state:
+                        trail_state[symbol]={"side":side_final,"best":last_price,"atr":atr,"qty":qty,"entry":last_price,"partial_done":False}
+                        tg_send(f"🟢 开仓信号 {symbol} side={side_final} qty={qty} price={fmt_price(last_price)}")
+                        if LIVE_TRADE
