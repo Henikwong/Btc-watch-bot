@@ -1,5 +1,5 @@
 # autotrader.py
-# 完整版：Binance futures (USDM) + 多周期策略 + ATR SL/TP + 跟踪止盈 + 1h+4h MACD 过滤
+# Binance futures (USDM) + 多周期策略 + ATR SL/TP + 跟踪止盈 + 1h+4h MACD 过滤
 import os
 import time
 import math
@@ -40,7 +40,6 @@ SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
 PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))
-MACD_FILTER_TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 
@@ -205,18 +204,6 @@ def get_macd_status(macd_hist_series):
 def macd_strength_label(macd_hist_series):
     return get_macd_status(macd_hist_series) or "—"
 
-def summarize(tf, side, det):
-    if not det:
-        return f"{tf} | 方向:{side or '无'} 入场:-"
-    macd_part = f"{round(det['macd'],4)}"
-    if tf == "4h":
-        macd_part += f" ({macd_strength_label(det.get('macd_hist_series'))})"
-    return (f"{tf} | 方向:{side or '无'} 入场:{fmt_price(det['entry'])} | "
-            f"EMA:{det['ema_trend']} MACD:{macd_part} "
-            f"RSI:{round(det['rsi'],2)} WR:{round(det['wr'],2)} "
-            f"KDJ:{det['k_trend']} VOLΔ:{round(det['vol_trend'],3)} ATR:{round(det['atr'],2)}")
-
-# ========= precision / order helpers =========
 def fmt_price(p):
     p = float(p)
     if p>=100: return f"{p:.2f}"
@@ -298,11 +285,11 @@ def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
     side = st["side"]; entry = st["entry"]; atr1h = st["atr"]; qty_total = st["qty"]
     profit_ok = (last_price - entry) >= (1.0 * atr1h) if side=="多" else (entry - last_price) >= (1.0 * atr1h)
     if not profit_ok: return
-    s4h, d4h = tf4h_details
-    if not d4h or "macd_hist_series" not in d4h: return
-    macd_hist_series = d4h["macd_hist_series"]
+    det4h = tf4h_details[1] if tf4h_details else None
+    if not det4h or "macd_hist_series" not in det4h: return
+    macd_hist_series = det4h["macd_hist_series"]
     if len(macd_hist_series) < 3: return
-    hist_prev = float(macd_hist_series.iloc[-2]); hist_last = float(macd_hist_series.iloc[-1]); rsi4h = float(d4h["rsi"])
+    hist_prev = float(macd_hist_series.iloc[-2]); hist_last = float(macd_hist_series.iloc[-1]); rsi4h = float(det4h["rsi"])
     macd_weak = False
     if side == "多":
         macd_weak = (hist_last > 0) and (hist_last < hist_prev) and (rsi4h > 65)
@@ -322,13 +309,12 @@ def macd_weakening_and_partial_tp(ex, symbol, last_price, tf4h_details):
         else:
             ex.create_order(symbol, type="MARKET", side="buy", amount=reduce_qty, params={"reduceOnly": True})
         trail_state[symbol]["partial_done"] = True
-        tg_send(f"🟢 提前止盈(已执行) {symbol} {side} 减仓≈{reduce_qty:.6f} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
+        tg_send(f"🟢 提前止盈(已执行) {symbol} {side} 减仓≈{reduce_qty} 价≈{fmt_price(last_price)} (4h MACD弱化 + RSI过滤)")
         log(f"[提前止盈成功] {symbol} side={side} reduce={reduce_qty}")
     except Exception as e:
         log(f"[提前止盈失败] {symbol}: {e}")
         tg_send(f"❌ 提前止盈失败 {symbol}: {e}")
 
-# ========= strict 1h+4h MACD check =========
 def should_open_trade(consensus, tf_details):
     def status_for(tf):
         tpl = tf_details.get(tf)
@@ -353,9 +339,25 @@ def main():
         return
 
     tg_send(f"🤖 启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={'实盘' if LIVE_TRADE==1 else '纸面'} 杠杆x{LEVERAGE}")
-    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS} "
-    f"OBSERVE_SYMBOLS={OBSERVE_SYMBOLS} "
-    f"ALL_SYMBOLS={ALL_SYMBOLS} "
-    f"TIMEFRAMES={TIMEFRAMES} "
-    f"MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS} "
-    f"SL_ATR_MULT={SL_ATR_MULT} TP_ATR_MULT={TP_ATR_MULT} TRAIL_ATR_MULT={TRAIL_ATR_MULT}")
+    log(f"TRADE_SYMBOLS={TRADE_SYMBOLS} OBSERVE_SYMBOLS={OBSERVE_SYMBOLS} ALL_SYMBOLS={ALL_SYMBOLS}")
+
+    for sym in TRADE_SYMBOLS:
+        set_leverage_safe(ex, sym, LEVERAGE)
+
+    while True:
+        try:
+            for sym in ALL_SYMBOLS:
+                tf_details = {}
+                consensus = None
+                for tf in ["1h", "4h"]:
+                    try:
+                        ohlcv = ex.fetch_ohlcv(sym, timeframe=tf, limit=100)
+                        df = df_from_ohlcv(ohlcv)
+                        side, det = analyze_one_df(df)
+                        tf_details[tf] = (side, det)
+                    except Exception as e:
+                        log(f"拉取或分析 {sym} {tf} 出错: {e}")
+                        tf_details[tf] = (None, None)
+
+                open_ok, s1, s4 = should_open_trade(consensus, tf_details)
+                if open
