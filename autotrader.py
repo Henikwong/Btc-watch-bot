@@ -15,6 +15,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 读取交易所参数
+exchange_id = os.getenv("EXCHANGE", "binance")
+market_type = os.getenv("MARKET_TYPE", "future")
+api_key = os.getenv("API_KEY")
+api_secret = os.getenv("API_SECRET")
+
+# 读取交易对，并自动修正为 binanceusdm 的格式
+raw_symbols = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+
+symbols = []
+for s in raw_symbols:
+    s = s.strip()
+    if not s.endswith(":USDT"):   # 补上 :USDT，Binance USDM 需要这种格式
+        s = s + ":USDT"
+    symbols.append(s)
+
+print("[INFO] 使用交易对:", symbols)
+
+# 初始化交易所（USDT 永续合约）
+if market_type.lower() == "future":
+    ex = ccxt.binanceusdm({
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"},
+    })
+else:
+    ex = ccxt.binance({
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+    })
+
+ex.load_markets()
+print("[INFO] 交易所初始化成功，支持交易对数量:", len(ex.symbols))
+
 # ========= ENV =========
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
