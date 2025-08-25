@@ -1,81 +1,90 @@
-# 选定币种，只跑这5个
+# autotrader.py
+import os, time, math, traceback
+import requests
+import ccxt
+import pandas as pd
+import numpy as np
+import ta
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ================== ENV ==================
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower()
+API_KEY   = os.getenv("API_KEY", "")
+API_SECRET= os.getenv("API_SECRET", "")
+
+MARKET_TYPE = os.getenv("MARKET_TYPE", "future").lower()  # spot/future
+# 强制使用这 5 个币（你也可以改 .env 的 SYMBOLS，但脚本默认只用这 5）
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "LTC/USDT", "DOGE/USDT"]
 
-# ================== 主循环 ==================
-def main():
-    ex = build_exchange()
-    ex.load_markets()
-    mode_txt = "实盘" if LIVE_TRADE==1 else "纸面"
-    log(f"启动Bot {EXCHANGE_NAME}/{MARKET_TYPE} 模式={mode_txt}")
-    tg_send(f"🤖 Bot启动 {EXCHANGE_NAME}/{MARKET_TYPE} 模式={mode_txt}")
+BASE_USDT = float(os.getenv("BASE_USDT", "15"))
+LEVERAGE  = int(os.getenv("LEVERAGE", "10"))
+ATR_MULT_INFO = float(os.getenv("RISK_ATR_MULT", "1.5"))
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 
-    if MARKET_TYPE == "future":
-        for sym in SYMBOLS:
-            try:
-                set_symbol_leverage(ex, sym)
-            except Exception:
-                pass
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+LIVE_TRADE    = int(os.getenv("LIVE_TRADE", "0"))
 
-    last_hourly_push = 0
+REQUIRED_CONFIRMS = int(os.getenv("REQUIRED_CONFIRMS", "3"))
+TIMEFRAMES = ["1h", "4h", "1d", "1w"]
 
-    while True:
-        loop_start = time.time()
-        try:
-            report_lines = []  # 一小时的汇总
-            for symbol in SYMBOLS:
-                sides = []
-                detail_map = {}
+# ================== 小工具 ==================
+def nowstr(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def log(msg): print(f"[{nowstr()}] {msg}", flush=True)
 
-                for tf in TIMEFRAMES:
-                    try:
-                        df = fetch_df(ex, symbol, tf, limit=300)
-                        side, det = indicators_and_side(df)
-                        detail_map[tf] = (side, det, df)
-                        sides.append(side)
-                        log(summarize(tf, side, det))
-                    except Exception as e_tf:
-                        log(f"❌ {symbol} {tf} 指标失败: {e_tf}")
-                        detail_map[tf] = (None, None, None)
-                        sides.append(None)
+def tg_send(text):
+    """仅用于向 Telegram 发送消息（尽量少发）"""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TG_CHAT, "text": text, "disable_web_page_preview": True}, timeout=10)
+    except Exception as e:
+        log(f"TG发送失败: {e}")
 
-                bull = sum(1 for s in sides if s=="多")
-                bear = sum(1 for s in sides if s=="空")
-                final_side = None
-                if bull >= REQUIRED_CONFIRMS and bull > bear:
-                    final_side = "多"
-                elif bear >= REQUIRED_CONFIRMS and bear > bull:
-                    final_side = "空"
+def format_price(p):
+    try:
+        p = float(p)
+        if p >= 100: return f"{p:.2f}"
+        if p >= 1:   return f"{p:.4f}"
+        if p >= 0.01:return f"{p:.6f}"
+        return f"{p:.8f}"
+    except:
+        return "-"
 
-                # 如果有信号，准备止盈止损数据
-                entry, sl, tp = "-", "-", "-"
-                if final_side:
-                    s1h, d1h, df1h = detail_map["1h"]
-                    if d1h and df1h is not None:
-                        entry = d1h["entry"]
-                        atr = compute_atr(df1h, period=14)
-                        if final_side == "多":
-                            sl = entry - SL_ATR_MULT * atr
-                            tp = entry + TP_ATR_MULT * atr
-                        else:
-                            sl = entry + SL_ATR_MULT * atr
-                            tp = entry - TP_ATR_MULT * atr
+def tier_text(n):
+    return "🟢 强(3+/4)" if n>=3 else ("🟡 中(2/4)" if n==2 else ("🔴 弱(1/4)" if n==1 else "⚪ 无(0/4)"))
 
-                        # 真正下单
-                        place_order_and_brackets(ex, symbol, final_side, entry, df1h)
+def floor_to_step(value, step):
+    if step is None or step == 0:
+        return value
+    return math.floor(value / step) * step
 
-                report_lines.append(
-                    f"{symbol} → {final_side or '无信号'} "
-                    f"入:{format_price(entry)} SL:{format_price(sl)} TP:{format_price(tp)}"
-                )
+def round_to_precision(value, precision):
+    if precision is None:
+        return value
+    fmt = "{:." + str(precision) + "f}"
+    return float(fmt.format(value))
 
-            # 整点推送一次 TG
-            now_ts = int(time.time())
-            if now_ts - last_hourly_push >= 3600:
-                tg_send("📊 每小时交易报告\n" + "\n".join(report_lines))
-                last_hourly_push = now_ts
+# ================== 交易所连接 ==================
+def build_exchange():
+    if EXCHANGE_NAME != "binance":
+        raise ValueError("此脚本当前仅支持 Binance（USDT futures）。")
+    ex = ccxt.binance({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "future",
+            "adjustForTimeDifference": True,
+        }
+    })
+    return ex
 
-        except Exception as e:
-            log(f"[主循环异常] {e}\n{traceback.format_exc()}")
-
-        used = time.time() - loop_start
-        time.sleep(max(1, POLL_INTERVAL - int(used)))
+# =================
