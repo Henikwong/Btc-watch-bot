@@ -1,35 +1,51 @@
-import ccxt
-import math
+import os, time, ccxt, requests
 
-exchange = ccxt.binanceusdm({
-    "apiKey": "你的API_KEY",
-    "secret": "你的API_SECRET",
+# === 从环境变量读取配置 ===
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT").split(",")
+BASE_USDT = float(os.getenv("BASE_USDT", 15))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
+LIVE_TRADE = int(os.getenv("LIVE_TRADE", 0))
+
+# === 初始化交易所 (Binance 现货) ===
+exchange = ccxt.binance({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
     "enableRateLimit": True
 })
 
-# 自动预算函数
-def calculate_order_size(symbol, balance, risk_pct=0.01, leverage=10, atr=50, price=50000):
-    risk_amount = balance * risk_pct  # 账户风险资金
-    contract_size = (risk_amount * leverage) / (atr)  # ATR 风控法
-    usdt_value = contract_size * atr
-    qty = usdt_value / price
-    return round(qty, 3)
+# === Telegram 发送函数 ===
+def send_tg(msg: str):
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ 没有设置 Telegram 环境变量")
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    try:
+        r = requests.get(url, params={"chat_id": CHAT_ID, "text": msg})
+        print("Telegram response:", r.json())
+    except Exception as e:
+        print("Telegram 发送失败:", e)
 
-# 示例：下单
-def place_order(symbol, side, qty, price=None):
-    params = {"type": "MARKET"}
-    if side == "buy":
-        order = exchange.create_market_buy_order(symbol, qty, params)
-    else:
-        order = exchange.create_market_sell_order(symbol, qty, params)
-    return order
+# === 主逻辑 ===
+def run_bot():
+    mode = "实盘" if LIVE_TRADE else "纸面"
+    send_tg(f"🤖 Bot启动 {exchange.id}/spot 模式={mode}")
 
-# 测试
-balance = exchange.fetch_balance()["total"]["USDT"]
-atr = 100  # 这里假设 ATR 已经算好
-price = exchange.fetch_ticker("BTC/USDT:USDT")["last"]
+    while True:
+        for symbol in SYMBOLS:
+            try:
+                ticker = exchange.fetch_ticker(symbol)
+                price = ticker["last"]
+                msg = f"📈 {symbol} 最新价: {price}"
+                print(msg)
+                send_tg(msg)
+            except Exception as e:
+                print(f"❌ 获取行情失败 {symbol}:", e)
+                send_tg(f"❌ 获取行情失败 {symbol}: {e}")
+        time.sleep(POLL_INTERVAL)
 
-qty = calculate_order_size("BTC/USDT:USDT", balance, risk_pct=0.01, leverage=10, atr=atr, price=price)
-print("下单数量:", qty)
-
-place_order("BTC/USDT:USDT", "buy", qty)
+if __name__ == "__main__":
+    run_bot()
