@@ -1,177 +1,122 @@
-import os, time, traceback
-import requests
-import pandas as pd
-import ccxt
+# app/autotrader.py
+import os, time, ccxt, requests
 import numpy as np
+import talib
 from datetime import datetime, timezone
 
-# ========= 环境变量 =========
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-EXCHANGE = os.getenv("EXCHANGE", "binance")
-MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,LTC/USDT,BNB/USDT,DOGE/USDT").split(",")
-BASE_USDT = float(os.getenv("BASE_USDT", "100"))
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-LIVE_TRADE = int(os.getenv("LIVE_TRADE", "0"))
-
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
-TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
-
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-# ========= 工具函数 =========
-def now():
+# ===========================
+# 工具函数
+# ===========================
+def now(): 
     return datetime.now(timezone.utc).isoformat()
 
-
-def log(msg):
-    print(f"[{now()}] {msg}", flush=True)
-
-
-def tg_send(msg: str):
-    """发消息到 Telegram"""
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("⚠️ TELEGRAM 未配置")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        r = requests.post(url, data=data, timeout=10)
-        if r.status_code != 200:
-            print(f"❌ TG发送失败: {r.text}")
-    except Exception as e:
-        print(f"❌ TG异常: {e}")
-
-
-# ========= 数据 & 指标 =========
-def fetch_ohlcv_df(ex, symbol, timeframe="15m", limit=200):
-    try:
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        return df
-    except Exception as e:
-        log(f"❌ fetch_ohlcv {symbol} {e}")
-        return None
-
-
-def compute_atr(df, period=14):
-    high_low = df["high"] - df["low"]
-    high_close = np.abs(df["high"] - df["close"].shift())
-    low_close = np.abs(df["low"] - df["close"].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr.iloc[-1]
-
-
-def indicators_and_side(df):
-    """简单指标示例：均线金叉/死叉"""
-    df["ma_fast"] = df["close"].rolling(9).mean()
-    df["ma_slow"] = df["close"].rolling(21).mean()
-    if df["ma_fast"].iloc[-1] > df["ma_slow"].iloc[-1]:
-        return "多", {"entry": df["close"].iloc[-1]}
-    elif df["ma_fast"].iloc[-1] < df["ma_slow"].iloc[-1]:
-        return "空", {"entry": df["close"].iloc[-1]}
-    return None, None
-
-
-def format_price(p):
-    try:
-        return f"{p:.4f}"
-    except:
-        return str(p)
-
-
-# ========= 下单逻辑 =========
-def place_order_and_brackets(ex, symbol, side, entry, df):
-    """这里只演示，不直接下真实单"""
-    log(f"📌 模拟下单 {symbol} {side} @ {entry}")
-    return {"symbol": symbol, "side": side, "price": entry}
-
-
-def safe_place_order(ex, symbol, side, entry, df):
-    try:
-        atr = compute_atr(df, period=14)
-        if side == "多":
-            sl = entry - SL_ATR_MULT * atr
-            tp = entry + TP_ATR_MULT * atr
-        else:
-            sl = entry + SL_ATR_MULT * atr
-            tp = entry - TP_ATR_MULT * atr
-
-        order = place_order_and_brackets(ex, symbol, side, entry, df)
-
-        msg = (
-            f"🚀 *入场信号*\n"
-            f"交易对: `{symbol}`\n"
-            f"方向: {side}\n"
-            f"入场价: {format_price(entry)}\n"
-            f"止盈: {format_price(tp)}\n"
-            f"止损: {format_price(sl)}"
-        )
-        tg_send(msg)
-        return order
-    except Exception as e:
-        log(f"❌ 下单失败 {symbol}: {e}")
-        tg_send(f"❌ 下单失败 {symbol}: {e}")
-        return None
-
-
-# ========= 主循环 =========
-def main():
-    ex = getattr(ccxt, EXCHANGE)({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-    })
-    ex.options["defaultType"] = MARKET_TYPE
-
-    log("🚀 AutoTrader 启动...")
-    tg_send("🤖 AutoTrader 已启动，开始监控行情...")
-
-    last_hourly_push = 0
-    positions = []
-
-    while True:
-        loop_start = time.time()
+def send_telegram(msg: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat_id:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
-            report_lines = []
-            for symbol in SYMBOLS:
-                df = fetch_ohlcv_df(ex, symbol, timeframe="15m", limit=200)
-                if df is None or len(df) < 50:
-                    continue
-
-                side, detail = indicators_and_side(df)
-                if side:
-                    entry = detail["entry"]
-                    order = safe_place_order(ex, symbol, side, entry, df)
-                    if order:
-                        positions.append(order)
-                else:
-                    log(f"⏸ {symbol} 暂无信号")
-
-                report_lines.append(f"{symbol}: {side or '无信号'}")
-
-                time.sleep(1)
-
-            # 每小时报告
-            now_ts = int(time.time())
-            if now_ts - last_hourly_push >= 3600:
-                report_msg = "📊 每小时汇总报告\n" + "\n".join(report_lines)
-                tg_send(report_msg)
-                last_hourly_push = now_ts
-
+            requests.post(url, json={"chat_id": chat_id, "text": msg})
         except Exception as e:
-            log(f"❌ 主循环错误: {e}\n{traceback.format_exc()}")
-            tg_send(f"⚠️ 主循环错误: {e}")
+            print("❌ Telegram 发送失败:", e)
 
-        used = time.time() - loop_start
-        time.sleep(max(1, POLL_INTERVAL - int(used)))
+# ===========================
+# 初始化交易所
+# ===========================
+exchange = ccxt.binance({
+    "apiKey": os.getenv("API_KEY"),
+    "secret": os.getenv("API_SECRET"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"}  # ✅ futures
+})
 
+# ===========================
+# 环境参数
+# ===========================
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT").split(",") if s.strip()]
+BASE_USDT = float(os.getenv("BASE_USDT", "100"))
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+LIVE_TRADE = os.getenv("LIVE_TRADE", "0") == "1"
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+
+# 止盈止损 ATR 倍数
+RISK_ATR_MULT = float(os.getenv("RISK_ATR_MULT", "1.5"))
+TP_ATR_MULT   = float(os.getenv("TP_ATR_MULT", "3.0"))
+SL_ATR_MULT   = float(os.getenv("SL_ATR_MULT", "2.0"))
+
+# ===========================
+# 技术指标信号
+# ===========================
+def check_signal(symbol):
+    ohlcv = exchange.fetch_ohlcv(symbol, "1h", limit=150)
+    closes = np.array([c[4] for c in ohlcv], dtype=float)
+    highs  = np.array([c[2] for c in ohlcv], dtype=float)
+    lows   = np.array([c[3] for c in ohlcv], dtype=float)
+
+    ema20 = talib.EMA(closes, 20)
+    ema50 = talib.EMA(closes, 50)
+    macd, macdsignal, _ = talib.MACD(closes, 12, 26, 9)
+    rsi = talib.RSI(closes, 14)
+    atr = talib.ATR(highs, lows, closes, timeperiod=14)
+
+    if ema20[-1] > ema50[-1] and macd[-1] > macdsignal[-1] and rsi[-1] > 50:
+        return "buy", closes[-1], atr[-1]
+    elif ema20[-1] < ema50[-1] and macd[-1] < macdsignal[-1] and rsi[-1] < 50:
+        return "sell", closes[-1], atr[-1]
+    else:
+        return None, closes[-1], atr[-1]
+
+# ===========================
+# 下单函数
+# ===========================
+def place_order(symbol, side, price, atr):
+    market = exchange.market(symbol)
+    qty = BASE_USDT * LEVERAGE / price
+    qty = float(exchange.amount_to_precision(symbol, qty))
+
+    if not LIVE_TRADE:
+        print(f"📌 模拟下单 {symbol} {side} {qty} @ {price}")
+        send_telegram(f"📌 模拟下单 {symbol} {side} {qty} @ {price}")
+        return
+
+    try:
+        # 开仓市价单
+        order = exchange.create_market_order(symbol, side, qty)
+        msg = f"✅ 入场 {symbol} {side} {qty} @ {price}"
+        print(msg); send_telegram(msg)
+
+        # 止盈止损
+        if side == "buy":
+            stop_loss = price - SL_ATR_MULT * atr
+            take_profit = price + TP_ATR_MULT * atr
+        else:
+            stop_loss = price + SL_ATR_MULT * atr
+            take_profit = price - TP_ATR_MULT * atr
+
+        # Binance 期货 OCO 不直接支持 → 分别挂单
+        exchange.create_order(symbol, "STOP_MARKET", "sell" if side=="buy" else "buy", qty, None, {"stopPrice": stop_loss})
+        exchange.create_order(symbol, "TAKE_PROFIT_MARKET", "sell" if side=="buy" else "buy", qty, None, {"stopPrice": take_profit})
+
+        send_telegram(f"🎯 止盈挂单: {take_profit}\n🛡 止损挂单: {stop_loss}")
+
+    except Exception as e:
+        print("❌ 下单失败:", e)
+        send_telegram(f"❌ 下单失败 {symbol}: {e}")
+
+# ===========================
+# 主循环
+# ===========================
+def main():
+    send_telegram("🚀 AutoTrader 启动...")
+    while True:
+        for symbol in SYMBOLS:
+            try:
+                signal, price, atr = check_signal(symbol)
+                if signal:
+                    place_order(symbol, signal, price, atr)
+            except Exception as e:
+                print(f"❌ {symbol} 出错:", e)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
