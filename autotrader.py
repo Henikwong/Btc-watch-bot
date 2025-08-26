@@ -528,4 +528,4 @@ def main():
                         place_order(symbol, sig1h, price, atr)
 
             except Exception as e:
-                print(f"❌ {symbo
+                print(f"❌ {symbol} 出错: {e}") 
