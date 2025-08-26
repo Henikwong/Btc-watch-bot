@@ -1,1 +1,12 @@
+version: "3.9"
 
+services:
+  autotrader:
+    build: .
+    container_name: autotrader-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    command: python autotrader.py
