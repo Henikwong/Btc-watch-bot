@@ -5,13 +5,13 @@ import ccxt
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import ta
 
 # ===========================
 # 配置（可通过环境变量覆盖）
 # ===========================
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT").split(",") if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,LTC/USDT,DOGE/USDT,BNB/USDT").split(",") if s.strip()]
 BASE_USDT = float(os.getenv("BASE_USDT", "100"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 LIVE_TRADE = os.getenv("LIVE_TRADE", "0") == "1"
@@ -50,12 +50,22 @@ exchange = ccxt.binance({
     "enableRateLimit": True,
     "options": {"defaultType": "future"}
 })
+exchange.load_markets()  # 确保 markets 已加载
 
+# ===========================
+# 仓位缓存 & 信号缓存
+# ===========================
+last_signal = {}  # 避免重复 Telegram
+
+# ===========================
+# setup account
+# ===========================
 def setup_account(symbol):
     try:
         m = exchange.market(symbol)
         ex_symbol = m["id"]
         try:
+            # 设置杠杆和保证金模式
             exchange.fapiPrivate_post_leverage({"symbol": ex_symbol, "leverage": LEVERAGE})
             exchange.fapiPrivate_post_margintype({"symbol": ex_symbol, "marginType": "ISOLATED"})
             print(f"✅ 已设置 {symbol} 杠杆与保证金模式")
@@ -90,7 +100,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def signal_from_indicators(df: pd.DataFrame):
     last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else last
     score = 0
     reasons = []
 
@@ -153,9 +162,6 @@ def parse_position_entry(pos):
         return None
 
 def get_position(symbol):
-    """
-    返回当前仓位信息，支持单向/双向模式
-    """
     positions = fetch_all_positions()
     for p in positions:
         parsed = parse_position_entry(p)
@@ -171,16 +177,22 @@ def get_position(symbol):
 # ===========================
 def place_order(symbol, side_text, price, atr):
     side = "buy" if side_text == "买入" else "sell"
+    qty = BASE_USDT * LEVERAGE / price
+
+    # 检查账户保证金
+    try:
+        balance = exchange.fetch_balance()["total"]["USDT"]
+        if qty * price / LEVERAGE > balance:
+            print(f"❌ {symbol} 保证金不足，跳过下单")
+            return
+    except Exception as e:
+        print(f"⚠️ 获取余额失败: {e}")
+        return
 
     try:
-        qty = BASE_USDT * LEVERAGE / price
-        try:
-            qty = float(exchange.amount_to_precision(symbol, qty))
-        except Exception:
-            qty = round(qty, 6)
-    except Exception as e:
-        send_telegram(f"❌ 计算下单数量失败 {symbol}：{e}")
-        return
+        qty = float(exchange.amount_to_precision(symbol, qty))
+    except:
+        qty = round(qty, 6)
 
     if not LIVE_TRADE:
         send_telegram(f"📌 模拟下单 {symbol} {side_text} 数量={qty} @ {price:.2f}")
@@ -193,7 +205,7 @@ def place_order(symbol, side_text, price, atr):
             dual_side = res.get("dualSidePosition", True)
             if dual_side:
                 params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
-        except Exception:
+        except:
             params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
 
         exchange.create_market_order(symbol, side, qty, params=params)
@@ -226,46 +238,6 @@ def place_order(symbol, side_text, price, atr):
         send_telegram(f"❌ 下单失败 {symbol}，原因: {e}")
 
 # ===========================
-# 平仓函数
-# ===========================
-def close_position(symbol, position):
-    try:
-        qty = position.get("qty")
-        if qty is None or qty == 0:
-            send_telegram(f"❌ 平仓失败 {symbol}：无法解析仓位数量")
-            return False
-
-        pos_side = position.get("side", "").lower()
-        side = "buy" if pos_side.startswith("short") else "sell"
-
-        is_hedge = False
-        try:
-            info = exchange.fapiPrivate_get_positionmode()
-            is_hedge = info.get("dualSidePosition") == True
-        except Exception:
-            pass
-
-        params = {}
-        if is_hedge:
-            params["positionSide"] = "SHORT" if side=="buy" else "LONG"
-
-        if LIVE_TRADE:
-            try:
-                qty_precise = float(exchange.amount_to_precision(symbol, qty))
-            except Exception:
-                qty_precise = round(qty, 6)
-
-            exchange.create_market_order(symbol, side, qty_precise, params=params)
-            send_telegram(f"✅ 已市价平仓 {symbol} {pos_side} 数量={qty_precise}")
-        else:
-            send_telegram(f"📌 模拟平仓 {symbol} {pos_side} 数量={qty}")
-
-        return True
-    except Exception as e:
-        send_telegram(f"❌ 平仓失败 {symbol}，原因: {e}")
-        return False
-
-# ===========================
 # 趋势检测
 # ===========================
 def check_trend_once(symbol):
@@ -287,14 +259,18 @@ def check_trend_once(symbol):
                     multi_tf_signal = None
         except Exception as e:
             status[tf] = {"error": str(e)}
-    
+
     if multi_tf_signal:
-        alerts.append(f"{now_str()} {symbol} 多周期共振信号: {multi_tf_signal} 原因: {';'.join(reasons_all)}")
-    
+        alert_msg = f"{now_str()} {symbol} 多周期共振信号: {multi_tf_signal} 原因: {';'.join(reasons_all)}"
+        cache = last_signal.get(symbol)
+        if cache != alert_msg:
+            alerts.append(alert_msg)
+            last_signal[symbol] = alert_msg
+
     return alerts, status, multi_tf_signal
 
 # ===========================
-# 主循环（防止重复开单）
+# 主循环
 # ===========================
 def main_loop():
     for symbol in SYMBOLS:
@@ -306,11 +282,10 @@ def main_loop():
         try:
             for symbol in SYMBOLS:
                 alerts, status, signal = check_trend_once(symbol)
-                
                 for alert in alerts:
                     print(alert)
                     send_telegram(alert)
-                
+
                 if signal:
                     df = compute_indicators(fetch_ohlcv_df(symbol, "1h", 100))
                     last_close = df.iloc[-1]["close"]
@@ -318,14 +293,10 @@ def main_loop():
                     pos = get_position(symbol)
 
                     if pos:
-                        # 方向相反 -> 平仓再开
                         if (signal=="买入" and pos["side"]=="short") or (signal=="卖出" and pos["side"]=="long"):
                             close_position(symbol, pos)
                             time.sleep(1)
                             place_order(symbol, signal, last_close, last_atr)
-                        # 方向相同 -> 不重复开单
-                        else:
-                            print(f"📌 {symbol} 已有相同方向仓位，不重复开单")
                     else:
                         place_order(symbol, signal, last_close, last_atr)
 
