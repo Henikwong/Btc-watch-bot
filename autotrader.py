@@ -185,40 +185,123 @@ def close_position(symbol, position):
         return False
 
 # ===========================
-# 下单
+# 下单（兼容单向和双向模式）
 # ===========================
 def place_order(symbol, side_text, price, atr):
-    side = "buy" if side_text=="买入" else "sell"
+    """
+    side_text: '买入' 或 '卖出'
+    自动处理单向/双向模式下的仓位问题
+    """
+    side = "buy" if side_text == "买入" else "sell"
+
+    # 计算下单数量
     try:
-        qty = BASE_USDT*LEVERAGE/price
-        try: qty=float(exchange.amount_to_precision(symbol, qty))
-        except: qty=round(qty,6)
+        qty = BASE_USDT * LEVERAGE / price
+        try:
+            qty = float(exchange.amount_to_precision(symbol, qty))
+        except Exception:
+            qty = round(qty, 6)
     except Exception as e:
         send_telegram(f"❌ 计算下单数量失败 {symbol}：{e}")
         return
+
     if not LIVE_TRADE:
         send_telegram(f"📌 模拟下单 {symbol} {side_text} 数量={qty} @ {price:.2f}")
         return
+
     try:
-        exchange.create_market_order(symbol, side, qty)
+        # 检查账户是否是双向模式
+        is_hedge = False
+        try:
+            info = exchange.fapiPrivate_get_positionmode()
+            is_hedge = info.get("dualSidePosition") == True
+        except Exception:
+            pass
+
+        params = {}
+        if is_hedge:
+            params["positionSide"] = "LONG" if side=="buy" else "SHORT"
+
+        # 开仓市价单
+        exchange.create_market_order(symbol, side, qty, params=params)
+
+        # 止损/止盈计算
         if atr is None or np.isnan(atr):
-            atr = price*0.005
-        if side=="buy":
-            stop_loss = price - SL_ATR_MULT*atr
-            take_profit = price + TP_ATR_MULT*atr
+            atr = price * 0.005
+
+        if side == "buy":
+            stop_loss = price - SL_ATR_MULT * atr
+            take_profit = price + TP_ATR_MULT * atr
             close_side = "sell"
         else:
-            stop_loss = price + SL_ATR_MULT*atr
-            take_profit = price - TP_ATR_MULT*atr
+            stop_loss = price + SL_ATR_MULT * atr
+            take_profit = price - TP_ATR_MULT * atr
             close_side = "buy"
+
+        # 下止损/止盈挂单
         try:
-            exchange.create_order(symbol,"STOP_MARKET",close_side,qty,None,{"stopPrice":stop_loss})
-            exchange.create_order(symbol,"TAKE_PROFIT_MARKET",close_side,qty,None,{"stopPrice":take_profit})
-            send_telegram(f"✅ 已下单 {symbol} {side_text} 数量={qty} @ {price:.2f}\n🎯 止盈: {take_profit:.2f}\n🛡 止损: {stop_loss:.2f}")
+            sl_params = params.copy()
+            sl_params["stopPrice"] = stop_loss
+            tp_params = params.copy()
+            tp_params["stopPrice"] = take_profit
+
+            exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None, sl_params)
+            exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, None, tp_params)
+
+            send_telegram(
+                f"✅ 已下单 {symbol} {side_text} 数量={qty} @ {price:.2f}\n🎯 止盈: {take_profit:.2f}\n🛡 止损: {stop_loss:.2f}"
+            )
         except Exception as e:
             send_telegram(f"✅ 已下单 {symbol} {side_text} 数量={qty} @ {price:.2f}\n⚠️ 挂止盈/止损失败: {e}")
+
     except Exception as e:
         send_telegram(f"❌ 下单失败 {symbol}，原因: {e}")
+
+
+# ===========================
+# 平仓函数
+# ===========================
+def close_position(symbol, position):
+    """
+    市价平掉给定仓位
+    自动处理单向/双向模式
+    """
+    try:
+        qty = position.get("qty")
+        if qty is None or qty == 0:
+            send_telegram(f"❌ 平仓失败 {symbol}：无法解析仓位数量")
+            return False
+
+        pos_side = position.get("side", "").lower()
+        side = "buy" if pos_side.startswith("short") else "sell"
+
+        # 检查账户是否是双向模式
+        is_hedge = False
+        try:
+            info = exchange.fapiPrivate_get_positionmode()
+            is_hedge = info.get("dualSidePosition") == True
+        except Exception:
+            pass
+
+        params = {}
+        if is_hedge:
+            params["positionSide"] = "SHORT" if side=="buy" else "LONG"
+
+        if LIVE_TRADE:
+            try:
+                qty_precise = float(exchange.amount_to_precision(symbol, qty))
+            except Exception:
+                qty_precise = round(qty, 6)
+
+            exchange.create_market_order(symbol, side, qty_precise, params=params)
+            send_telegram(f"✅ 已市价平仓 {symbol} {pos_side} 数量={qty_precise}")
+        else:
+            send_telegram(f"📌 模拟平仓 {symbol} {pos_side} 数量={qty}")
+
+        return True
+    except Exception as e:
+        send_telegram(f"❌ 平仓失败 {symbol}，原因: {e}")
+        return False
 
 # ===========================
 # 趋势检测
