@@ -1,4 +1,5 @@
 # app/autotrader.py
+
 import os
 import time
 import ccxt
@@ -11,10 +12,8 @@ import ta
 # ===========================
 # 工具函数
 # ===========================
-
 def now():
     return datetime.now(timezone.utc).isoformat()
-
 
 def send_telegram(msg: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,7 +25,6 @@ def send_telegram(msg: str):
         except Exception as e:
             print("❌ Telegram 发送失败:", e)
 
-
 # ===========================
 # 初始化交易所
 # ===========================
@@ -36,7 +34,6 @@ exchange = ccxt.binance({
     "enableRateLimit": True,
     "options": {"defaultType": "future"}  # ✅ futures
 })
-
 
 # ===========================
 # 环境参数
@@ -59,14 +56,13 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 # ===========================
 # 指标计算与信号逻辑
 # ===========================
-
 def fetch_ohlcv_df(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     return df
-    def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # ensure floats
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
@@ -87,23 +83,27 @@ def fetch_ohlcv_df(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT):
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14, fillna=True).rsi()
 
     # ATR
-    df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14, fillna=True).average_true_range()
+    df["atr"] = ta.volatility.AverageTrueRange(
+        df["high"], df["low"], df["close"], window=14, fillna=True
+    ).average_true_range()
 
-    # Williams %R (范围 -100 .. 0)
-    df["wr"] = ta.momentum.WilliamsRIndicator(df["high"], df["low"], df["close"], lbp=14, fillna=True).williams_r()
+    # Williams %R
+    df["wr"] = ta.momentum.WilliamsRIndicator(
+        df["high"], df["low"], df["close"], lbp=14, fillna=True
+    ).williams_r()
 
-    # Stochastic (K, D) -> used for KDJ
-    stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3, fillna=True)
+    # Stochastic (K, D, J)
+    stoch = ta.momentum.StochasticOscillator(
+        df["high"], df["low"], df["close"], window=14, smooth_window=3, fillna=True
+    )
     df["stoch_k"] = stoch.stoch()
     df["stoch_d"] = stoch.stoch_signal()
-    # Compute J = 3*K - 2*D (KDJ's J line)
     df["kdj_j"] = 3 * df["stoch_k"] - 2 * df["stoch_d"]
 
-    # Volume moving average
+    # Volume MA
     df["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
 
     return df
-
 
 def signal_from_indicators(df: pd.DataFrame):
     last = df.iloc[-1]
@@ -112,7 +112,7 @@ def signal_from_indicators(df: pd.DataFrame):
     score = 0
     reasons = []
 
-    # EMA crossover (short-term trend)
+    # EMA
     if last["ema20"] > last["ema50"]:
         score += 2
         reasons.append("EMA20>EMA50")
@@ -120,14 +120,15 @@ def signal_from_indicators(df: pd.DataFrame):
         score -= 2
         reasons.append("EMA20<EMA50")
 
-    # MACD bullish if macd > signal and hist positive and rising
+    # MACD
     if last["macd"] > last["macd_signal"] and last["macd_hist"] > 0:
         score += 2
         reasons.append("MACD bullish")
     elif last["macd"] < last["macd_signal"] and last["macd_hist"] < 0:
         score -= 2
         reasons.append("MACD bearish")
-         # RSI: neutral band 45-55
+
+    # RSI
     if last["rsi"] > 60:
         score += 1
         reasons.append(f"RSI high {last['rsi']:.1f}")
@@ -135,7 +136,7 @@ def signal_from_indicators(df: pd.DataFrame):
         score -= 1
         reasons.append(f"RSI low {last['rsi']:.1f}")
 
-    # Williams %R: oversold (<= -80) favors buy, overbought (>= -20) favors sell
+    # Williams %R
     if last["wr"] <= -80:
         score += 1
         reasons.append(f"WR oversold {last['wr']:.1f}")
@@ -143,7 +144,7 @@ def signal_from_indicators(df: pd.DataFrame):
         score -= 1
         reasons.append(f"WR overbought {last['wr']:.1f}")
 
-    # KDJ: K crossing above D and J rising
+    # KDJ
     if last["stoch_k"] > last["stoch_d"] and last["stoch_k"] > prev["stoch_k"]:
         score += 1
         reasons.append("KDJ bullish")
@@ -151,12 +152,11 @@ def signal_from_indicators(df: pd.DataFrame):
         score -= 1
         reasons.append("KDJ bearish")
 
-    # Volume spike: current volume > vol_ma20 * 1.5
+    # Volume
     if last["volume"] > last["vol_ma20"] * 1.5:
         score += 1
         reasons.append("Volume spike")
 
-    # Decide
     threshold_long = 3
     threshold_short = -3
 
@@ -167,19 +167,15 @@ def signal_from_indicators(df: pd.DataFrame):
     else:
         return None, score, reasons, last
 
-
 # ===========================
 # 下单函数
 # ===========================
-
 def place_order(symbol, side, price, atr):
     market = exchange.market(symbol)
-    # 使用基础 USDT * 杠杆 / 价格 = 合约数量近似
     qty = BASE_USDT * LEVERAGE / price
     try:
         qty = float(exchange.amount_to_precision(symbol, qty))
     except Exception:
-        # Fallback: round to 6 decimals
         qty = float(round(qty, 6))
 
     if not LIVE_TRADE:
@@ -189,15 +185,13 @@ def place_order(symbol, side, price, atr):
         return
 
     try:
-        # 开仓市价单
         order = exchange.create_market_order(symbol, side, qty)
         msg = f"✅ 入场 {symbol} {side} {qty:.6f} @ {price:.2f}"
         print(msg)
         send_telegram(msg)
-        
-        # 止盈止损
+
         if atr is None or np.isnan(atr):
-            atr = price * 0.005  # fallback 0.5%
+            atr = price * 0.005
 
         if side == "buy":
             stop_loss = price - SL_ATR_MULT * atr
@@ -208,7 +202,6 @@ def place_order(symbol, side, price, atr):
             take_profit = price - TP_ATR_MULT * atr
             close_side = "buy"
 
-        # 创建止损/止盈市价单（注意：不同交易所期货需要不同参数）
         try:
             exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None, {"stopPrice": stop_loss})
             exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, None, {"stopPrice": take_profit})
@@ -221,11 +214,9 @@ def place_order(symbol, side, price, atr):
         print("❌ 下单失败:", e)
         send_telegram(f"❌ 下单失败 {symbol}: {e}")
 
-
 # ===========================
 # 主循环
 # ===========================
-
 def main():
     send_telegram("🚀 AutoTrader (ta version) 启动...")
     print("启动: ", now())
@@ -247,7 +238,6 @@ def main():
                 if signal:
                     place_order(symbol, signal, price, atr)
                 else:
-                    # optional: push periodic updates
                     print(f"[{symbol}] no clear signal. score={score}")
 
             except Exception as e:
@@ -255,7 +245,6 @@ def main():
                 send_telegram(f"❌ {symbol} 出错: {e}")
 
         time.sleep(POLL_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
