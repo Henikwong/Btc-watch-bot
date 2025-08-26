@@ -1,4 +1,4 @@
-# app/autotrader.py
+# autotrader.py
 import os
 import time
 import ccxt
@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 import ta
 
 # ===========================
-# 配置（环境变量覆盖）
+# 配置（可通过环境变量覆盖）
 # ===========================
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT").split(",") if s.strip()]
 BASE_USDT = float(os.getenv("BASE_USDT", "100"))
@@ -17,27 +17,27 @@ LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 LIVE_TRADE = os.getenv("LIVE_TRADE", "0") == "1"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # 每分钟默认 60 秒
 ONLY_RESONANCE = os.getenv("ONLY_RESONANCE", "1") == "1"  # 是否仅在多周期共振时下单
+
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
+
 OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "200"))
 
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 # ===========================
-# 帮助函数
+# 工具函数
 # ===========================
 def now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def send_telegram(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
         print("⚠️ 未配置 Telegram 环境变量，跳过推送:", msg)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        requests.post(url, json={"chat_id": chat_id, "text": msg})
     except Exception as e:
         print("❌ Telegram 推送失败:", e)
 
@@ -69,7 +69,7 @@ def setup_account(symbol):
 # ===========================
 def fetch_ohlcv_df(symbol, timeframe="1h", limit=OHLCV_LIMIT):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -94,18 +94,22 @@ def signal_from_indicators(df: pd.DataFrame):
     score = 0
     reasons = []
 
+    # EMA
     if last["ema20"] > last["ema50"]:
         score += 2; reasons.append("EMA 多头")
     else:
         score -= 2; reasons.append("EMA 空头")
+    # MACD
     if last["macd"] > last["macd_signal"]:
         score += 1; reasons.append("MACD 多头")
     else:
         score -= 1; reasons.append("MACD 空头")
+    # RSI
     if last["rsi"] > 60:
         score += 1; reasons.append(f"RSI 偏强 {last['rsi']:.1f}")
     elif last["rsi"] < 40:
         score -= 1; reasons.append(f"RSI 偏弱 {last['rsi']:.1f}")
+    # Volume spike
     if "vol_ma20" in df.columns and last["volume"] > last["vol_ma20"] * 1.5:
         score += 1; reasons.append("成交量放大")
 
@@ -117,7 +121,7 @@ def signal_from_indicators(df: pd.DataFrame):
         return None, score, reasons, last
 
 # ===========================
-# 仓位相关
+# 仓位管理
 # ===========================
 def fetch_all_positions():
     try:
@@ -130,28 +134,44 @@ def fetch_all_positions():
 def parse_position_entry(pos):
     try:
         symbol = pos.get("symbol") or (pos.get("info") or {}).get("symbol")
-        contracts = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("amount") or 0)
-        if contracts == 0: return None
-        side = pos.get("side") or ("long" if contracts > 0 else "short")
-        entry = pos.get("entryPrice") or (pos.get("info") or {}).get("entryPrice")
+        contracts = None
+        if "contracts" in pos: contracts = float(pos["contracts"])
+        elif "positionAmt" in pos: contracts = float(pos["positionAmt"])
+        elif "amount" in pos: contracts = float(pos["amount"])
+        if contracts is None or contracts==0: return None
+        side = None
+        if "side" in pos and pos["side"]: side = pos["side"]
+        else:
+            if "positionAmt" in pos:
+                amt = float(pos["positionAmt"])
+                side = "long" if amt > 0 else "short"
+            elif contracts > 0:
+                side = pos.get("side") or (pos.get("info") or {}).get("positionSide") or "long"
+        entry = pos.get("entryPrice") or (pos.get("info") or {}).get("entryPrice") or None
         return (symbol, abs(contracts), side, float(entry) if entry else None)
-    except: return None
+    except Exception as e:
+        print("⚠️ parse_position_entry 失败:", e)
+        return None
 
 def get_position(symbol):
     positions = fetch_all_positions()
     for p in positions:
         parsed = parse_position_entry(p)
-        if parsed and parsed[0] and parsed[0].replace("/","") == symbol.replace("/",""):
-            return {"symbol": symbol, "qty": parsed[1], "side": parsed[2], "entry": parsed[3], "raw": p}
+        if not parsed: continue
+        sym, qty, side, entry = parsed
+        if not sym: continue
+        if sym.replace("/", "") == symbol.replace("/", "") or sym == symbol:
+            return {"symbol": symbol, "qty": qty, "side": side, "entry": entry, "raw": p}
     return None
 
 def close_position(symbol, position):
     try:
         qty = position.get("qty")
         if qty is None or qty==0:
-            send_telegram(f"❌ 平仓失败 {symbol}：无法解析仓位数量"); return False
-        pos_side = position.get("side","")
-        side = "buy" if pos_side.lower().startswith("short") else "sell"
+            send_telegram(f"❌ 平仓失败 {symbol}：无法解析仓位数量")
+            return False
+        pos_side = position.get("side","").lower()
+        side = "buy" if pos_side.startswith("short") else "sell"
         if LIVE_TRADE:
             try: qty_precise = float(exchange.amount_to_precision(symbol, qty))
             except: qty_precise = round(qty,6)
@@ -171,24 +191,26 @@ def place_order(symbol, side_text, price, atr):
     side = "buy" if side_text=="买入" else "sell"
     try:
         qty = BASE_USDT*LEVERAGE/price
-        try: qty = float(exchange.amount_to_precision(symbol, qty))
+        try: qty=float(exchange.amount_to_precision(symbol, qty))
         except: qty=round(qty,6)
     except Exception as e:
-        send_telegram(f"❌ 计算下单数量失败 {symbol}：{e}"); return
+        send_telegram(f"❌ 计算下单数量失败 {symbol}：{e}")
+        return
     if not LIVE_TRADE:
         send_telegram(f"📌 模拟下单 {symbol} {side_text} 数量={qty} @ {price:.2f}")
         return
     try:
         exchange.create_market_order(symbol, side, qty)
-        if atr is None or np.isnan(atr): atr = price*0.005
+        if atr is None or np.isnan(atr):
+            atr = price*0.005
         if side=="buy":
-            stop_loss = price-SL_ATR_MULT*atr
-            take_profit = price+TP_ATR_MULT*atr
-            close_side="sell"
+            stop_loss = price - SL_ATR_MULT*atr
+            take_profit = price + TP_ATR_MULT*atr
+            close_side = "sell"
         else:
-            stop_loss=price+SL_ATR_MULT*atr
-            take_profit=price-TP_ATR_MULT*atr
-            close_side="buy"
+            stop_loss = price + SL_ATR_MULT*atr
+            take_profit = price - TP_ATR_MULT*atr
+            close_side = "buy"
         try:
             exchange.create_order(symbol,"STOP_MARKET",close_side,qty,None,{"stopPrice":stop_loss})
             exchange.create_order(symbol,"TAKE_PROFIT_MARKET",close_side,qty,None,{"stopPrice":take_profit})
@@ -202,26 +224,68 @@ def place_order(symbol, side_text, price, atr):
 # 趋势检测
 # ===========================
 def check_trend_once(symbol):
-    result={"alerts":[],"status":{}}
-    for tf in ["4h","1d"]:
-        try:
-            df = compute_indicators(fetch_ohlcv_df(symbol,timeframe=tf))
-            last=df.iloc[-1]; prev=df.iloc[-2]
-            status="多头" if last["ema20"]>last["ema50"] else "空头"
-            result["status"][tf]=status
-            if last["ema20"]>last["ema50"] and prev["ema20"]<=prev["ema50"]:
-                result["alerts"].append(f"⚡ 趋势提醒: {symbol} {tf} 出现金叉 → 趋势看多")
-            elif last["ema20"]<last["ema50"] and prev["ema20"]>=prev["ema50"]:
-                result["alerts"].append(f"⚡ 趋势提醒: {symbol} {tf} 出现死叉 → 趋势转空")
-        except Exception as e:
-            result["alerts"].append(f"❌ 趋势检测失败 {symbol} {tf}: {e}")
-    if result["status"].get("4h") and result["status"].get("1d") and result["status"]["4h"]==result["status"]["1d"]:
-        result["alerts"].append(f"🔥 趋势共振: {symbol} ({result['status']['4h']})")
-    return result
+    alerts = []
+    status = {}
+    multi_tf_signal = None
+    reasons_all = []
 
-def startup_trend_report():
-    report=["📌 启动时趋势检测:"]
+    for tf in ["1h","4h","1d"]:  # 多周期共振
+        try:
+            df = compute_indicators(fetch_ohlcv_df(symbol, tf, 100))
+            signal, score, reasons, last = signal_from_indicators(df)
+            status[tf] = {"signal": signal, "score": score, "reasons": reasons, "last_close": last["close"]}
+            if signal:
+                reasons_all.extend([f"{tf}:{r}" for r in reasons])
+                if multi_tf_signal is None:
+                    multi_tf_signal = signal
+                elif multi_tf_signal != signal:
+                    multi_tf_signal = None  # 不共振
+        except Exception as e:
+            status[tf] = {"error": str(e)}
+    
+    if multi_tf_signal:
+        alerts.append(f"{now_str()} {symbol} 多周期共振信号: {multi_tf_signal} 原因: {';'.join(reasons_all)}")
+    
+    return alerts, status, multi_tf_signal
+
+# ===========================
+# 主循环
+# ===========================
+def main_loop():
     for symbol in SYMBOLS:
-        r=check_trend_once(symbol)
-        st4=r["status"].get("4h","未知"); st1=r["status"].get("1d","未知")
-        report.append(f"{symbol} 4h:{st4} | 1d:{st1}")
+        setup_account(symbol)
+    
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                alerts, status, signal = check_trend_once(symbol)
+                
+                for alert in alerts:
+                    print(alert)
+                    send_telegram(alert)
+                
+                if signal:
+                    df = compute_indicators(fetch_ohlcv_df(symbol, "1h", 100))
+                    last_close = df.iloc[-1]["close"]
+                    last_atr = df.iloc[-1]["atr"]
+                    pos = get_position(symbol)
+                    
+                    if pos:
+                        # 如果已有仓位且方向不同，先平仓
+                        if (signal=="买入" and pos["side"]=="short") or (signal=="卖出" and pos["side"]=="long"):
+                            close_position(symbol, pos)
+                            time.sleep(1)  # 等待平仓
+                            place_order(symbol, signal, last_close, last_atr)
+                    else:
+                        place_order(symbol, signal, last_close, last_atr)
+            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            print("⚠️ 主循环异常:", e)
+            time.sleep(POLL_INTERVAL)
+
+# ===========================
+# 启动
+# ===========================
+if __name__ == "__main__":
+    print(f"🚀 AutoTrader 启动 {SYMBOLS}，LIVE_TRADE={LIVE_TRADE}")
+    main_loop()
