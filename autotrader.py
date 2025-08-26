@@ -94,22 +94,21 @@ def signal_from_indicators(df: pd.DataFrame):
     score = 0
     reasons = []
 
-    # EMA
     if last["ema20"] > last["ema50"]:
         score += 2; reasons.append("EMA 多头")
     else:
         score -= 2; reasons.append("EMA 空头")
-    # MACD
+
     if last["macd"] > last["macd_signal"]:
         score += 1; reasons.append("MACD 多头")
     else:
         score -= 1; reasons.append("MACD 空头")
-    # RSI
+
     if last["rsi"] > 60:
         score += 1; reasons.append(f"RSI 偏强 {last['rsi']:.1f}")
     elif last["rsi"] < 40:
         score -= 1; reasons.append(f"RSI 偏弱 {last['rsi']:.1f}")
-    # Volume spike
+
     if "vol_ma20" in df.columns and last["volume"] > last["vol_ma20"] * 1.5:
         score += 1; reasons.append("成交量放大")
 
@@ -154,6 +153,9 @@ def parse_position_entry(pos):
         return None
 
 def get_position(symbol):
+    """
+    返回当前仓位信息，支持单向/双向模式
+    """
     positions = fetch_all_positions()
     for p in positions:
         parsed = parse_position_entry(p)
@@ -164,36 +166,10 @@ def get_position(symbol):
             return {"symbol": symbol, "qty": qty, "side": side, "entry": entry, "raw": p}
     return None
 
-def close_position(symbol, position):
-    try:
-        qty = position.get("qty")
-        if qty is None or qty==0:
-            send_telegram(f"❌ 平仓失败 {symbol}：无法解析仓位数量")
-            return False
-        pos_side = position.get("side","").lower()
-        side = "buy" if pos_side.startswith("short") else "sell"
-        if LIVE_TRADE:
-            try: qty_precise = float(exchange.amount_to_precision(symbol, qty))
-            except: qty_precise = round(qty,6)
-            exchange.create_market_order(symbol, side, qty_precise)
-            send_telegram(f"✅ 已市价平仓 {symbol} {pos_side} 数量={qty_precise}")
-        else:
-            send_telegram(f"📌 模拟平仓 {symbol} {pos_side} 数量={qty}")
-        return True
-    except Exception as e:
-        send_telegram(f"❌ 平仓失败 {symbol}，原因: {e}")
-        return False
-
 # ===========================
-# 下单（兼容单向和双向模式）
+# 下单函数
 # ===========================
 def place_order(symbol, side_text, price, atr):
-    """
-    下单函数（支持双向模式Hedge）
-    side_text: '买入' 或 '卖出'
-    price: 当前价格
-    atr: ATR值，用于计算止盈止损
-    """
     side = "buy" if side_text == "买入" else "sell"
 
     try:
@@ -211,27 +187,17 @@ def place_order(symbol, side_text, price, atr):
         return
 
     try:
-        # -----------------------------
-        # 双向模式指定 positionSide
-        # -----------------------------
         params = {}
         try:
-            res = exchange.fapiPrivate_get_positionmode()  # 获取当前模式
+            res = exchange.fapiPrivate_get_positionmode()
             dual_side = res.get("dualSidePosition", True)
             if dual_side:
                 params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
         except Exception:
-            # 如果获取失败，仍尝试指定
             params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
 
-        # -----------------------------
-        # 开仓市价单
-        # -----------------------------
         exchange.create_market_order(symbol, side, qty, params=params)
 
-        # -----------------------------
-        # 计算止损、止盈
-        # -----------------------------
         if atr is None or np.isnan(atr):
             atr = price * 0.005
         if side_text == "买入":
@@ -245,7 +211,6 @@ def place_order(symbol, side_text, price, atr):
             close_side = "buy"
             close_pos_side = "SHORT"
 
-        # 尝试挂止损/止盈单
         try:
             exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None,
                                   {"stopPrice": stop_loss, "positionSide": close_pos_side})
@@ -264,10 +229,6 @@ def place_order(symbol, side_text, price, atr):
 # 平仓函数
 # ===========================
 def close_position(symbol, position):
-    """
-    市价平掉给定仓位
-    自动处理单向/双向模式
-    """
     try:
         qty = position.get("qty")
         if qty is None or qty == 0:
@@ -277,7 +238,6 @@ def close_position(symbol, position):
         pos_side = position.get("side", "").lower()
         side = "buy" if pos_side.startswith("short") else "sell"
 
-        # 检查账户是否是双向模式
         is_hedge = False
         try:
             info = exchange.fapiPrivate_get_positionmode()
@@ -314,7 +274,7 @@ def check_trend_once(symbol):
     multi_tf_signal = None
     reasons_all = []
 
-    for tf in ["1h","4h","1d"]:  # 多周期共振
+    for tf in ["1h","4h","1d"]:
         try:
             df = compute_indicators(fetch_ohlcv_df(symbol, tf, 100))
             signal, score, reasons, last = signal_from_indicators(df)
@@ -324,7 +284,7 @@ def check_trend_once(symbol):
                 if multi_tf_signal is None:
                     multi_tf_signal = signal
                 elif multi_tf_signal != signal:
-                    multi_tf_signal = None  # 不共振
+                    multi_tf_signal = None
         except Exception as e:
             status[tf] = {"error": str(e)}
     
@@ -334,12 +294,14 @@ def check_trend_once(symbol):
     return alerts, status, multi_tf_signal
 
 # ===========================
-# 主循环
+# 主循环（防止重复开单）
 # ===========================
 def main_loop():
     for symbol in SYMBOLS:
         setup_account(symbol)
-    
+        pos = get_position(symbol)
+        print(f"📌 启动时 {symbol} 仓位: {pos}")
+
     while True:
         try:
             for symbol in SYMBOLS:
@@ -354,15 +316,19 @@ def main_loop():
                     last_close = df.iloc[-1]["close"]
                     last_atr = df.iloc[-1]["atr"]
                     pos = get_position(symbol)
-                    
+
                     if pos:
-                        # 如果已有仓位且方向不同，先平仓
+                        # 方向相反 -> 平仓再开
                         if (signal=="买入" and pos["side"]=="short") or (signal=="卖出" and pos["side"]=="long"):
                             close_position(symbol, pos)
-                            time.sleep(1)  # 等待平仓
+                            time.sleep(1)
                             place_order(symbol, signal, last_close, last_atr)
+                        # 方向相同 -> 不重复开单
+                        else:
+                            print(f"📌 {symbol} 已有相同方向仓位，不重复开单")
                     else:
                         place_order(symbol, signal, last_close, last_atr)
+
             time.sleep(POLL_INTERVAL)
         except Exception as e:
             print("⚠️ 主循环异常:", e)
