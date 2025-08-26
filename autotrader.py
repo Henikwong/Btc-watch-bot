@@ -189,12 +189,13 @@ def close_position(symbol, position):
 # ===========================
 def place_order(symbol, side_text, price, atr):
     """
+    下单函数（支持双向模式Hedge）
     side_text: '买入' 或 '卖出'
-    自动处理单向/双向模式下的仓位问题
+    price: 当前价格
+    atr: ATR值，用于计算止盈止损
     """
     side = "buy" if side_text == "买入" else "sell"
 
-    # 计算下单数量
     try:
         qty = BASE_USDT * LEVERAGE / price
         try:
@@ -210,44 +211,46 @@ def place_order(symbol, side_text, price, atr):
         return
 
     try:
-        # 检查账户是否是双向模式
-        is_hedge = False
-        try:
-            info = exchange.fapiPrivate_get_positionmode()
-            is_hedge = info.get("dualSidePosition") == True
-        except Exception:
-            pass
-
+        # -----------------------------
+        # 双向模式指定 positionSide
+        # -----------------------------
         params = {}
-        if is_hedge:
-            params["positionSide"] = "LONG" if side=="buy" else "SHORT"
+        try:
+            res = exchange.fapiPrivate_get_positionmode()  # 获取当前模式
+            dual_side = res.get("dualSidePosition", True)
+            if dual_side:
+                params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
+        except Exception:
+            # 如果获取失败，仍尝试指定
+            params["positionSide"] = "LONG" if side_text=="买入" else "SHORT"
 
+        # -----------------------------
         # 开仓市价单
+        # -----------------------------
         exchange.create_market_order(symbol, side, qty, params=params)
 
-        # 止损/止盈计算
+        # -----------------------------
+        # 计算止损、止盈
+        # -----------------------------
         if atr is None or np.isnan(atr):
             atr = price * 0.005
-
-        if side == "buy":
+        if side_text == "买入":
             stop_loss = price - SL_ATR_MULT * atr
             take_profit = price + TP_ATR_MULT * atr
             close_side = "sell"
+            close_pos_side = "LONG"
         else:
             stop_loss = price + SL_ATR_MULT * atr
             take_profit = price - TP_ATR_MULT * atr
             close_side = "buy"
+            close_pos_side = "SHORT"
 
-        # 下止损/止盈挂单
+        # 尝试挂止损/止盈单
         try:
-            sl_params = params.copy()
-            sl_params["stopPrice"] = stop_loss
-            tp_params = params.copy()
-            tp_params["stopPrice"] = take_profit
-
-            exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None, sl_params)
-            exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, None, tp_params)
-
+            exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None,
+                                  {"stopPrice": stop_loss, "positionSide": close_pos_side})
+            exchange.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, None,
+                                  {"stopPrice": take_profit, "positionSide": close_pos_side})
             send_telegram(
                 f"✅ 已下单 {symbol} {side_text} 数量={qty} @ {price:.2f}\n🎯 止盈: {take_profit:.2f}\n🛡 止损: {stop_loss:.2f}"
             )
@@ -256,7 +259,6 @@ def place_order(symbol, side_text, price, atr):
 
     except Exception as e:
         send_telegram(f"❌ 下单失败 {symbol}，原因: {e}")
-
 
 # ===========================
 # 平仓函数
