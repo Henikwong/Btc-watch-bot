@@ -1,12 +1,14 @@
-def send_telegram(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram 未配置，消息打印:", msg)
-        return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        )
-        print("📨 Telegram 返回:", r.status_code, r.text)  # 加这一行
-    except Exception as e:
-        print("❌ Telegram 推送失败:", e)
+import os, requests
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+print("🔧 TOKEN:", TOKEN)
+print("🔧 CHAT_ID:", CHAT_ID)
+
+url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+payload = {"chat_id": CHAT_ID, "text": "✅ Telegram 最小化测试"}
+r = requests.post(url, json=payload)
+
+print("📨 状态:", r.status_code)
+print("📨 返回:", r.text)
