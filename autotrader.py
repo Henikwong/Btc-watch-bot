@@ -1,24 +1,21 @@
-import openai
+import requests
 import os
 
-# 读取 API Key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# GPT 生成回应
-def gpt_response(prompt):
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Telegram 配置缺失")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
     try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=200
-        )
-        return resp.choices[0].message.content.strip()
+        r = requests.post(url, data=payload)
+        print("📨 Telegram 发送状态:", r.text)   # 打印结果方便调试
     except Exception as e:
-        return f"❌ GPT 调用失败: {e}"
-
-
-# === 关键：把 GPT 回应发到 Telegram ===
-def gpt_to_telegram(prompt):
-    reply = gpt_response(prompt)
-    send_telegram(f"🤖 GPT 回复:\n{reply}")
+        print("❌ Telegram 发送失败:", e)
