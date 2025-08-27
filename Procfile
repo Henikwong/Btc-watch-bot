@@ -1,1 +1,1 @@
-test_loop.py
+worker: python3 autotrader.py
