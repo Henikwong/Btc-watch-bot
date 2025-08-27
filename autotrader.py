@@ -16,3 +16,9 @@ def gpt_response(prompt):
         return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"❌ GPT 调用失败: {e}"
+
+
+# === 关键：把 GPT 回应发到 Telegram ===
+def gpt_to_telegram(prompt):
+    reply = gpt_response(prompt)
+    send_telegram(f"🤖 GPT 回复:\n{reply}")
