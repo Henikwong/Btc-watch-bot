@@ -341,7 +341,7 @@ def main_loop():
                             send_telegram(f"⏸ {symbol} 保证金不足冷却至 {cooldown_until[symbol]}")
                         if "-4061" in errstr:
                             send_telegram(f"⚠️ {symbol} -4061 position side mismatch")
-            last_hour = last_summary_time = datetime.minwhile True:
+            last_hour = last_summary_time = datetime.min while True:
     now = datetime.now(timezone.utc)
     
     # ... 每个币的信号和状态更新到 all_status ...
