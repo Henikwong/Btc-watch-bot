@@ -515,5 +515,11 @@ def main_loop():
                     if "-4061" in errstr:
                         send_telegram(f"⚠️ {symbol} 报 -4061 (position side mismatch)，请确认账户为 Hedge Mode 并且 API 权限完整")
             # main for end
+            time.sleep(POLL_INTERVAL)
 
- 
+        except Exception as e:
+            print("⚠️ 主循环异常:", e)
+            time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main_loop()
