@@ -1,4 +1,3 @@
-python autotrader.py
 import os
 import openai
 
