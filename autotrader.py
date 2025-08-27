@@ -295,7 +295,7 @@ def main_loop():
     send_telegram(f"🤖 Bot 启动 - Hedge Mode={is_hedge_mode()} LIVE_TRADE={LIVE_TRADE} SYMBOLS={','.join(SYMBOLS)}")
 
     while True:
-    try:
+        try:
         now = datetime.now(timezone.utc)
         all_status = {}
 
