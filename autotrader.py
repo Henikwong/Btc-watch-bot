@@ -399,7 +399,7 @@ last_summary_time = {}   # 每币种上次汇总时间 (datetime)
 last_executed_signal = {}  # 每币种上次已执行方向 'buy'/'sell'/None
 cooldown_until = {}        # 每币种冷却到期 (datetime)
 
-# ================== 主循环 ==================
+# ================== 主循环（改写版） ==================
 def main_loop():
     load_markets_safe()
     # 尝试设置杠杆与保证金模式（容错）
@@ -412,63 +412,115 @@ def main_loop():
     while True:
         try:
             now = datetime.now(timezone.utc)
+            all_status = {}  # 保存每个币种当前状态
 
             for symbol in SYMBOLS:
                 # 冷却处理
                 if symbol in cooldown_until and now < cooldown_until[symbol]:
                     continue
 
-                # 多周期共振
+                # 多周期共振信号计算
                 signal, reasons, status = check_multi_tf(symbol)
+                all_status[symbol] = {"signal": signal, "reasons": reasons, "status": status}
                 price = status.get("1h", {}).get("last_close") or 0.0
                 atr = status.get("1h", {}).get("atr") or None
 
-                # 每小时汇总推送（每币种）
-                last_sum = last_summary_time.get(symbol)
-                if last_sum is None or (now - last_sum).total_seconds() >= SUMMARY_INTERVAL:
-                    pr = f"{price:.2f}" if price else "0"
+                # 下单逻辑
+                prev_signal = last_executed_signal.get(symbol)
+                if signal in ("buy", "sell") and signal != prev_signal:
+                    pos = get_position(symbol)
+                    need_close_and_reverse = pos and ((signal == "buy" and pos["side"] == "short") or (signal == "sell" and pos["side"] == "long"))
+
+                    # ATR/price 校验
+                    if price <= 0 or math.isnan(price) or (atr is None or math.isnan(atr)):
+                        print(f"⚠️ {symbol} 当前价格或 ATR 无效，跳过本轮下单")
+                        continue
+
+                    # 计算下单数量
+                    try:
+                        qty = amount_from_usdt(symbol, price, usdt_amount=None)
+                    except Exception as e:
+                        print(f"⚠️ 计算 {symbol} qty 失败:", e)
+                        qty = 0
+
+                    min_amount = get_min_amount(symbol)
+                    if qty < min_amount:
+                        msg = f"{symbol} 下单量 {qty} < 最小量 {min_amount}，跳过"
+                        print("⚠️", msg)
+                        send_telegram(msg)
+                        last_executed_signal[symbol] = None
+                        continue
+
+                    # 平反向仓
+                    if need_close_and_reverse:
+                        ok = close_position_market_with_positionSide(symbol, pos)
+                        if not ok:
+                            continue
+                        time.sleep(1)
+
+                    # 再确认是否已有同向仓
+                    pos2 = get_position(symbol)
+                    has_same = pos2 and ((signal == "buy" and pos2["side"] == "long") or (signal == "sell" and pos2["side"] == "short"))
+                    if has_same:
+                        last_executed_signal[symbol] = signal
+                        continue
+
+                    # 开仓
+                    ok, err = place_market_with_positionSide(symbol, signal, qty)
+                    if ok:
+                        # 挂 TP/SL
+                        if signal == "buy":
+                            tp_price = price + TP_ATR_MULT * atr
+                            sl_price = price - SL_ATR_MULT * atr
+                        else:
+                            tp_price = price - TP_ATR_MULT * atr
+                            sl_price = price + SL_ATR_MULT * atr
+
+                        # 分批 TP
+                        if PARTIAL_TP_RATIO > 0 and PARTIAL_TP_RATIO < 1:
+                            qty_first = round(qty * PARTIAL_TP_RATIO, 6)
+                            qty_rest = round(qty - qty_first, 6)
+                            if qty_first > 0:
+                                place_tp_sl_orders(symbol, signal, qty_first, tp_price, sl_price)
+                            if qty_rest > 0:
+                                place_tp_sl_orders(symbol, signal, qty_rest, tp_price, sl_price)
+                        else:
+                            place_tp_sl_orders(symbol, signal, qty, tp_price, sl_price)
+
+                        send_telegram(f"✅ {symbol} 开仓 {signal} qty={qty} @ {price:.2f} TP≈{tp_price:.2f} SL≈{sl_price:.2f}")
+                        last_executed_signal[symbol] = signal
+                    else:
+                        errstr = str(err)
+                        send_telegram(f"❌ 下单失败 {symbol} {signal}: {errstr}")
+                        if "-2019" in errstr or "Margin is insufficient" in errstr:
+                            cooldown_until[symbol] = now + timedelta(seconds=MARGIN_COOLDOWN)
+                            send_telegram(f"⏸ {symbol} 保证金不足冷却至 {cooldown_until[symbol].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                        if "-4061" in errstr:
+                            send_telegram(f"⚠️ {symbol} -4061 (position side mismatch)")
+
+            # 每小时统一推送五个币种状态
+            last_hour = last_summary_time.get("all", datetime.min)
+            if (now - last_hour).total_seconds() >= SUMMARY_INTERVAL:
+                msgs = []
+                for s in SYMBOLS:
+                    st = all_status.get(s, {})
+                    sig = st.get("signal") or "无"
+                    reasons = st.get("reasons") or []
                     reason_str = ";".join(reasons) if reasons else "无"
-                    send_telegram(f"{now_str()} {symbol} 信号:{signal or '无'} 原因:{reason_str} 价格:{pr}")
-                    last_summary_time[symbol] = now
+                    price = st.get("status", {}).get("1h", {}).get("last_close") or 0.0
+                    msgs.append(f"{s} 信号:{sig} 原因:{reason_str} 价格:{price:.2f}")
+                send_telegram(f"{now_str()}\n" + "\n".join(msgs))
+                last_summary_time["all"] = now
 
-                # 仅在信号发生改变时尝试执行（防刷屏/防重复下单）
-                prev = last_executed_signal.get(symbol)
-                if signal not in ("buy", "sell"):
-                    continue
+            time.sleep(POLL_INTERVAL)
 
-                if signal == prev:
-                    # same signal already executed -> skip
-                    continue
-
-                # 获取当前仓位
-                pos = get_position(symbol)
-                need_close_and_reverse = pos and ((signal == "buy" and pos["side"] == "short") or (signal == "sell" and pos["side"] == "long"))
-
+        except Exception as e:
+            print("⚠️ 主循环异常:", e)
+            time.sleep(5)
                 if price <= 0 or math.isnan(price):
                     continue
 
-                # 计算下单数量（优先基于账户余额 RISK_RATIO；若想用固定 BASE_USDT 可传 usdt_amount=BASE_USDT）
-                try:
-                    qty = amount_from_usdt(symbol, price, usdt_amount=None)  # None -> 使用 RISK_RATIO
-                except Exception as e:
-                    print("⚠️ 计算 qty 失败:", e)
-                    qty = 0
-
-                min_amount = get_min_amount(symbol)
-                if min_amount and qty < min_amount:
-                    msg = f"{symbol} 计算下单量 {qty} 小于最小单量 {min_amount}，跳过此次开仓"
-                    print("⚠️", msg)
-                    send_telegram(msg)
-                    last_executed_signal[symbol] = None
-                    continue
-
-                # 需要先平反向仓
-                if need_close_and_reverse:
-                    ok = close_position_market_with_positionSide(symbol, pos)
-                    if not ok:
-                        continue
-                    # 睡一小会儿让位置更新
-                    time.sleep(1)
+                # 计算下单数量（优先基于账户余额 RISK_RATIO；若想用固定 BASE_USDT 可传 
 
                 # 再次确认是否已有同向仓（可能平仓后已无仓）
                 pos2 = get_position(symbol)
