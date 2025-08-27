@@ -1,13 +1,23 @@
 import requests
 import os
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(message: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    r = requests.post(url, data=payload)
-    print("📨 状态:", r.status_code, r.text)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Telegram 配置缺失，请检查 Railway Variables")
+        return
 
-send_telegram("✅ Telegram 测试消息 from Railway")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+
+    print("📤 准备发送到 Telegram:")
+    print("   Chat ID:", TELEGRAM_CHAT_ID)
+    print("   Message:", message)
+
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        print("📨 Telegram 返回:", r.status_code, r.text)
+    except Exception as e:
+        print("❌ Telegram 请求失败:", e)
