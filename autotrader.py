@@ -341,17 +341,26 @@ def main_loop():
                             send_telegram(f"⏸ {symbol} 保证金不足冷却至 {cooldown_until[symbol]}")
                         if "-4061" in errstr:
                             send_telegram(f"⚠️ {symbol} -4061 position side mismatch")
-            last_hour = last_summary_time.get("all", datetime.min)
-            if (now - last_hour).total_seconds() >= SUMMARY_INTERVAL:
-                summary_msgs = []
-                for sym, info in all_status.items():
-                    sig = info.get("signal")
-                    reasons = info.get("reasons", [])
-                    summary_msgs.append(f"{sym}: 信号={sig}, 理由={'|'.join(reasons)}")
-                send_telegram("🕒 每小时汇总\n" + "\n".join(summary_msgs))
-                last_summary_time["all"] = now
+            last_hour = last_summary_time = datetime.min
 
-            time.sleep(POLL_INTERVAL)
+while True:
+    now = datetime.now(timezone.utc)
+    
+    # ... 每个币的信号和状态更新到 all_status ...
+
+    # 每小时汇总
+    if (now - last_summary_time).total_seconds() >= SUMMARY_INTERVAL:
+        summary_msgs = []
+        for sym in SYMBOLS:
+            info = all_status.get(sym, {})
+            sig = info.get("signal") or "无信号"
+            reasons = info.get("reasons", [])
+            price = info.get("status", {}).get("1h", {}).get("last_close", 0)
+            summary_msgs.append(f"{sym}: 信号={sig}, 最新价={price:.2f}, 理由={'|'.join(reasons)}")
+        send_telegram("🕒 每小时汇总\n" + "\n".join(summary_msgs))
+        last_summary_time = now
+
+    time.sleep(POLL_INTERVAL)
         except Exception as e:
             print(f"⚠️ 主循环异常: {e}")
             time.sleep(5)
