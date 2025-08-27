@@ -1,1 +1,1 @@
-worker: python3 autotrader.py
+worker: python3 test_telegram.py
