@@ -1,14 +1,15 @@
 # autotrader.py
 """
-Merged Hedge Mode AutoTrader - 完整版
+Merged Hedge Mode AutoTrader - 完整版 (已合并 RISK_RATIO / ATR / PARTIAL_TP / 修复 fetch)
 功能：
 - 多周期共振 (1h, 4h, 1d)
-- Hedge Mode 强制使用 positionSide (LONG/SHORT)
+- Hedge Mode 强制使用 positionSide (LONG/SHORT)，若账户为单向则自动不传
 - ATR 计算 TP/SL，支持分批止盈 PARTIAL_TP_RATIO（可选）
 - 每个币每小时汇总 Telegram（避免刷屏）
 - 出错（如 margin insufficient）冷却处理
-- 检查并跳过小于交易对最小下单量的下单
-- LIVE_TRADE=0 为模拟（不实际下单）
+- 动态仓位：使用 RISK_RATIO * 可用 USDT（默认 15%）
+- 跳过小于交易所最小下单量的下单
+- LIVE_TRADE 支持 env 写 "1" 或 "true"
 """
 
 import os
@@ -22,10 +23,17 @@ from datetime import datetime, timezone, timedelta
 import ta
 
 # ================== 配置（ENV） ==================
+# SYMBOLS env 例子: SYMBOLS=BTC/USDT,ETH/USDT,LTC/USDT,DOGE/USDT,BNB/USDT
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,LTC/USDT,DOGE/USDT,BNB/USDT").split(",") if s.strip()]
-BASE_USDT = float(os.getenv("BASE_USDT", "20"))         # 每次单个币名义资金（建议小于账户总余额）
+
+# 资金与仓位
+BASE_USDT = float(os.getenv("BASE_USDT", "20"))         # 备选：每次单个币名义资金（若不使用 RISK_RATIO）
+RISK_RATIO = float(os.getenv("RISK_RATIO", os.getenv("RISK_RATIO", "0.15")))  # 每次用可用 USDT 的比例，默认 15%
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-LIVE_TRADE = os.getenv("LIVE_TRADE", "0") == "1"
+
+# 运行与策略参数
+# 支持 LIVE_TRADE=1 或 LIVE_TRADE=True 两种写法
+LIVE_TRADE = os.getenv("LIVE_TRADE", "0").lower() in ("1", "true", "yes")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
@@ -34,17 +42,20 @@ OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "200"))
 SUMMARY_INTERVAL = int(os.getenv("SUMMARY_INTERVAL", "3600"))  # 每币种多久汇总推送一次（秒）
 MARGIN_COOLDOWN = int(os.getenv("MARGIN_COOLDOWN", "3600"))    # 保证金不足冷却时间（秒）
 
+# Telegram & API
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
+EXCHANGE_ID = os.getenv("EXCHANGE", "binance")
+MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
 
 # ================== 交易所初始化 ==================
-exchange = ccxt.binance({
+exchange = getattr(ccxt, EXCHANGE_ID)({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "future"},
+    "options": {"defaultType": MARKET_TYPE},
 })
 
 # ================== 工具函数 ==================
@@ -81,7 +92,7 @@ def symbol_id(symbol):
         return symbol.replace("/", "")
 
 def is_hedge_mode():
-    """检测是否为 hedge 模式；若检测失败，返回 True（因为脚本是假定 hedge）"""
+    """检测是否为 hedge 模式；若检测失败，返回 True（以 hedge 为优先）"""
     try:
         info = exchange.fapiPrivate_get_positionmode()
         return bool(info.get("dualSidePosition") is True)
@@ -93,18 +104,42 @@ def ensure_leverage_and_margin(symbol):
     # 尝试设置杠杆
     try:
         if hasattr(exchange, "set_leverage"):
-            exchange.set_leverage(LEVERAGE, symbol)
+            try:
+                exchange.set_leverage(LEVERAGE, symbol)
+                print(f"✅ {symbol} 杠杆设置成功 {LEVERAGE}x")
+            except Exception as e:
+                # 有时 ccxt 的 set_leverage 接口会报错，继续尝试备用接口
+                print(f"⚠️ set_leverage 报错 {symbol}: {e}")
+                try:
+                    exchange.fapiPrivate_post_leverage({"symbol": sid, "leverage": LEVERAGE})
+                    print(f"✅ {symbol} 杠杆设置成功 (备用接口) {LEVERAGE}x")
+                except Exception as e2:
+                    print(f"⚠️ 设置杠杆失败 {symbol}: {e2}")
         else:
             exchange.fapiPrivate_post_leverage({"symbol": sid, "leverage": LEVERAGE})
+            print(f"✅ {symbol} 杠杆设置成功 (post) {LEVERAGE}x")
     except Exception as e:
         print(f"⚠️ 设置杠杆失败 {symbol}: {e}")
-    # 尝试设置保证金模式（逐仓），若失败则跳过
+
+    # 尝试设置保证金模式（逐仓），若失败则提示并继续
     try:
         if hasattr(exchange, "set_margin_mode"):
-            exchange.set_margin_mode("ISOLATED", symbol)
+            try:
+                exchange.set_margin_mode("ISOLATED", symbol)
+                print(f"✅ {symbol} 保证金模式设置成功 ISOLATED")
+            except Exception as e:
+                print(f"⚠️ set_margin_mode 报错 {symbol}: {e}")
+                # 备用调用
+                try:
+                    exchange.fapiPrivate_post_margintype({"symbol": sid, "marginType": "ISOLATED"})
+                    print(f"✅ {symbol} 保证金模式设置成功 (备用) ISOLATED")
+                except Exception as e2:
+                    print(f"⚠️ 设置保证金模式失败 {symbol}: {e2}")
         else:
             exchange.fapiPrivate_post_margintype({"symbol": sid, "marginType": "ISOLATED"})
+            print(f"✅ {symbol} 保证金模式设置成功 (post) ISOLATED")
     except Exception as e:
+        # 常见错误：已有仓位无法切换、Multi-Assets 模式不允许等，提示但不中断
         print(f"⚠️ 设置保证金模式失败 {symbol}: {e}")
 
 # ================== OHLCV 与指标 ==================
@@ -225,26 +260,50 @@ def get_position(symbol):
             return {"symbol": symbol, "qty": qty, "side": side, "entry": entry, "raw": p}
     return None
 
-# ================== 数量/金额计算 ==================
-def amount_from_usdt(symbol, price, usdt_amount):
-    if price <= 0:
-        return 0
-    base_qty = usdt_amount / price
-    # 取市场精度限制
+# ================== 数量/金额计算（改为支持 RISK_RATIO） ==================
+def amount_from_usdt(symbol, price, usdt_amount=None):
+    """
+    计算合约数量：
+    - 如果 usdt_amount 为 None，则使用 RISK_RATIO * 可用 USDT 余额（优先）
+    - 否则使用提供的 usdt_amount（等价于 BASE_USDT）
+    """
     try:
-        precision = exchange.markets.get(symbol, {}).get("precision", {}).get("amount")
-        if precision is not None:
-            qty = round(base_qty, precision)
+        if price <= 0:
+            return 0
+        # 优先使用 RISK_RATIO 基于账户可用余额
+        if usdt_amount is None:
+            # 读取账户可用 USDT (free)
+            try:
+                bal = exchange.fetch_balance()
+                usdt_free = float(bal.get("free", {}).get("USDT", bal.get("total", {}).get("USDT", 0) or 0))
+            except Exception:
+                usdt_free = BASE_USDT
+            use_usdt = usdt_free * RISK_RATIO
         else:
-            qty = round(base_qty, 6)
-        # 再用交易所精度函数
+            use_usdt = usdt_amount
+
+        # 名义资金乘以杠杆 -> 实际合约名义
+        nominal = use_usdt * LEVERAGE
+        base_qty = nominal / price
+
+        # 取市场精度限制
         try:
-            qty = float(exchange.amount_to_precision(symbol, qty))
+            precision = exchange.markets.get(symbol, {}).get("precision", {}).get("amount")
+            if precision is not None:
+                qty = round(base_qty, precision)
+            else:
+                qty = round(base_qty, 6)
+            # 再用交易所精度函数
+            try:
+                qty = float(exchange.amount_to_precision(symbol, qty))
+            except Exception:
+                pass
+            return qty
         except Exception:
-            pass
-        return qty
-    except Exception:
-        return round(base_qty, 6)
+            return round(base_qty, 6)
+    except Exception as e:
+        print(f"⚠️ amount_from_usdt 错误 {symbol}: {e}")
+        return 0
 
 def get_min_amount(symbol):
     try:
@@ -257,7 +316,15 @@ def place_market_with_positionSide(symbol, side, qty):
     if qty <= 0:
         return False, "qty_zero"
     pos_side = "LONG" if side == "buy" else "SHORT"
-    params = {"positionSide": pos_side}
+    params = {}
+    # 优先检测账户是否为 hedge；若是 hedge 则传 positionSide，否则不传
+    hedge = is_hedge_mode()
+    if hedge:
+        params["positionSide"] = pos_side
+    else:
+        # 单向模式：告知但不传 positionSide（避免 -4061）
+        print(f"⚠️ {symbol} 账户是单向模式；已自动不传 positionSide。如仍报错请在币安合约设置里确认模式。")
+
     # 最小下单量校验
     min_amount = get_min_amount(symbol)
     if min_amount and qty < min_amount:
@@ -266,7 +333,7 @@ def place_market_with_positionSide(symbol, side, qty):
         return False, msg
     try:
         if not LIVE_TRADE:
-            print(f"💡 模拟下单 {symbol} {side} qty={qty} positionSide={pos_side}")
+            print(f"💡 模拟下单 {symbol} {side} qty={qty} positionSide={params.get('positionSide')}")
             return True, None
         order = exchange.create_order(symbol, "market", side, qty, None, params)
         return True, order
@@ -279,11 +346,14 @@ def close_position_market_with_positionSide(symbol, position):
         return True
     pos_side = position.get("side", "").lower()
     action = "buy" if pos_side == "short" else "sell"
-    params = {"positionSide": "SHORT" if pos_side == "short" else "LONG"}
-    qty = position["qty"]
+    params = {}
+    hedge = is_hedge_mode()
+    if hedge:
+        params["positionSide"] = "SHORT" if pos_side == "short" else "LONG"
     try:
+        qty = position["qty"]
         if not LIVE_TRADE:
-            print(f"💡 模拟平仓 {symbol} {pos_side} qty={qty} positionSide={params['positionSide']}")
+            print(f"💡 模拟平仓 {symbol} {pos_side} qty={qty} positionSide={params.get('positionSide')}")
             return True
         order = exchange.create_order(symbol, "market", action, qty, None, params)
         send_telegram(f"✅ 已市价平仓 {symbol} {pos_side} 数量={qty}")
@@ -292,8 +362,13 @@ def close_position_market_with_positionSide(symbol, position):
         send_telegram(f"❌ 平仓失败 {symbol}：{e}")
         return False
 
-# ================== 挂 TP/SL（条件市价） ==================
+# ================== 挂 TP/SL（条件市价） + 支持部分止盈 ==================
 def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
+    """
+    side 是开仓方向 'buy' 或 'sell'（用于确定 close_side）
+    qty: 剩余/部分数量（按合约单位）
+    tp_price/sl_price: 触发价（市价触发）
+    """
     pos_side = "LONG" if side == "buy" else "SHORT"
     close_side = "sell" if side == "buy" else "buy"
     results = []
@@ -320,13 +395,14 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
     return results
 
 # ================== 状态缓存 ==================
-last_summary_time = {}
-last_executed_signal = {}
-cooldown_until = {}
+last_summary_time = {}   # 每币种上次汇总时间 (datetime)
+last_executed_signal = {}  # 每币种上次已执行方向 'buy'/'sell'/None
+cooldown_until = {}        # 每币种冷却到期 (datetime)
 
 # ================== 主循环 ==================
 def main_loop():
     load_markets_safe()
+    # 尝试设置杠杆与保证金模式（容错）
     for s in SYMBOLS:
         ensure_leverage_and_margin(s)
 
@@ -347,7 +423,7 @@ def main_loop():
                 price = status.get("1h", {}).get("last_close") or 0.0
                 atr = status.get("1h", {}).get("atr") or None
 
-                # 每小时汇总推送
+                # 每小时汇总推送（每币种）
                 last_sum = last_summary_time.get(symbol)
                 if last_sum is None or (now - last_sum).total_seconds() >= SUMMARY_INTERVAL:
                     pr = f"{price:.2f}" if price else "0"
@@ -355,11 +431,13 @@ def main_loop():
                     send_telegram(f"{now_str()} {symbol} 信号:{signal or '无'} 原因:{reason_str} 价格:{pr}")
                     last_summary_time[symbol] = now
 
-                # 触发条件：信号为 buy/sell，且和上一次执行不同
+                # 仅在信号发生改变时尝试执行（防刷屏/防重复下单）
                 prev = last_executed_signal.get(symbol)
                 if signal not in ("buy", "sell"):
                     continue
+
                 if signal == prev:
+                    # same signal already executed -> skip
                     continue
 
                 # 获取当前仓位
@@ -369,8 +447,13 @@ def main_loop():
                 if price <= 0 or math.isnan(price):
                     continue
 
-                # 计算下单数量并校验最小数量
-                qty = amount_from_usdt(symbol, price, BASE_USDT)
+                # 计算下单数量（优先基于账户余额 RISK_RATIO；若想用固定 BASE_USDT 可传 usdt_amount=BASE_USDT）
+                try:
+                    qty = amount_from_usdt(symbol, price, usdt_amount=None)  # None -> 使用 RISK_RATIO
+                except Exception as e:
+                    print("⚠️ 计算 qty 失败:", e)
+                    qty = 0
+
                 min_amount = get_min_amount(symbol)
                 if min_amount and qty < min_amount:
                     msg = f"{symbol} 计算下单量 {qty} 小于最小单量 {min_amount}，跳过此次开仓"
@@ -384,19 +467,20 @@ def main_loop():
                     ok = close_position_market_with_positionSide(symbol, pos)
                     if not ok:
                         continue
+                    # 睡一小会儿让位置更新
                     time.sleep(1)
 
-                # 再次检查是否已有同向仓
+                # 再次确认是否已有同向仓（可能平仓后已无仓）
                 pos2 = get_position(symbol)
                 has_same = pos2 and ((signal == "buy" and pos2["side"] == "long") or (signal == "sell" and pos2["side"] == "short"))
                 if has_same:
                     last_executed_signal[symbol] = signal
                     continue
 
-                # 下市价开仓（带 positionSide）
+                # 下市价开仓（Hedge Mode 下带 positionSide）
                 ok, err = place_market_with_positionSide(symbol, signal, qty)
                 if ok:
-                    # 成功后挂 TP/SL
+                    # 下单成功后挂 TP/SL（条件单），并支持 PARTIAL_TP_RATIO
                     if atr is None or np.isnan(atr):
                         atr = price * 0.005
                     if signal == "buy":
@@ -406,15 +490,17 @@ def main_loop():
                         tp_price = price - TP_ATR_MULT * atr
                         sl_price = price + SL_ATR_MULT * atr
 
-                    # 支持部分 TP
-                    if PARTIAL_TP_RATIO > 0 and 0 < PARTIAL_TP_RATIO < 1:
+                    # 若 PARTIAL_TP_RATIO>0 则先挂一笔部分 TP，再挂剩余 TP/SL
+                    if PARTIAL_TP_RATIO > 0 and PARTIAL_TP_RATIO < 1:
                         qty_first = round(qty * PARTIAL_TP_RATIO, 6)
                         qty_rest = round(qty - qty_first, 6)
                         if qty_first > 0:
+                            # 部分 TP: 用市价触发TAKE_PROFIT_MARKET/ LIMIT（这里用 TAKE_PROFIT_MARKET）
                             place_tp_sl_orders(symbol, signal, qty_first, tp_price, sl_price)
                         if qty_rest > 0:
                             place_tp_sl_orders(symbol, signal, qty_rest, tp_price, sl_price)
                     else:
+                        # 全仓 TP/SL
                         place_tp_sl_orders(symbol, signal, qty, tp_price, sl_price)
 
                     send_telegram(f"✅ {symbol} 开仓 {signal} qty={qty} @ {price:.2f} TP≈{tp_price:.2f} SL≈{sl_price:.2f}")
@@ -428,12 +514,6 @@ def main_loop():
                         send_telegram(f"⏸ {symbol} 因保证金不足进入冷却到 {cooldown_until[symbol].strftime('%Y-%m-%d %H:%M:%S UTC')}")
                     if "-4061" in errstr:
                         send_telegram(f"⚠️ {symbol} 报 -4061 (position side mismatch)，请确认账户为 Hedge Mode 并且 API 权限完整")
-            # for end
-            time.sleep(POLL_INTERVAL)
+            # main for end
 
-        except Exception as e:
-            print("⚠️ 主循环异常:", e)
-            time.sleep(POLL_INTERVAL)
-
-if __name__ == "__main__":
-    main_loop()
+ 
