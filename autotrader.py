@@ -183,6 +183,7 @@ def check_multi_tf(symbol):
 # ================== 仓位管理 ==================
 def parse_position_entry(pos):
     try:
+        if pos is None: return None
         sym = pos.get("symbol") or (pos.get("info") or {}).get("symbol")
         amt = float(pos.get("positionAmt") or pos.get("contracts") or pos.get("amount") or 0)
         if amt == 0: return None
@@ -218,8 +219,6 @@ def amount_from_usdt(symbol, price, usdt_amount=None):
         else: use_usdt = usdt_amount
         nominal = use_usdt * LEVERAGE
         qty = nominal / price
-        precision = exchange.markets.get(symbol, {}).get("precision", {}).get("amount")
-        qty = round(qty, precision if precision is not None else 6)
         try: qty = float(exchange.amount_to_precision(symbol, qty))
         except: pass
         return qty
@@ -276,9 +275,11 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
     close_side = "sell" if side=="buy" else "buy"
     results=[]
     try:
+        # 分批止盈
+        tp_qty = qty * PARTIAL_TP_RATIO if PARTIAL_TP_RATIO > 0 else qty
         params_tp={"positionSide": pos_side, "stopPrice": tp_price}
-        if LIVE_TRADE: exchange.create_order(symbol,"TAKE_PROFIT_MARKET",close_side,qty,None,params_tp)
-        else: print(f"💡 模拟挂 TP {symbol} qty={qty} tp={tp_price} positionSide={pos_side}")
+        if LIVE_TRADE: exchange.create_order(symbol,"TAKE_PROFIT_MARKET",close_side,tp_qty,None,params_tp)
+        else: print(f"💡 模拟挂 TP {symbol} qty={tp_qty} tp={tp_price} positionSide={pos_side}")
         results.append(("tp", True))
     except Exception as e: results.append(("tp", str(e)))
     try:
@@ -370,23 +371,23 @@ def main_loop():
                             cooldown_until[symbol] = now + timedelta(seconds=MARGIN_COOLDOWN)
                             send_telegram(f"⏸ {symbol} 保证金不足冷却至 {cooldown_until[symbol]}")
 
-            # 每小时全局汇总
-                summary_key = "global_summary"
-                last_summary = last_summary_time.get(summary_key, datetime.min)
-                if (now - last_summary).total_seconds() >= SUMMARY_INTERVAL:
-                    msgs = []
-                    for symbol in SYMBOLS:
-                        info = all_status.get(symbol, {})
-                        sig = info.get("signal") or "无信号"
-                        reasons = info.get("reasons") or []
-                        status = info.get("status") or {}
-                        last_close = status.get("1h", {}).get("last_close") or 0
-                        atr = status.get("1h", {}).get("atr") or 0
-                        msg_line = f"{symbol}: 信号={sig}, 价格≈{last_close:.2f}, ATR≈{atr:.2f}, 原因={'|'.join(reasons)}"
-                        msgs.append(msg_line)
-                    full_msg = "📊 每小时汇总:\n" + "\n".join(msgs)
-                    send_telegram(full_msg)
-                    last_summary_time[summary_key] = now
+            # 每小时全局汇总（循环外，避免重复发送）
+            summary_key = "global_summary"
+            last_summary = last_summary_time.get(summary_key, datetime.min)
+            if (now - last_summary).total_seconds() >= SUMMARY_INTERVAL:
+                msgs = []
+                for symbol in SYMBOLS:
+                    info = all_status.get(symbol, {})
+                    sig = info.get("signal") or "无信号"
+                    reasons = info.get("reasons") or []
+                    status = info.get("status") or {}
+                    last_close = status.get("1h", {}).get("last_close") or 0
+                    atr = status.get("1h", {}).get("atr") or 0
+                    msg_line = f"{symbol}: 信号={sig}, 价格={last_close:.2f}, ATR={atr:.2f}, 理由={'|'.join(reasons)}"
+                    msgs.append(msg_line)
+                summary_text = "🕐 每小时汇总:\n" + "\n".join(msgs)
+                send_telegram(summary_text)
+                last_summary_time[summary_key] = now
 
             time.sleep(POLL_INTERVAL)
 
@@ -394,6 +395,5 @@ def main_loop():
             print(f"❌ 主循环异常: {e}")
             time.sleep(5)
 
-# ================== 启动 ==================
 if __name__ == "__main__":
     main_loop()
