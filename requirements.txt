@@ -7,3 +7,7 @@ requests>=2.31.0
 certifi>=2024.2.2
 python-telegram-bot==13.15
 openai==0.28.1
+tqdm>=4.66.1
+optuna>=3.6.1
+backtesting>=0.3.3
+plotly>=5.21.0
