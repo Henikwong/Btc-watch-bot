@@ -22,4 +22,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 
 # 启动程序
-CMD ["python", "autotrader.py"]
+CMD ["python", "test_gpt_to_telegram.py"]
