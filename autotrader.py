@@ -44,7 +44,6 @@ MARGIN_COOLDOWN = int(os.getenv("MARGIN_COOLDOWN", "3600"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# 修正：将 API_KEY 和 API_SECRET 变量名统一为 BIANANCE_API_KEY 和 BIANANCE_API_SECRET
 BIANANCE_API_KEY = os.getenv("BIANANCE_API_KEY")
 BIANANCE_API_SECRET = os.getenv("BIANANCE_API_SECRET")
 EXCHANGE_ID = os.getenv("EXCHANGE", "binance")
@@ -407,7 +406,7 @@ def main_loop():
                             send_telegram(f"⏸ {symbol} 保证金不足冷却至 {cooldown_until[symbol]}")
 
             summary_key = "global_summary"
-            last_summary = last_summary_time.get(summary_key, datetime.min)
+            last_summary = last_summary_time.get(summary_key, datetime.min.replace(tzinfo=timezone.utc))
             if (now - last_summary).total_seconds() >= SUMMARY_INTERVAL:
                 msgs = []
                 for symbol in SYMBOLS:
