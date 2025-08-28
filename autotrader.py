@@ -44,10 +44,16 @@ MARGIN_COOLDOWN = int(os.getenv("MARGIN_COOLDOWN", "3600"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BIANANCE_API_KEY = os.getenv("API_KEY")
-BIANANCE_API_SECRET = os.getenv("BIANANCE_API_SECRET") # 修复环境变量名
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("BIANANCE_API_SECRET")
 EXCHANGE_ID = os.getenv("EXCHANGE", "binance")
 MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
+
+# 检查关键环境变量是否已设置
+if not API_KEY or not API_SECRET:
+    logging.error("❌ 致命错误：API_KEY 或 API_SECRET 未配置。请在环境中设置这两个变量。")
+    # 如果在非Railway环境运行，直接退出，避免后续错误
+    exit(1)
 
 # CCXT 实例
 exchange = getattr(ccxt, EXCHANGE_ID)({
@@ -63,7 +69,7 @@ def now_str():
 
 def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("⚠️ Telegram 未配置，消息打印:", msg)
+        logging.warning("⚠️ Telegram 未配置，消息打印: %s", msg)
         return
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -99,7 +105,6 @@ def is_hedge_mode():
     if HEDGE_MODE_CACHE is not None:
         return HEDGE_MODE_CACHE
     
-    # 针对 Binance 交易所的特定实现
     if EXCHANGE_ID == 'binance':
         try:
             info = exchange.fapiPrivate_get_positionmode()
@@ -108,20 +113,16 @@ def is_hedge_mode():
             logging.warning("⚠️ Binance 对冲模式检测失败，默认为单向模式。")
             HEDGE_MODE_CACHE = False
     else:
-        # 对于其他交易所，目前假设为单向模式
         logging.info("ℹ️ 交易所 %s 的对冲模式检测暂未实现，默认为单向模式。", EXCHANGE_ID)
         HEDGE_MODE_CACHE = False
 
     return HEDGE_MODE_CACHE
 
 def _try_set_param(method, symbol, params, action_name):
-    """一个通用的辅助函数，用于尝试设置杠杆或保证金模式。"""
     try:
-        # 优先使用 CCXT 通用方法
         if hasattr(exchange, method):
             getattr(exchange, method)(**params)
         else:
-            # 备选的交易所私有方法 (适用于 Binance)
             if EXCHANGE_ID == 'binance':
                 if action_name == '杠杆':
                     exchange.fapiPrivate_post_leverage({"symbol": symbol_id(symbol), "leverage": LEVERAGE})
@@ -136,16 +137,13 @@ def _try_set_param(method, symbol, params, action_name):
     return True
 
 def ensure_leverage_and_margin(symbol):
-    # 设置杠杆
     leverage_params = {"leverage": LEVERAGE, "symbol": symbol}
     _try_set_param("set_leverage", symbol, leverage_params, "杠杆")
     
-    # 设置保证金模式
     margin_params = {"marginMode": "ISOLATED", "symbol": symbol}
     _try_set_param("set_margin_mode", symbol, margin_params, "保证金模式")
 
 # ================== OHLCV / 指标 ==================
-# 这部分代码保持不变，因为它与回测脚本共享
 def fetch_ohlcv_df(symbol, timeframe="1h", limit=OHLCV_LIMIT):
     for _ in range(3):
         try:
@@ -205,7 +203,6 @@ def check_multi_tf(symbol):
     return multi_signal, reasons_all, status
 
 # ================== 仓位管理 ==================
-# 这部分代码保持不变，但加入了日志
 def parse_position_entry(pos):
     try:
         if pos is None: return None
@@ -317,7 +314,6 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
     pos_side = "LONG" if side=="buy" else "SHORT"
     close_side = "sell" if side=="buy" else "buy"
     
-    # 挂 TP
     tp_qty = qty * PARTIAL_TP_RATIO if PARTIAL_TP_RATIO > 0 else qty
     tp_params = {"positionSide": pos_side, "stopPrice": tp_price}
     try:
@@ -328,7 +324,6 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
     except ccxt.ExchangeError as e:
         logging.error("❌ 挂 TP 失败 %s: %s", symbol, e)
     
-    # 挂 SL
     sl_params = {"positionSide": pos_side, "stopPrice": sl_price}
     try:
         if LIVE_TRADE:
@@ -381,7 +376,7 @@ def main_loop():
                     if need_close_and_reverse:
                         if not close_position_market_with_positionSide(symbol, pos):
                             continue
-                        time.sleep(1) # 简单等待，确保订单状态更新
+                        time.sleep(1)
 
                     pos2 = get_position(symbol)
                     has_same = pos2 and ((signal=="buy" and pos2["side"]=="long") or (signal=="sell" and pos2["side"]=="short"))
@@ -436,14 +431,5 @@ def main_loop():
             time.sleep(5)
 
 if __name__ == "__main__":
-    # 修复环境变量名，因为env.example中是BIANANCE_API_SECRET
-    # 这会导致API_SECRET加载失败
-    if API_SECRET is None:
-        API_SECRET = os.getenv("BIANANCE_API_SECRET")
-    
-    if not API_KEY or not API_SECRET:
-        logging.error("API_KEY 或 API_SECRET 未配置。")
-        exit()
-
     main_loop()
 
