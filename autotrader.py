@@ -44,8 +44,8 @@ MARGIN_COOLDOWN = int(os.getenv("MARGIN_COOLDOWN", "3600"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("BIANANCE_API_SECRET") # 修复环境变量名
+BIANANCE_API_KEY = os.getenv("API_KEY")
+BIANANCE_API_SECRET = os.getenv("BIANANCE_API_SECRET") # 修复环境变量名
 EXCHANGE_ID = os.getenv("EXCHANGE", "binance")
 MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
 
