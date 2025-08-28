@@ -1,11 +1,24 @@
+import os
 import requests
 
-TOKEN = "你的BOT_TOKEN"
-CHAT_ID = "你的CHAT_ID"
+# 从环境变量读取
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-msg = "测试消息，检查BOT是否可用"
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("请检查 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID 是否正确设置")
 
-url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-res = requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+# 测试发送消息
+message = "✅ Bot 已启动并测试成功！"
+url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+payload = {
+    "chat_id": CHAT_ID,
+    "text": message
+}
 
-print(res.status_code, res.json())
+response = requests.post(url, data=payload)
+
+if response.status_code == 200:
+    print("消息发送成功！")
+else:
+    print(f"发送失败: {response.status_code} {response.text}")
