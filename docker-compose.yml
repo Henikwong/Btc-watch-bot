@@ -9,4 +9,4 @@ services:
       - .env
     volumes:
       - ./logs:/app/logs
-    command: python test_gpt_to_telegram.py
+    command: python autotrader.py
