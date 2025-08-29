@@ -322,7 +322,7 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
         else:
             logging.info("💡 模拟挂 TP %s qty=%s tp=%s positionSide=%s", symbol, tp_qty, tp_price, pos_side)
     except ccxt.ExchangeError as e:
-        logging.error("❌ 挂 TP 失败 %s: %s", symbol, e)
+        logging.error("❌ 挂 TP 失败 %s: %s", e)
     
     sl_params = {"positionSide": pos_side, "stopPrice": sl_price}
     try:
@@ -331,7 +331,7 @@ def place_tp_sl_orders(symbol, side, qty, tp_price, sl_price):
         else:
             logging.info("💡 模拟挂 SL %s qty=%s sl=%s positionSide=%s", symbol, qty, sl_price, pos_side)
     except ccxt.ExchangeError as e:
-        logging.error("❌ 挂 SL 失败 %s: %s", symbol, e)
+        logging.error("❌ 挂 SL 失败 %s: %s", e)
 
 # ================== 状态缓存 ==================
 last_summary_time = {}
@@ -432,6 +432,4 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
-
-main_loop()
 
