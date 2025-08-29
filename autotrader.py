@@ -132,9 +132,7 @@ class BacktestAccount:
 
 # ================== 工具函数 ==================
 def get_historical_data(symbol, timeframe="1h", limit=1000):
-    # --- 修复部分：直接使用全局的 'exchange' 对象 ---
-    # 这样可以确保使用已认证的实例，避免连接和访问权限问题。
-    if exchange is None: # 为回测模式提供一个未经认证的实例
+    if exchange is None:
         ex = ccxt.binance()
     else:
         ex = exchange
@@ -170,64 +168,35 @@ def live_place_order(symbol, side, qty, price, atr):
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
 
-# ================== 回测 ==================
-def run_backtest():
-    print("🤖 启动回测...")
-    for symbol in SYMBOLS:
-        print(f"\n=== {symbol} 回测 ===")
-        df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=1000))
-        df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=1000))
-        account = BacktestAccount(INITIAL_BALANCE)
-
-        for i in range(len(df_1h)):
-            cur_1h = df_1h.iloc[: i + 1]
-            if len(cur_1h) < 50: continue
-            price = cur_1h["close"].iloc[-1]
-            atr = cur_1h["atr"].iloc[-1]
-            ts = cur_1h.index[-1]
-            cur_4h = df_4h[df_4h.index <= ts]
-            if cur_4h.empty: continue
-
-            if account.position:
-                tp_sl_price, reason = account.check_tp_sl(cur_1h["high"].iloc[-1], cur_1h["low"].iloc[-1])
-                if tp_sl_price:
-                    account.close_position(tp_sl_price, ts, reason)
-                    continue
-
-            signal = signal_from_indicators(cur_1h, cur_4h)
-            if signal in ["buy", "sell"]:
-                if account.position and account.position["side"] != signal:
-                    account.close_position(price, ts, "Reverse")
-                if not account.position:
-                    qty = calculate_position_size(account.balance, price)
-                    account.place_order(signal, qty, price, atr, ts)
-
-        if account.position:
-            last_price = df_1h["close"].iloc[-1]
-            account.close_position(last_price, df_1h.index[-1], "Final")
-
-        print(f"初始资金: {INITIAL_BALANCE:.2f}, 最终资金: {account.balance:.2f}")
-
 # ================== 实盘 ==================
 def run_live():
     print("🚀 启动实盘交易...")
     while True:
         for symbol in SYMBOLS:
             try:
-                # 修复后，这里会调用一个正确使用全局 exchange 对象的函数
                 df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=200))
                 df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=200))
                 
-                # 确保获取到足够的数据进行分析
                 if df_1h.empty or df_4h.empty:
                     print(f"警告：无法获取 {symbol} 的足够历史数据，跳过此交易对。")
                     continue
 
                 signal = signal_from_indicators(df_1h, df_4h)
                 price = df_1h["close"].iloc[-1]
-                atr = df_1h["atr"].iloc[-1]
+                
+                market = exchange.market(symbol)
+                min_amount = market['limits']['amount']['min']
+                
                 qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
                 qty = float(exchange.amount_to_precision(symbol, qty))
+
+                # 在下单前检查数量是否满足要求
+                if qty < min_amount:
+                    print(f"❌ 下单失败 {symbol}: 计算出的数量 {qty} 小于最小交易量 {min_amount}。")
+                    continue
+                
+                # 获取ATR值，用于止盈止损计算
+                atr = df_1h["atr"].iloc[-1]
 
                 if signal in ["buy", "sell"] and qty > 0:
                     live_place_order(symbol, signal, qty, price, atr)
