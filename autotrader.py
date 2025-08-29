@@ -1,138 +1,150 @@
 import os
-import math
 import time
+import math
 import ccxt
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 from datetime import datetime, timezone, timedelta
+import ta
+import logging
 
-# ============= 配置 =============
-SYMBOL = "BTC/USDT"
-TIMEFRAME = "1h"
-LEVERAGE = 10
-RISK_RATIO = 0.15
-TP_ATR_MULT = 3.0
-SL_ATR_MULT = 2.0
-COOLDOWN = 60  # 信号冷却时间秒
-SUMMARY_INTERVAL = 1800  # 每 30 分钟汇总一次
-
-# 从环境变量读取资金基数
-BASE_USDT = float(os.getenv("BASE_USDT", "20"))
-
-# Telegram 配置
+# ================== 配置 ==================
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Binance
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+BASE_USDT = float(os.getenv("BASE_USDT", "20"))  # 默认 20 USDT，可环境变量配置
+RISK_RATIO = float(os.getenv("RISK_RATIO", "0.15"))
 
-LIVE_TRADE = os.getenv("LIVE_TRADE", "false").lower() == "true"
+TP_ATR_MULT = 3.0
+SL_ATR_MULT = 2.0
 
-# ============= 工具函数 =============
-def telegram_send(msg):
-    """发送 Telegram 消息"""
+# ================== 初始化 ==================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+exchange = ccxt.binance({
+    "apiKey": BINANCE_API_KEY,
+    "secret": BINANCE_API_SECRET,
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"}  # 使用 USDT-M 合约
+})
+
+# ================== 工具函数 ==================
+def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram 未配置，消息未发送")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        requests.post(url, data=data, timeout=5)
     except Exception as e:
-        print(f"⚠️ Telegram 发送失败: {e}")
+        logging.error(f"Telegram 发送失败: {e}")
 
-def fetch_ohlcv(symbol, timeframe, limit=200):
+def log_and_notify(level, msg):
+    getattr(logging, level)(msg)
+    send_telegram(msg)
+
+def amount_from_usdt(symbol, usdt_amount, price):
+    """根据 USDT 金额换算下单数量"""
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        df.set_index("time", inplace=True)
-        return df
-    except Exception as e:
-        print(f"❌ 获取K线失败: {e}")
-        return pd.DataFrame()
+        qty = usdt_amount / price
+        return float(exchange.amount_to_precision(symbol, qty))
+    except Exception:
+        return 0.0
 
-def compute_indicators(df):
-    df["ema_fast"] = df["close"].ewm(span=12).mean()
-    df["ema_slow"] = df["close"].ewm(span=26).mean()
-    df["macd"] = df["ema_fast"] - df["ema_slow"]
-    df["signal"] = df["macd"].ewm(span=9).mean()
-    df["atr"] = df["high"] - df["low"]
+# ================== 策略函数 (示例) ==================
+def compute_indicators(df: pd.DataFrame):
+    df["ema_fast"] = ta.trend.ema_indicator(df["close"], 12)
+    df["ema_slow"] = ta.trend.ema_indicator(df["close"], 26)
+    df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14)
     return df
 
-def signal_from_indicators(df):
-    score = 0
+def signal_from_indicators(df: pd.DataFrame):
     if df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]:
-        score += 1
-    else:
-        score -= 1
-    if df["macd"].iloc[-1] > df["signal"].iloc[-1]:
-        score += 1
-    else:
-        score -= 1
-    if score >= 2:
-        return "buy", score
-    elif score <= -2:
-        return "sell", score
-    return None, score
+        return "buy", None, None
+    elif df["ema_fast"].iloc[-1] < df["ema_slow"].iloc[-1]:
+        return "sell", None, None
+    return None, None, None
 
-def round_step(value, step):
-    return math.floor(value / step) * step
-
-def get_symbol_info(symbol):
-    markets = exchange.load_markets()
-    market = markets[symbol]
-    lot = market["limits"]["amount"]
-    step = lot["min"]
-    return {"minQty": lot["min"], "stepSize": step}
-
-# ============= 下单逻辑 =============
+# ================== 下单逻辑 ==================
 def place_order(symbol, side, qty, price, atr):
+    """开仓并自动挂止盈止损"""
     if qty <= 0:
-        return False
-    print(f"📥 下单: {side} {qty:.6f} {symbol} @ {price}")
-    telegram_send(f"📥 下单: {side} {qty:.6f} {symbol} @ {price}")
-    return True
+        log_and_notify("error", f"❌ 下单失败 {symbol} 数量为 0")
+        return
 
-# ============= 主循环 =============
+    try:
+        # 开仓单
+        order = exchange.create_order(
+            symbol=symbol,
+            type="MARKET",
+            side=side.upper(),
+            amount=qty
+        )
+
+        # TP/SL 价格
+        if side == "buy":
+            tp_price = price + TP_ATR_MULT * atr
+            sl_price = price - SL_ATR_MULT * atr
+            pos_side = "LONG"
+        else:
+            tp_price = price - TP_ATR_MULT * atr
+            sl_price = price + SL_ATR_MULT * atr
+            pos_side = "SHORT"
+
+        # 止盈单
+        exchange.create_order(
+            symbol=symbol,
+            type="TAKE_PROFIT_MARKET",
+            side="SELL" if side == "buy" else "BUY",
+            amount=qty,
+            params={"stopPrice": tp_price, "reduceOnly": True, "positionSide": pos_side}
+        )
+
+        # 止损单
+        exchange.create_order(
+            symbol=symbol,
+            type="STOP_MARKET",
+            side="SELL" if side == "buy" else "BUY",
+            amount=qty,
+            params={"stopPrice": sl_price, "reduceOnly": True, "positionSide": pos_side}
+        )
+
+        log_and_notify("info", f"✅ 开仓 {side.upper()} {symbol} qty={qty} @ {price:.2f} | TP={tp_price:.2f} SL={sl_price:.2f}")
+
+    except Exception as e:
+        log_and_notify("error", f"❌ 下单失败 {symbol}: {e}")
+
+# ================== 主循环 ==================
 def main_loop():
-    last_signal_time = datetime.min.replace(tzinfo=timezone.utc)
-    last_summary_time = datetime.now(timezone.utc)
+    symbol = "BTC/USDT"
+    timeframe = "1h"
 
     while True:
         try:
-            df = fetch_ohlcv(SYMBOL, TIMEFRAME, limit=200)
-            if df.empty: 
-                time.sleep(10)
-                continue
+            # 获取历史数据
+            ohlcvs = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+            df = pd.DataFrame(ohlcvs, columns=["time", "open", "high", "low", "close", "volume"])
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+            df.set_index("time", inplace=True)
+
             df = compute_indicators(df)
-            signal, score = signal_from_indicators(df)
+            signal, _, _ = signal_from_indicators(df)
+
             price = df["close"].iloc[-1]
             atr = df["atr"].iloc[-1]
+            qty = amount_from_usdt(symbol, BASE_USDT * RISK_RATIO * LEVERAGE, price)
 
-            if signal:
-                now = datetime.now(timezone.utc)
-                if (now - last_signal_time).total_seconds() > COOLDOWN:
-                    balance = BASE_USDT
-                    qty = (balance * RISK_RATIO * LEVERAGE) / price
-                    info = get_symbol_info(SYMBOL)
-                    qty = round_step(qty, info["stepSize"])
-                    if qty < info["minQty"]:
-                        print(f"⚠️ {SYMBOL} 下单量 {qty} < 最小量 {info['minQty']}")
-                        continue
-                    place_order(SYMBOL, signal, qty, price, atr)
-                    last_signal_time = now
+            if signal in ["buy", "sell"]:
+                place_order(symbol, signal, qty, price, atr)
 
-            # 定期汇总
-            if (datetime.now(timezone.utc) - last_summary_time).total_seconds() > SUMMARY_INTERVAL:
-                print(f"📊 {datetime.now(timezone.utc)} | 最新价 {price:.2f} | 信号 {signal} (score={score})")
-                last_summary_time = datetime.now(timezone.utc)
-
-            time.sleep(10)
         except Exception as e:
-            print(f"❌ 主循环异常: {e}")
-            time.sleep(5)
+            log_and_notify("error", f"主循环异常: {e}")
+
+        time.sleep(60)  # 等待一分钟再跑
 
 if __name__ == "__main__":
-    exchange = ccxt.binance()
     main_loop()
