@@ -132,7 +132,13 @@ class BacktestAccount:
 
 # ================== 工具函数 ==================
 def get_historical_data(symbol, timeframe="1h", limit=1000):
-    ex = ccxt.binance()
+    # --- 修复部分：直接使用全局的 'exchange' 对象 ---
+    # 这样可以确保使用已认证的实例，避免连接和访问权限问题。
+    if exchange is None: # 为回测模式提供一个未经认证的实例
+        ex = ccxt.binance()
+    else:
+        ex = exchange
+        
     ohlcvs = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcvs, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
@@ -208,8 +214,15 @@ def run_live():
     while True:
         for symbol in SYMBOLS:
             try:
+                # 修复后，这里会调用一个正确使用全局 exchange 对象的函数
                 df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=200))
                 df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=200))
+                
+                # 确保获取到足够的数据进行分析
+                if df_1h.empty or df_4h.empty:
+                    print(f"警告：无法获取 {symbol} 的足够历史数据，跳过此交易对。")
+                    continue
+
                 signal = signal_from_indicators(df_1h, df_4h)
                 price = df_1h["close"].iloc[-1]
                 atr = df_1h["atr"].iloc[-1]
