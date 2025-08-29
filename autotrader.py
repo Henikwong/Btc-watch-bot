@@ -135,4 +135,4 @@ def main_loop():
 
 if __name__ == "__main__":
     exchange = ccxt.binance()
-    main_loop()1
+    main_loop()
