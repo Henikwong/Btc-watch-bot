@@ -188,14 +188,13 @@ def run_live():
                 min_amount = market['limits']['amount']['min']
                 
                 qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
-                qty = float(exchange.amount_to_precision(symbol, qty))
-
-                # 在下单前检查数量是否满足要求
+                
                 if qty < min_amount:
                     print(f"❌ 下单失败 {symbol}: 计算出的数量 {qty} 小于最小交易量 {min_amount}。")
                     continue
                 
-                # 获取ATR值，用于止盈止损计算
+                qty = float(exchange.amount_to_precision(symbol, qty))
+
                 atr = df_1h["atr"].iloc[-1]
 
                 if signal in ["buy", "sell"] and qty > 0:
