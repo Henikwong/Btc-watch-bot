@@ -5,7 +5,6 @@
 
 import os
 import time
-import math
 import ccxt
 import pandas as pd
 import ta
@@ -13,8 +12,11 @@ from datetime import datetime
 
 # ================== 配置 ==================
 MODE = os.getenv("MODE", "backtest")  # "backtest" / "live"
-SYMBOLS = ["ETH/USDT", "LTC/USDT", "BNB/USDT", "DOGE/USDT",
-           "XRP/USDT", "SOL/USDT", "TRX/USDT", "ADA/USDT", "LINK/USDT"]
+
+# 从 ENV 读取交易对，默认用 BTC/USDT
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+SYMBOLS = [s.strip() for s in SYMBOLS if s.strip()]
+SYMBOL = SYMBOLS[0]  # 回测只跑第一个
 
 TIMEFRAME = "1h"
 HIGHER_TIMEFRAME = "4h"
@@ -22,7 +24,7 @@ LEVERAGE = 10
 RISK_RATIO = 0.15
 TP_ATR_MULT = 3.0
 SL_ATR_MULT = 2.0
-INITIAL_BALANCE = 1000  # 回测用
+INITIAL_BALANCE = 1000  # 回测资金
 BASE_USDT = 120  # 实盘资金
 SLEEP_INTERVAL = 60  # 实盘循环等待时间
 
@@ -38,6 +40,7 @@ if MODE == "live":
         "enableRateLimit": True,
         "options": {"defaultType": "future"}
     })
+    exchange.load_markets()  # 避免 markets not loaded 错误
 
 # ================== 技术指标 ==================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -59,7 +62,6 @@ def signal_from_indicators(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
     latest_1h = df_1h.iloc[-1]
     latest_4h = df_4h.iloc[-1]
 
-    # 成交量过滤
     if latest_1h["volume"] < latest_1h["vol_ma"]:
         return "hold"
 
@@ -78,7 +80,6 @@ def signal_from_indicators(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
     else:
         signal_1h = "hold"
 
-    # 4h 趋势过滤
     trend_4h = "buy" if latest_4h["ema_fast"] > latest_4h["ema_slow"] else "sell"
 
     if signal_1h == "buy" and trend_4h == "buy":
@@ -132,11 +133,8 @@ class BacktestAccount:
 
 # ================== 工具函数 ==================
 def get_historical_data(symbol, timeframe="1h", limit=1000):
-    if exchange is None:
-        ex = ccxt.binance()
-    else:
-        ex = exchange
-        
+    ex = exchange if exchange else ccxt.binance()
+    ex.load_markets()
     ohlcvs = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcvs, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms")
@@ -176,25 +174,21 @@ def run_live():
             try:
                 df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=200))
                 df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=200))
-                
                 if df_1h.empty or df_4h.empty:
-                    print(f"警告：无法获取 {symbol} 的足够历史数据，跳过此交易对。")
+                    print(f"⚠️ 无法获取 {symbol} 的足够历史数据，跳过。")
                     continue
 
                 signal = signal_from_indicators(df_1h, df_4h)
                 price = df_1h["close"].iloc[-1]
-                
                 market = exchange.market(symbol)
                 min_amount = market['limits']['amount']['min']
-                
-                qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
-                
-                if qty < min_amount:
-                    print(f"❌ 下单失败 {symbol}: 计算出的数量 {qty} 小于最小交易量 {min_amount}。")
-                    continue
-                
-                qty = float(exchange.amount_to_precision(symbol, qty))
 
+                qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
+                if qty < min_amount:
+                    print(f"❌ 下单失败 {symbol}: 数量 {qty} < 最小交易量 {min_amount}")
+                    continue
+
+                qty = float(exchange.amount_to_precision(symbol, qty))
                 atr = df_1h["atr"].iloc[-1]
 
                 if signal in ["buy", "sell"] and qty > 0:
@@ -204,6 +198,63 @@ def run_live():
                 print(f"主循环异常 {symbol}: {e}")
 
         time.sleep(SLEEP_INTERVAL)
+
+# ================== 回测 ==================
+def run_backtest():
+    print("🤖 启动多周期回测...")
+    df_1h = compute_indicators(get_historical_data(SYMBOL, TIMEFRAME, limit=1000))
+    df_4h = compute_indicators(get_historical_data(SYMBOL, HIGHER_TIMEFRAME, limit=1000))
+    account = BacktestAccount(INITIAL_BALANCE)
+
+    for i in range(len(df_1h)):
+        current_df_1h = df_1h.iloc[: i + 1]
+        if len(current_df_1h) < 50:
+            continue
+        price = current_df_1h["close"].iloc[-1]
+        atr = current_df_1h["atr"].iloc[-1]
+        timestamp = current_df_1h.index[-1]
+        current_df_4h = df_4h[df_4h.index <= timestamp]
+        if current_df_4h.empty:
+            continue
+
+        if account.position:
+            tp_sl_price, reason = account.check_tp_sl(
+                current_df_1h["high"].iloc[-1], current_df_1h["low"].iloc[-1]
+            )
+            if tp_sl_price:
+                account.close_position(tp_sl_price, timestamp, reason)
+                continue
+
+        signal = signal_from_indicators(current_df_1h, current_df_4h)
+        if signal == "buy":
+            if not account.position or account.position["side"] == "short":
+                if account.position:
+                    account.close_position(price, timestamp, "Reverse")
+                qty = calculate_position_size(account.balance, price)
+                account.place_order("buy", qty, price, atr, timestamp)
+        elif signal == "sell":
+            if not account.position or account.position["side"] == "long":
+                if account.position:
+                    account.close_position(price, timestamp, "Reverse")
+                qty = calculate_position_size(account.balance, price)
+                account.place_order("sell", qty, price, atr, timestamp)
+
+    if account.position:
+        last_price = df_1h["close"].iloc[-1]
+        last_time = df_1h.index[-1]
+        account.close_position(last_price, last_time, "Final")
+
+    trade_df = pd.DataFrame(account.trade_history)
+    print("\n--- 回测结果 ---")
+    print(f"初始资金: {INITIAL_BALANCE:.2f}")
+    print(f"最终资金: {account.balance:.2f}")
+    closes = trade_df[trade_df["type"] == "Close"]
+    if not closes.empty:
+        total_trades = len(closes)
+        win_trades = (closes["pnl"] > 0).sum()
+        win_rate = win_trades / total_trades * 100
+        print(f"交易次数: {total_trades}, 胜率: {win_rate:.2f}%")
+        print(f"总盈亏: {closes['pnl'].sum():.2f}")
 
 # ================== 主入口 ==================
 if __name__ == "__main__":
