@@ -45,13 +45,14 @@ if MODE == "live":
 
     # 设置双向/单向持仓模式
     try:
+        # 修复后的正确 API 调用方法
         if HEDGE_MODE:
-            # 正确的 API 调用方法
-            exchange.private_post_fapi_v1_positionside_dual({"dualSidePosition": "true"})
+            params = {'dualSidePosition': 'true'}
+            exchange.fapiPrivate_post_positionside_dual(params)
             print("✅ 已切换为双向持仓模式 (HEDGE_MODE)")
         else:
-            # 正确的 API 调用方法
-            exchange.private_post_fapi_v1_positionside_dual({"dualSidePosition": "false"})
+            params = {'dualSidePosition': 'false'}
+            exchange.fapiPrivate_post_positionside_dual(params)
             print("ℹ️ 使用单向持仓模式")
     except Exception as e:
         print(f"⚠️ 持仓模式设置失败: {e}")
