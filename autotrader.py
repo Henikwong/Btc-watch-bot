@@ -12,6 +12,7 @@ from datetime import datetime
 
 # ================== 配置 ==================
 MODE = os.getenv("MODE", "backtest")  # "backtest" / "live"
+HEDGE_MODE = os.getenv("HEDGE_MODE", "false").lower() == "true"  # 是否开启双向持仓
 
 # 从 ENV 读取交易对，默认用 BTC/USDT
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
@@ -41,6 +42,17 @@ if MODE == "live":
         "options": {"defaultType": "future"}
     })
     exchange.load_markets()  # 避免 markets not loaded 错误
+
+    # 设置双向/单向持仓模式
+    try:
+        if HEDGE_MODE:
+            exchange.fapiPrivate_post_positionside_dual({"dualSidePosition": "true"})
+            print("✅ 已切换为双向持仓模式 (HEDGE_MODE)")
+        else:
+            exchange.fapiPrivate_post_positionside_dual({"dualSidePosition": "false"})
+            print("ℹ️ 使用单向持仓模式")
+    except Exception as e:
+        print(f"⚠️ 持仓模式设置失败: {e}")
 
 # ================== 技术指标 ==================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
