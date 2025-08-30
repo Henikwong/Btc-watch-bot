@@ -13,7 +13,7 @@ from datetime import datetime
 
 # ================== 配置 ==================
 MODE = os.getenv("MODE", "backtest")  # "backtest" / "live"
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "LTC/USDT", "BNB/USDT", "DOGE/USDT",
+SYMBOLS = ["ETH/USDT", "LTC/USDT", "BNB/USDT", "DOGE/USDT",
            "XRP/USDT", "SOL/USDT", "TRX/USDT", "ADA/USDT", "LINK/USDT"]
 
 TIMEFRAME = "1h"
