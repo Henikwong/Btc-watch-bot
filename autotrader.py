@@ -43,12 +43,15 @@ if MODE == "live":
     })
     exchange.load_markets()
 
+    # 设置双向/单向持仓模式
     try:
         if HEDGE_MODE:
-            exchange.fapiPrivate_post_positionside_dual({"dualSidePosition": "true"})
+            # 正确的 API 调用方法
+            exchange.private_post_fapi_v1_positionside_dual({"dualSidePosition": "true"})
             print("✅ 已切换为双向持仓模式 (HEDGE_MODE)")
         else:
-            exchange.fapiPrivate_post_positionside_dual({"dualSidePosition": "false"})
+            # 正确的 API 调用方法
+            exchange.private_post_fapi_v1_positionside_dual({"dualSidePosition": "false"})
             print("ℹ️ 使用单向持仓模式")
     except Exception as e:
         print(f"⚠️ 持仓模式设置失败: {e}")
@@ -158,15 +161,16 @@ def live_place_order(symbol, side, qty, price, atr, params=None):
     try:
         pos_side = "LONG" if side == "buy" else "SHORT"
         order_side = side.upper()
+        
+        order_params = params or {}
+        if HEDGE_MODE:
+            order_params["positionSide"] = pos_side
 
-        if params and "reduceOnly" in params:
-            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=params)
+        if "reduceOnly" in order_params:
+            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
             print(f"✅ 平仓订单 {order_side} {symbol} qty={qty} @ {price:.2f}")
         else:
-            if HEDGE_MODE:
-                order = exchange.create_order(symbol, "MARKET", order_side, qty, params={"positionSide": pos_side})
-            else:
-                order = exchange.create_order(symbol, "MARKET", order_side, qty)
+            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
 
             if HEDGE_MODE:
                 if side == "buy":
@@ -182,7 +186,7 @@ def live_place_order(symbol, side, qty, price, atr, params=None):
                 exchange.create_order(symbol, "STOP_MARKET",
                                       "SELL" if side == "buy" else "BUY", qty,
                                       params={"stopPrice": sl_price, "reduceOnly": True, "positionSide": pos_side})
-
+            
             print(f"✅ 实盘开仓 {order_side} {symbol} qty={qty} @ {price:.2f}")
 
     except Exception as e:
@@ -194,7 +198,6 @@ def run_live():
     while True:
         for symbol in SYMBOLS:
             try:
-                # 1. 获取数据和信号
                 df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=200))
                 df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=200))
                 if df_1h.empty or df_4h.empty:
@@ -207,11 +210,9 @@ def run_live():
                 min_amount = market['limits']['amount']['min']
                 atr = df_1h["atr"].iloc[-1]
                 
-                # 2. 获取当前持仓
                 positions = exchange.fetch_positions_risk()
                 current_pos = next((p for p in positions if p['symbol'] == symbol and float(p['positionAmt']) != 0), None)
 
-                # 3. 根据信号和持仓情况执行交易
                 if signal == "buy":
                     if not current_pos or current_pos["positionSide"] == "SHORT":
                         if current_pos:
