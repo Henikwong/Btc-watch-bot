@@ -1,282 +1,130 @@
-"""
-多周期共振策略 - 回测 + 实盘 (支持单向 / 双向模式)
-"""
-
 import os
 import time
 import ccxt
 import pandas as pd
 import ta
-from datetime import datetime
 
-# ================== 配置 ==================
-MODE = os.getenv("MODE", "backtest")  # "backtest" / "live"
+# =========================
+# 环境变量
+# =========================
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+MODE = os.getenv("MODE", "live")  # live / backtest
 HEDGE_MODE = os.getenv("HEDGE_MODE", "false").lower() == "true"
 
-# 从 ENV 读取交易对，默认用 BTC/USDT
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
-SYMBOLS = [s.strip() for s in SYMBOLS if s.strip()]
-SYMBOL = SYMBOLS[0]  # 回测只跑第一个
+# =========================
+# 初始化交易所
+# =========================
+exchange = ccxt.binance({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"},
+})
 
-TIMEFRAME = "1h"
-HIGHER_TIMEFRAME = "4h"
-LEVERAGE = 10
-RISK_RATIO = 0.15
-TP_ATR_MULT = 3.0
-SL_ATR_MULT = 2.0
-INITIAL_BALANCE = 1000  # 回测资金
-BASE_USDT = 120  # 实盘资金
-SLEEP_INTERVAL = 60  # 实盘循环等待时间
+print(f"🚀 启动实盘交易... (模式: {'双向' if HEDGE_MODE else '单向'})")
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-
-# ================== 初始化交易所 ==================
-exchange = None
-if MODE == "live":
-    exchange = ccxt.binance({
-        "apiKey": BINANCE_API_KEY,
-        "secret": BINANCE_API_SECRET,
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"}
-    })
-    exchange.load_markets()
-
-    # 设置双向/单向持仓模式（Railway 上的 ccxt 可能不支持）
-    try:
-        params = {'dualSidePosition': 'true' if HEDGE_MODE else 'false'}
-        if hasattr(exchange, "fapiPrivate_post_positionside_dual"):
-            exchange.fapiPrivate_post_positionside_dual(params)
-            print(f"✅ 已切换为{'双向' if HEDGE_MODE else '单向'}持仓模式")
-        else:
-            print("⚠️ 当前 ccxt 不支持自动设置持仓模式，请在 Binance 网页端手动切换。")
-    except Exception as e:
-        print(f"⚠️ 持仓模式设置失败: {e}，请在 Binance 网页端手动设置。")
-
-# ================== 技术指标 ==================
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+# =========================
+# 技术指标计算
+# =========================
+def add_indicators(df: pd.DataFrame):
     df["ema_fast"] = ta.trend.EMAIndicator(df["close"], window=12).ema_indicator()
     df["ema_slow"] = ta.trend.EMAIndicator(df["close"], window=26).ema_indicator()
     macd = ta.trend.MACD(df["close"])
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-    df["atr"] = ta.volatility.AverageTrueRange(
-        df["high"], df["low"], df["close"], window=14
-    ).average_true_range()
-    df["vol_ma"] = df["volume"].rolling(window=20).mean()
+    df["vol_ma"] = df["volume"].rolling(20).mean()
     return df.dropna()
 
-def signal_from_indicators(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
-    """1h 给信号，4h 做确认"""
-    latest_1h = df_1h.iloc[-1]
-    latest_4h = df_4h.iloc[-1]
+# =========================
+# 信号生成（严格金叉/死叉）
+# =========================
+def signal_from_indicators(df, trend_df):
+    prev_macd = df["macd"].iloc[-2]
+    prev_signal = df["macd_signal"].iloc[-2]
+    curr_macd = df["macd"].iloc[-1]
+    curr_signal = df["macd_signal"].iloc[-1]
 
-    if latest_1h["volume"] < latest_1h["vol_ma"]:
-        return "hold"
+    ema_fast = df["ema_fast"].iloc[-1]
+    ema_slow = df["ema_slow"].iloc[-1]
+    rsi = df["rsi"].iloc[-1]
+    vol = df["volume"].iloc[-1]
+    vol_ma = df["vol_ma"].iloc[-1]
 
-    if (
-        latest_1h["macd"] > latest_1h["macd_signal"]
-        and latest_1h["ema_fast"] > latest_1h["ema_slow"]
-        and latest_1h["rsi"] > 50
-    ):
-        signal_1h = "buy"
-    elif (
-        latest_1h["macd"] < latest_1h["macd_signal"]
-        and latest_1h["ema_fast"] < latest_1h["ema_slow"]
-        and latest_1h["rsi"] < 50
-    ):
-        signal_1h = "sell"
-    else:
-        signal_1h = "hold"
+    trend_macd = trend_df["macd"].iloc[-1]
+    trend_signal = trend_df["macd_signal"].iloc[-1]
+    trend_ema_fast = trend_df["ema_fast"].iloc[-1]
+    trend_ema_slow = trend_df["ema_slow"].iloc[-1]
 
-    trend_4h = "buy" if latest_4h["ema_fast"] > latest_4h["ema_slow"] else "sell"
+    # 金叉 = 从下往上穿越
+    if prev_macd <= prev_signal and curr_macd > curr_signal:
+        if ema_fast > ema_slow and rsi > 50 and vol > vol_ma:
+            if trend_macd > trend_signal and trend_ema_fast > trend_ema_slow:
+                print(f"🔔 {df.index[-1]} {df['symbol'].iloc[-1]} 检测到【金叉信号】 → 开多")
+                return "buy"
 
-    if signal_1h == "buy" and trend_4h == "buy":
-        return "buy"
-    elif signal_1h == "sell" and trend_4h == "sell":
-        return "sell"
-    else:
-        return "hold"
+    # 死叉 = 从上往下穿越
+    if prev_macd >= prev_signal and curr_macd < curr_signal:
+        if ema_fast < ema_slow and rsi < 50 and vol > vol_ma:
+            if trend_macd < trend_signal and trend_ema_fast < trend_ema_slow:
+                print(f"🔔 {df.index[-1]} {df['symbol'].iloc[-1]} 检测到【死叉信号】 → 开空")
+                return "sell"
 
-# ================== 回测账户类 ==================
-class BacktestAccount:
-    def __init__(self, initial_balance):
-        self.balance = float(initial_balance)
-        self.position = None
-        self.trade_history = []
+    return "hold"
 
-    def place_order(self, side, qty, price, atr, timestamp):
-        if self.position:
-            return
-        cost = (qty * price) / LEVERAGE
-        self.balance -= cost
-        tp_price = price + TP_ATR_MULT * atr if side == "buy" else price - TP_ATR_MULT * atr
-        sl_price = price - SL_ATR_MULT * atr if side == "buy" else price + SL_ATR_MULT * atr
-        self.position = {"side": "long" if side == "buy" else "short",
-                         "qty": qty, "entry": price, "tp": tp_price, "sl": sl_price}
-        self.trade_history.append({"time": timestamp, "type": "Open", "side": side, "qty": qty, "price": price})
-
-    def close_position(self, price, timestamp, reason="Signal"):
-        if not self.position:
-            return
-        pos = self.position
-        pnl = (price - pos["entry"]) * pos["qty"]
-        if pos["side"] == "short":
-            pnl *= -1
-        self.balance += (pos["qty"] * pos["entry"] / LEVERAGE) + pnl
-        self.trade_history.append({"time": timestamp, "type": "Close", "reason": reason,
-                                   "side": pos["side"], "price": price, "pnl": pnl})
-        self.position = None
-
-    def check_tp_sl(self, high, low):
-        if not self.position:
-            return None, None
-        pos = self.position
-        if pos["side"] == "long":
-            if high >= pos["tp"]: return pos["tp"], "TP"
-            if low <= pos["sl"]: return pos["sl"], "SL"
-        else:
-            if low <= pos["tp"]: return pos["tp"], "TP"
-            if high >= pos["sl"]: return pos["sl"], "SL"
-        return None, None
-
-# ================== 工具函数 ==================
-def get_historical_data(symbol, timeframe="1h", limit=1000):
-    ex = exchange if exchange else ccxt.binance()
-    ohlcvs = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcvs, columns=["time", "open", "high", "low", "close", "volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df.set_index("time", inplace=True)
-    return df
-
-def calculate_position_size(balance, price):
-    return (balance * RISK_RATIO * LEVERAGE) / price
-
-# ================== 实盘下单 ==================
-def live_place_order(symbol, side, qty, price, atr, params=None):
+# =========================
+# 下单函数
+# =========================
+def place_order(symbol, side, amount):
     try:
-        pos_side = "LONG" if side == "buy" else "SHORT"
-        order_side = side.upper()
-        
-        order_params = params or {}
-        if HEDGE_MODE:
-            order_params["positionSide"] = pos_side
-
-        # 下单
-        order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
-
-        print(f"✅ 实盘开仓 {order_side} {symbol} qty={qty} @ {price:.2f}")
-
+        order = exchange.create_market_order(symbol, side, amount)
+        print(f"✅ {symbol} 下单成功: {side} {amount}")
+        return order
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
+        return None
 
-# ================== 实盘 ==================
-def run_live():
-    print(f"🚀 启动实盘交易... (模式: {'双向' if HEDGE_MODE else '单向'})")
+# =========================
+# 主循环
+# =========================
+def run_trading():
     while True:
         for symbol in SYMBOLS:
             try:
-                df_1h = compute_indicators(get_historical_data(symbol, TIMEFRAME, limit=200))
-                df_4h = compute_indicators(get_historical_data(symbol, HIGHER_TIMEFRAME, limit=200))
-                if df_1h.empty or df_4h.empty:
-                    print(f"⚠️ 无法获取 {symbol} 的足够历史数据，跳过。")
-                    continue
+                # 获取 1h 数据
+                ohlcv = exchange.fetch_ohlcv(symbol, "1h", limit=100)
+                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df.set_index("timestamp", inplace=True)
+                df = add_indicators(df)
+                df["symbol"] = symbol
 
-                signal = signal_from_indicators(df_1h, df_4h)
-                price = df_1h["close"].iloc[-1]
-                market = exchange.market(symbol)
-                min_amount = market['limits']['amount']['min']
-                atr = df_1h["atr"].iloc[-1]
+                # 获取 4h 数据作为趋势
+                ohlcv_trend = exchange.fetch_ohlcv(symbol, "4h", limit=100)
+                trend_df = pd.DataFrame(ohlcv_trend, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                trend_df["timestamp"] = pd.to_datetime(trend_df["timestamp"], unit="ms")
+                trend_df.set_index("timestamp", inplace=True)
+                trend_df = add_indicators(trend_df)
 
-                # 检查仓位
-                positions = exchange.fetch_positions()
-                current_pos = next((p for p in positions if p['symbol'] == symbol and float(p['contracts']) > 0), None)
-
+                # 生成信号
+                signal = signal_from_indicators(df, trend_df)
                 if signal == "buy":
-                    if not current_pos:
-                        qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
-                        if qty >= min_amount:
-                            qty = float(exchange.amount_to_precision(symbol, qty))
-                            live_place_order(symbol, "buy", qty, price, atr)
-                        else:
-                            print(f"❌ 开多失败 {symbol}: 数量 {qty} < 最小交易量 {min_amount}")
-
+                    place_order(symbol, "buy", 0.01)  # ⚠️ 下单数量请根据资金调整
                 elif signal == "sell":
-                    if not current_pos:
-                        qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
-                        if qty >= min_amount:
-                            qty = float(exchange.amount_to_precision(symbol, qty))
-                            live_place_order(symbol, "sell", qty, price, atr)
-                        else:
-                            print(f"❌ 开空失败 {symbol}: 数量 {qty} < 最小交易量 {min_amount}")
+                    place_order(symbol, "sell", 0.01)
 
             except Exception as e:
-                print(f"主循环异常 {symbol}: {e}")
+                print(f"⚠️ 主循环异常 {symbol}: {e}")
 
-        time.sleep(SLEEP_INTERVAL)
+        time.sleep(60)  # 每分钟循环一次
 
-# ================== 回测 ==================
-def run_backtest():
-    print("🤖 启动多周期回测...")
-    df_1h = compute_indicators(get_historical_data(SYMBOL, TIMEFRAME, limit=1000))
-    df_4h = compute_indicators(get_historical_data(SYMBOL, HIGHER_TIMEFRAME, limit=1000))
-    account = BacktestAccount(INITIAL_BALANCE)
-
-    for i in range(len(df_1h)):
-        current_df_1h = df_1h.iloc[: i + 1]
-        if len(current_df_1h) < 50:
-            continue
-        price = current_df_1h["close"].iloc[-1]
-        atr = current_df_1h["atr"].iloc[-1]
-        timestamp = current_df_1h.index[-1]
-        current_df_4h = df_4h[df_4h.index <= timestamp]
-        if current_df_4h.empty:
-            continue
-
-        if account.position:
-            tp_sl_price, reason = account.check_tp_sl(
-                current_df_1h["high"].iloc[-1], current_df_1h["low"].iloc[-1]
-            )
-            if tp_sl_price:
-                account.close_position(tp_sl_price, timestamp, reason)
-                continue
-
-        signal = signal_from_indicators(current_df_1h, current_df_4h)
-        if signal == "buy":
-            if not account.position or account.position["side"] == "short":
-                if account.position:
-                    account.close_position(price, timestamp, "Reverse")
-                qty = calculate_position_size(account.balance, price)
-                account.place_order("buy", qty, price, atr, timestamp)
-        elif signal == "sell":
-            if not account.position or account.position["side"] == "long":
-                if account.position:
-                    account.close_position(price, timestamp, "Reverse")
-                qty = calculate_position_size(account.balance, price)
-                account.place_order("sell", qty, price, atr, timestamp)
-
-    if account.position:
-        last_price = df_1h["close"].iloc[-1]
-        last_time = df_1h.index[-1]
-        account.close_position(last_price, last_time, "Final")
-
-    trade_df = pd.DataFrame(account.trade_history)
-    print("\n--- 回测结果 ---")
-    print(f"初始资金: {INITIAL_BALANCE:.2f}")
-    print(f"最终资金: {account.balance:.2f}")
-    closes = trade_df[trade_df["type"] == "Close"]
-    if not closes.empty:
-        total_trades = len(closes)
-        win_trades = (closes["pnl"] > 0).sum()
-        win_rate = win_trades / total_trades * 100
-        print(f"交易次数: {total_trades}, 胜率: {win_rate:.2f}%")
-        print(f"总盈亏: {closes['pnl'].sum():.2f}")
-
-# ================== 主入口 ==================
+# =========================
+# 入口
+# =========================
 if __name__ == "__main__":
-    if MODE == "backtest":
-        run_backtest()
+    if MODE == "live":
+        run_trading()
     else:
-        run_live()
+        print("⚠️ 当前是回测模式，还没写回测逻辑。")
