@@ -1,4 +1,3 @@
-# trading_bot.py
 """
 多周期共振策略 - 回测 + 实盘 (支持单向 / 双向模式)
 """
@@ -43,19 +42,16 @@ if MODE == "live":
     })
     exchange.load_markets()
 
-    # 设置双向/单向持仓模式
+    # 设置双向/单向持仓模式（Railway 上的 ccxt 可能不支持）
     try:
-        # 修复后的正确 API 调用方法
-        if HEDGE_MODE:
-            params = {'dualSidePosition': 'true'}
+        params = {'dualSidePosition': 'true' if HEDGE_MODE else 'false'}
+        if hasattr(exchange, "fapiPrivate_post_positionside_dual"):
             exchange.fapiPrivate_post_positionside_dual(params)
-            print("✅ 已切换为双向持仓模式 (HEDGE_MODE)")
+            print(f"✅ 已切换为{'双向' if HEDGE_MODE else '单向'}持仓模式")
         else:
-            params = {'dualSidePosition': 'false'}
-            exchange.fapiPrivate_post_positionside_dual(params)
-            print("ℹ️ 使用单向持仓模式")
+            print("⚠️ 当前 ccxt 不支持自动设置持仓模式，请在 Binance 网页端手动切换。")
     except Exception as e:
-        print(f"⚠️ 持仓模式设置失败: {e}")
+        print(f"⚠️ 持仓模式设置失败: {e}，请在 Binance 网页端手动设置。")
 
 # ================== 技术指标 ==================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,6 +154,7 @@ def get_historical_data(symbol, timeframe="1h", limit=1000):
 def calculate_position_size(balance, price):
     return (balance * RISK_RATIO * LEVERAGE) / price
 
+# ================== 实盘下单 ==================
 def live_place_order(symbol, side, qty, price, atr, params=None):
     try:
         pos_side = "LONG" if side == "buy" else "SHORT"
@@ -167,28 +164,10 @@ def live_place_order(symbol, side, qty, price, atr, params=None):
         if HEDGE_MODE:
             order_params["positionSide"] = pos_side
 
-        if "reduceOnly" in order_params:
-            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
-            print(f"✅ 平仓订单 {order_side} {symbol} qty={qty} @ {price:.2f}")
-        else:
-            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
+        # 下单
+        order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
 
-            if HEDGE_MODE:
-                if side == "buy":
-                    tp_price = price + TP_ATR_MULT * atr
-                    sl_price = price - SL_ATR_MULT * atr
-                else:
-                    tp_price = price - TP_ATR_MULT * atr
-                    sl_price = price + SL_ATR_MULT * atr
-
-                exchange.create_order(symbol, "TAKE_PROFIT_MARKET",
-                                      "SELL" if side == "buy" else "BUY", qty,
-                                      params={"stopPrice": tp_price, "reduceOnly": True, "positionSide": pos_side})
-                exchange.create_order(symbol, "STOP_MARKET",
-                                      "SELL" if side == "buy" else "BUY", qty,
-                                      params={"stopPrice": sl_price, "reduceOnly": True, "positionSide": pos_side})
-            
-            print(f"✅ 实盘开仓 {order_side} {symbol} qty={qty} @ {price:.2f}")
+        print(f"✅ 实盘开仓 {order_side} {symbol} qty={qty} @ {price:.2f}")
 
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
@@ -210,18 +189,13 @@ def run_live():
                 market = exchange.market(symbol)
                 min_amount = market['limits']['amount']['min']
                 atr = df_1h["atr"].iloc[-1]
-                
-                positions = exchange.fetch_positions_risk()
-                current_pos = next((p for p in positions if p['symbol'] == symbol and float(p['positionAmt']) != 0), None)
+
+                # 检查仓位
+                positions = exchange.fetch_positions()
+                current_pos = next((p for p in positions if p['symbol'] == symbol and float(p['contracts']) > 0), None)
 
                 if signal == "buy":
-                    if not current_pos or current_pos["positionSide"] == "SHORT":
-                        if current_pos:
-                            qty_to_close = abs(float(current_pos["positionAmt"]))
-                            live_place_order(symbol, "buy", qty_to_close, price, atr, params={"reduceOnly": True, "positionSide": "SHORT"})
-                            print(f"✅ 平掉 {symbol} 空头仓位")
-                            time.sleep(1)
-
+                    if not current_pos:
                         qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
                         if qty >= min_amount:
                             qty = float(exchange.amount_to_precision(symbol, qty))
@@ -230,13 +204,7 @@ def run_live():
                             print(f"❌ 开多失败 {symbol}: 数量 {qty} < 最小交易量 {min_amount}")
 
                 elif signal == "sell":
-                    if not current_pos or current_pos["positionSide"] == "LONG":
-                        if current_pos:
-                            qty_to_close = abs(float(current_pos["positionAmt"]))
-                            live_place_order(symbol, "sell", qty_to_close, price, atr, params={"reduceOnly": True, "positionSide": "LONG"})
-                            print(f"✅ 平掉 {symbol} 多头仓位")
-                            time.sleep(1)
-
+                    if not current_pos:
                         qty = (BASE_USDT / len(SYMBOLS)) * RISK_RATIO * LEVERAGE / price
                         if qty >= min_amount:
                             qty = float(exchange.amount_to_precision(symbol, qty))
