@@ -11,3 +11,4 @@ tqdm>=4.66.1
 optuna>=3.6.1
 backtesting>=0.3.3
 plotly>=5.21.0
+matplotlib>=3.8.0
