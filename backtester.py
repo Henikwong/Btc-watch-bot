@@ -1,6 +1,6 @@
-# r# multi_backtest_bot.py
+# multi_backtest_bot_full.py
 """
-多币种多周期共振策略回测
+多币种多周期共振策略回测（显示TP/SL百分比，保存CSV）
 """
 
 import ccxt
@@ -82,10 +82,17 @@ class BacktestAccount:
         self.balance -= cost + cost * FEE_RATE
         tp_price = price + TP_ATR_MULT * atr if side == "buy" else price - TP_ATR_MULT * atr
         sl_price = price - SL_ATR_MULT * atr if side == "buy" else price + SL_ATR_MULT * atr
+        tp_pct = (tp_price - price) / price * 100 if side == "buy" else (price - tp_price) / price * 100
+        sl_pct = (price - sl_price) / price * 100 if side == "buy" else (sl_price - price) / price * 100
+
         self.positions[symbol] = {"side": "long" if side == "buy" else "short",
-                                  "qty": qty, "entry": price, "tp": tp_price, "sl": sl_price}
-        self.trade_history.append({"time": timestamp, "symbol": symbol, "type": "Open", "side": side, "qty": qty, "price": price})
+                                  "qty": qty, "entry": price, "tp": tp_price, "sl": sl_price,
+                                  "tp_pct": tp_pct, "sl_pct": sl_pct}
+        self.trade_history.append({"time": timestamp, "symbol": symbol, "type": "Open", "side": side,
+                                   "qty": qty, "price": price, "tp_price": tp_price, "tp_pct": tp_pct,
+                                   "sl_price": sl_price, "sl_pct": sl_pct})
         self.balance_curve.append(self.balance)
+        print(f"🟢 开仓 {symbol} {side.upper()} qty={qty:.4f} @ {price:.2f} | TP: {tp_price:.2f} ({tp_pct:.2f}%), SL: {sl_price:.2f} ({sl_pct:.2f}%)")
 
     def close_position(self, symbol, price, timestamp, reason="Signal"):
         if symbol not in self.positions or not self.positions[symbol]:
@@ -94,11 +101,13 @@ class BacktestAccount:
         pnl = (price - pos["entry"]) * pos["qty"]
         if pos["side"] == "short":
             pnl *= -1
+        pnl_pct = pnl / (pos["entry"] * pos["qty"] / LEVERAGE) * 100  # 盈亏百分比
         self.balance += (pos["qty"] * pos["entry"] / LEVERAGE) + pnl - (price * pos["qty"] / LEVERAGE * FEE_RATE)
         self.trade_history.append({"time": timestamp, "symbol": symbol, "type": "Close", "reason": reason,
-                                   "side": pos["side"], "price": price, "pnl": pnl})
+                                   "side": pos["side"], "price": price, "pnl": pnl, "pnl_pct": pnl_pct})
         self.positions[symbol] = None
         self.balance_curve.append(self.balance)
+        print(f"🔴 平仓 {symbol} {pos['side'].upper()} @ {price:.2f} | PnL: {pnl:.2f} ({pnl_pct:.2f}%) | 原因: {reason}")
 
     def check_tp_sl(self, symbol, high, low):
         if symbol not in self.positions or not self.positions[symbol]:
@@ -152,45 +161,4 @@ def run_multi_backtest():
                 if not account.positions.get(symbol) or account.positions[symbol]["side"] == "short":
                     if account.positions.get(symbol):
                         account.close_position(symbol, price, timestamp, "Reverse")
-                    qty = calculate_position_size(account.balance, price, len(SYMBOLS))
-                    account.place_order(symbol, "buy", qty, price, atr, timestamp)
-            elif signal == "sell":
-                if not account.positions.get(symbol) or account.positions[symbol]["side"] == "long":
-                    if account.positions.get(symbol):
-                        account.close_position(symbol, price, timestamp, "Reverse")
-                    qty = calculate_position_size(account.balance, price, len(SYMBOLS))
-                    account.place_order(symbol, "sell", qty, price, atr, timestamp)
-
-    # 平掉所有未平仓位
-    for symbol in SYMBOLS:
-        if account.positions.get(symbol):
-            last_price = dfs_1h[symbol]["close"].iloc[-1]
-            last_time = dfs_1h[symbol].index[-1]
-            account.close_position(symbol, last_price, last_time, "Final")
-
-    # 输出结果
-    trade_df = pd.DataFrame(account.trade_history)
-    print("\n--- 回测结果 ---")
-    print(f"初始资金: {INITIAL_BALANCE:.2f}")
-    print(f"最终资金: {account.balance:.2f}")
-    closes = trade_df[trade_df["type"] == "Close"]
-    if not closes.empty:
-        total_trades = len(closes)
-        win_trades = (closes["pnl"] > 0).sum()
-        win_rate = win_trades / total_trades * 100
-        print(f"交易次数: {total_trades}, 胜率: {win_rate:.2f}%")
-        print(f"总盈亏: {closes['pnl'].sum():.2f}")
-
-    # 绘制资金曲线
-    plt.figure(figsize=(12, 6))
-    plt.plot(account.balance_curve, label="Total Balance Curve")
-    plt.title("多币种回测资金曲线")
-    plt.xlabel("交易次数")
-    plt.ylabel("账户余额 (USDT)")
-    plt.legend()
-    plt.grid()
-    plt.show()
-
-
-if __name__ == "__main__":
-    run_multi_backtest()
+                    qty = calculate_position_size(account.balance, price, len(SYMBOLS
