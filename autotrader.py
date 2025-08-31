@@ -99,10 +99,6 @@ class Config:
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
     BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
     
-    # 通知配置
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-    
     # 性能配置
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2.0"))
@@ -115,57 +111,11 @@ class Config:
     DAILY_LOSS_LIMIT = 0.1
     ORDER_TIMEOUT = 30
 
-# ================== 通知系统 ==================
-class NotificationSystem:
-    """增强的通知系统"""
-    
-    def __init__(self):
-        self.bot_token = Config.TELEGRAM_BOT_TOKEN
-        self.chat_id = Config.TELEGRAM_CHAT_ID
-        self.enabled = bool(self.bot_token and self.chat_id)
-    
-    def send_message(self, message: str, level: str = "INFO"):
-        """发送消息"""
-        if not self.enabled:
-            return
-        
-        try:
-            emoji = {
-                "INFO": "ℹ️",
-                "WARNING": "⚠️",
-                "ERROR": "❌",
-                "CRITICAL": "🚨"
-            }.get(level, "📢")
-            
-            formatted_msg = f"{emoji} {message}"
-            
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": formatted_msg,
-                "parse_mode": "HTML"
-            }
-            
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            
-        except Exception as e:
-            logging.error(f"Telegram消息发送失败: {e}")
-    
-    def send_order_alert(self, symbol: str, side: str, success: bool, error: str = ""):
-        """发送订单警报"""
-        status = "✅成功" if success else "❌失败"
-        message = f"订单执行: {symbol} {side} - {status}"  # 修复alert变量问题
-        if error:
-            message += f"\n错误: {error}"
-        self.send_message(message, "ERROR" if not success else "INFO")
-
 # ================== 日志系统 ==================
 class AdvancedLogger:
     """高级日志系统"""
     
     def __init__(self):
-        self.notifier = NotificationSystem()
         self.setup_logging()
     
     def setup_logging(self):
@@ -185,25 +135,17 @@ class AdvancedLogger:
     def debug(self, message: str):
         self.logger.debug(message)
     
-    def info(self, message: str, notify: bool = False):
+    def info(self, message: str):
         self.logger.info(message)
-        if notify:
-            self.notifier.send_message(message, "INFO")
     
-    def warning(self, message: str, notify: bool = True):
+    def warning(self, message: str):
         self.logger.warning(message)
-        if notify:
-            self.notifier.send_message(message, "WARNING")
     
-    def error(self, message: str, notify: bool = True):
+    def error(self, message: str):
         self.logger.error(message)
-        if notify:
-            self.notifier.send_message(message, "ERROR")
     
-    def critical(self, message: str, notify: bool = True):
+    def critical(self, message: str):
         self.logger.critical(message)
-        if notify:
-            self.notifier.send_message(message, "CRITICAL")
 
 # ================== 缓存系统 ==================
 class TimedCache:
@@ -420,7 +362,6 @@ class TradeExecutor:
     def __init__(self, exchange: ExchangeInterface, logger: AdvancedLogger):
         self.exchange = exchange
         self.logger = logger
-        self.notifier = NotificationSystem()
     
     async def execute_signal(self, signal: TradeSignal, balance: float) -> Tuple[bool, Optional[TradeSignal]]:
         """执行交易信号，返回执行结果和信号"""
@@ -448,7 +389,7 @@ class TradeExecutor:
             )
             
             if not order_result.success:
-                self.notifier.send_order_alert(signal.symbol, signal.side.value, False, order_result.error)
+                self.logger.error(f"订单执行失败 {signal.symbol}: {order_result.error}")
                 return False, None
             
             # 设置止盈止损
@@ -457,7 +398,6 @@ class TradeExecutor:
             
             if tp_success and sl_success:
                 self.logger.info(f"交易执行成功: {signal.symbol} {signal.side.value}")
-                self.notifier.send_order_alert(signal.symbol, signal.side.value, True)
                 return True, signal
             else:
                 self.logger.warning(f"止盈止损设置部分失败: {signal.symbol}")
@@ -505,7 +445,7 @@ class TradeExecutor:
             except Exception as e:
                 self.logger.warning(f"止盈单设置失败(尝试{attempt+1}): {e}")
                 if attempt == Config.MAX_RETRIES - 1:
-                    self.notifier.send_message(f"止盈单设置失败: {signal.symbol} - {e}", "ERROR")
+                    self.logger.error(f"止盈单设置失败: {signal.symbol} - {e}")
                     return False
                 await asyncio.sleep(Config.RETRY_DELAY)
         
@@ -542,7 +482,7 @@ class TradeExecutor:
             except Exception as e:
                 self.logger.warning(f"止损单设置失败(尝试{attempt+1}): {e}")
                 if attempt == Config.MAX_RETRIES - 1:
-                    self.notifier.send_message(f"止损单设置失败: {signal.symbol} - {e}", "ERROR")
+                    self.logger.error(f"止损单设置失败: {signal.symbol} - {e}")
                     return False
                 await asyncio.sleep(Config.RETRY_DELAY)
         
@@ -563,7 +503,7 @@ class ProductionTrader:
     
     async def run(self):
         """主运行循环"""
-        self.logger.info("🚀 启动生产环境交易机器人", notify=True)
+        self.logger.info("🚀 启动生产环境交易机器人")
         self.running = True
         
         try:
@@ -597,7 +537,7 @@ class ProductionTrader:
                 await asyncio.sleep(sleep_time)
                 
         except Exception as e:
-            self.logger.critical(f"主循环异常: {e}", notify=True)
+            self.logger.critical(f"主循环异常: {e}")
         finally:
             await self.shutdown()
     
@@ -626,32 +566,4 @@ class ProductionTrader:
             return False, signal
             
         except Exception as e:
-            self.logger.error(f"处理交易对 {symbol} 失败: {e}")
-            return False, None
-    
-    async def shutdown(self):
-        """安全关闭"""
-        self.logger.info("正在安全关闭交易机器人...", notify=True)
-        self.running = False
-
-# ================== 主程序入口 ==================
-async def main():
-    trader = ProductionTrader()
-    
-    # 信号处理
-    def signal_handler(signum, frame):
-        asyncio.create_task(trader.shutdown())
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        await trader.run()
-    except KeyboardInterrupt:
-        await trader.shutdown()
-    except Exception as e:
-        trader.logger.critical(f"程序崩溃: {e}", notify=True)
-        sys.exit(1)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            self.logger.error(
