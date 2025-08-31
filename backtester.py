@@ -161,4 +161,45 @@ def run_multi_backtest():
                 if not account.positions.get(symbol) or account.positions[symbol]["side"] == "short":
                     if account.positions.get(symbol):
                         account.close_position(symbol, price, timestamp, "Reverse")
-                    qty = calculate_position_size(account.balance, price, len(SYMBOLS
+                    qty = calculate_position_size(account.balance, price, len(SYMBOLS))
+                    account.place_order(symbol, "buy", qty, price, atr, timestamp)
+            elif signal == "sell":
+                if not account.positions.get(symbol) or account.positions[symbol]["side"] == "long":
+                    if account.positions.get(symbol):
+                        account.close_position(symbol, price, timestamp, "Reverse")
+                    qty = calculate_position_size(account.balance, price, len(SYMBOLS))
+                    account.place_order(symbol, "sell", qty, price, atr, timestamp)
+
+    # 平掉所有未平仓位
+    for symbol in SYMBOLS:
+        if account.positions.get(symbol):
+            last_price = dfs_1h[symbol]["close"].iloc[-1]
+            last_time = dfs_1h[symbol].index[-1]
+            account.close_position(symbol, last_price, last_time, "Final")
+
+    # 输出结果
+    trade_df = pd.DataFrame(account.trade_history)
+    trade_df.to_csv("backtest_results.csv", index=False)  # 保存CSV
+    print("\n--- 回测结果 ---")
+    print(f"初始资金: {INITIAL_BALANCE:.2f}")
+    print(f"最终资金: {account.balance:.2f}")
+    closes = trade_df[trade_df["type"] == "Close"]
+    if not closes.empty:
+        total_trades = len(closes)
+        win_trades = (closes["pnl"] > 0).sum()
+        win_rate = win_trades / total_trades * 100
+        print(f"交易次数: {total_trades}, 胜率: {win_rate:.2f}%")
+        print(f"总盈亏: {closes['pnl'].sum():.2f}")
+
+    # 绘制资金曲线
+    plt.figure(figsize=(12, 6))
+    plt.plot(account.balance_curve, label="Total Balance Curve")
+    plt.title("多币种回测资金曲线")
+    plt.xlabel("交易次数")
+    plt.ylabel("账户余额 (USDT)")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+if __name__ == "__main__":
+    run_multi_backtest()
