@@ -1,4 +1,4 @@
-# trading_bot_final.py
+# trading_bot_final_safe.py
 """
 多周期共振策略 - 多币种回测 + 实盘 (支持单向 / 双向)
 """
@@ -36,16 +36,15 @@ if MODE == "live":
         "apiKey": BINANCE_API_KEY,
         "secret": BINANCE_API_SECRET,
         "enableRateLimit": True,
-        "options": {"defaultType": "future"}
+        "options": {"defaultType": "future"}  # 永续合约
     })
     exchange.load_markets()
-
-    try:
-        params = {'dualSidePosition': 'true' if HEDGE_MODE else 'false'}
-        exchange.fapiPrivate_post_positionside_dual(params)
-        print(f"✅ 已切换为{'双向' if HEDGE_MODE else '单向'}持仓模式")
-    except Exception as e:
-        print(f"⚠️ 持仓模式设置失败: {e}")
+    
+    # ⚠️ 不再自动切换持仓模式
+    if HEDGE_MODE:
+        print("✅ 已设置为双向模式，请确保在 Binance 手动开启 Hedge Mode")
+    else:
+        print("✅ 单向模式 (One-way) 已启用")
 
 # ================== 技术指标 ==================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -141,29 +140,24 @@ def live_place_order(symbol, side, qty, price, atr, params=None):
         order_side = side.upper()
         order_params = params or {}
 
-        if HEDGE_MODE:
+        if HEDGE_MODE and "positionSide" not in order_params:
             order_params["positionSide"] = pos_side
 
-        if "reduceOnly" in order_params:
-            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
-            print(f"✅ 平仓订单 {order_side} {symbol} qty={qty} @ {price:.2f}")
-        else:
-            order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
-            if HEDGE_MODE:
-                if side == "buy":
-                    tp_price = price + TP_ATR_MULT * atr
-                    sl_price = price - SL_ATR_MULT * atr
-                else:
-                    tp_price = price - TP_ATR_MULT * atr
-                    sl_price = price + SL_ATR_MULT * atr
+        order = exchange.create_order(symbol, "MARKET", order_side, qty, params=order_params)
+        print(f"✅ 订单 {order_side} {symbol} qty={qty} @ {price:.2f}")
 
-                exchange.create_order(symbol, "TAKE_PROFIT_MARKET",
-                                      "SELL" if side == "buy" else "BUY", qty,
-                                      params={"stopPrice": tp_price, "reduceOnly": True, "positionSide": pos_side})
-                exchange.create_order(symbol, "STOP_MARKET",
-                                      "SELL" if side == "buy" else "BUY", qty,
-                                      params={"stopPrice": sl_price, "reduceOnly": True, "positionSide": pos_side})
-            print(f"✅ 实盘开仓 {order_side} {symbol} qty={qty} @ {price:.2f}")
+        # 设置止盈止损
+        if HEDGE_MODE and "reduceOnly" not in order_params:
+            tp_price = price + TP_ATR_MULT * atr if side == "buy" else price - TP_ATR_MULT * atr
+            sl_price = price - SL_ATR_MULT * atr if side == "buy" else price + SL_ATR_MULT * atr
+
+            exchange.create_order(symbol, "TAKE_PROFIT_MARKET",
+                                  "SELL" if side == "buy" else "BUY", qty,
+                                  params={"stopPrice": tp_price, "reduceOnly": True, "positionSide": pos_side})
+            exchange.create_order(symbol, "STOP_MARKET",
+                                  "SELL" if side == "buy" else "BUY", qty,
+                                  params={"stopPrice": sl_price, "reduceOnly": True, "positionSide": pos_side})
+            print(f"✅ 止盈止损设置完成 {symbol}")
 
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
@@ -286,4 +280,3 @@ if __name__ == "__main__":
         run_backtest_multi()
     elif MODE == "live":
         run_live_multi()
-
