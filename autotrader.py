@@ -566,4 +566,32 @@ class ProductionTrader:
             return False, signal
             
         except Exception as e:
-            self.logger.error(
+            self.logger.error(f"处理交易对 {symbol} 失败: {e}")
+            return False, None
+    
+    async def shutdown(self):
+        """安全关闭"""
+        self.logger.info("正在安全关闭交易机器人...")
+        self.running = False
+
+# ================== 主程序入口 ==================
+async def main():
+    trader = ProductionTrader()
+    
+    # 信号处理
+    def signal_handler(signum, frame):
+        asyncio.create_task(trader.shutdown())
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        await trader.run()
+    except KeyboardInterrupt:
+        await trader.shutdown()
+    except Exception as e:
+        trader.logger.critical(f"程序崩溃: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
