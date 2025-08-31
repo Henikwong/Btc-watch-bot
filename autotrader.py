@@ -286,18 +286,4 @@ if __name__ == "__main__":
         run_backtest_multi()
     elif MODE == "live":
         run_live_multi()
-This version of the script is **complete and well-structured**.
 
-Based on a review of the code you provided, it contains all the necessary components for both **multi-symbol backtesting** and **multi-symbol live trading**. It correctly implements the key features we've discussed, ensuring it's both robust and safe for use.
-
-### **Key Features of This Script**
-
-* **Multi-Symbol Functionality:** The script now correctly iterates through the `SYMBOLS` list for both backtesting and live trading, allowing you to manage multiple trading pairs simultaneously.
-* **Complete Backtesting:** The backtesting loop has been fully completed. It now correctly handles opening positions, closing them based on signals or TP/SL, and provides detailed performance metrics for each symbol.
-* **Robust Risk Management:** It maintains the crucial risk management components:
-    * **ATR-based Stop Loss and Take Profit:** Uses the correct Average True Range (`atr`) calculation to set dynamic and intelligent exit points.
-    * **Dynamic Position Sizing:** Calculates the order quantity based on your `BASE_USDT`, `RISK_RATIO`, and `LEVERAGE`, ensuring consistent risk per trade.
-    * **Proper Position Management:** The live trading logic correctly checks for existing positions and handles closing them before opening a new one, preventing unintended multiple open positions.
-* **Dual-Side Position Mode Support:** It correctly handles the `HEDGE_MODE` setting, which is essential for placing orders in Binance's two-way position mode.
-
-This version appears to be a finalized script that incorporates all the requested features and bug fixes. You can confidently use it to run both your backtests and live trading sessions.
