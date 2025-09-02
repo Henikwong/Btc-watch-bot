@@ -699,7 +699,7 @@ class ParameterOptimizer:
             'atr_window': Config.ATR_WINDOW,
             'sl_mult': Config.SL_ATR_MULT,
             'tp_mult': Config.TP_ATR_MULT,
-            'risk_ratio': Config.RISK_RATRIO,
+            'risk_ratio': Config.RISK_RATIO,  # 修复了这里的拼写错误
             'leverage': Config.LEVERAGE
         }
         
@@ -819,4 +819,77 @@ def generate_sample_data(symbols: List[str], periods: int = 1000) -> Dict[str, p
         trend = np.linspace(0, 0.5, periods)  # 向上趋势
         noise = np.random.normal(0, 0.01, periods)
         
-        close_prices = base
+        close_prices = base_price * (1 + trend + noise).cumprod()
+        
+        # 生成高、低、开盘价格
+        volatility = 0.02  # 2% 波动率
+        returns = np.random.normal(0, volatility, periods)
+        close_prices = base_price * np.exp(np.cumsum(returns))
+        
+        # 添加一些趋势
+        trend = np.linspace(0, 0.2, periods)
+        close_prices = close_prices * (1 + trend)
+        
+        # 生成OHLC数据
+        open_prices = close_prices * (1 + np.random.normal(0, 0.005, periods))
+        high_prices = close_prices * (1 + np.abs(np.random.normal(0, 0.01, periods)))
+        low_prices = close_prices * (1 - np.abs(np.random.normal(0, 0.01, periods)))
+        
+        # 确保价格合理
+        high_prices = np.maximum(high_prices, np.maximum(open_prices, close_prices))
+        low_prices = np.minimum(low_prices, np.minimum(open_prices, close_prices))
+        
+        df = pd.DataFrame({
+            'open': open_prices,
+            'high': high_prices,
+            'low': low_prices,
+            'close': close_prices,
+            'volume': np.random.lognormal(5, 1, periods)
+        }, index=dates)
+        
+        data_dict[symbol] = df
+    
+    return data_dict
+
+if __name__ == "__main__":
+    # 示例使用
+    symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT"]
+    
+    # 生成示例数据
+    data_dict = generate_sample_data(symbols, periods=2000)
+    
+    # 参数网格
+    param_grid = {
+        'ema_short': [8, 12, 16],
+        'ema_long': [20, 26, 32],
+        'macd_fast': [8, 12, 16],
+        'macd_slow': [20, 26, 32],
+        'macd_signal': [7, 9, 11],
+        'rsi_window': [10, 14, 18],
+        'atr_window': [10, 14, 18],
+        'sl_mult': [1.5, 2.0, 2.5],
+        'tp_mult': [2.0, 3.0, 4.0],
+        'risk_ratio': [0.03, 0.05, 0.07],
+        'leverage': [3, 5, 7]
+    }
+    
+    # 初始化优化器
+    optimizer = ParameterOptimizer()
+    
+    # 运行优化
+    best_params = optimizer.optimize_parameters(
+        data_dict=data_dict,
+        param_grid=param_grid,
+        objective='composite_score',
+        max_workers=4,
+        max_combinations=500,  # 限制组合数量
+        initial_balance=1000
+    )
+    
+    # 绘制结果
+    optimizer.plot_parameter_sensitivity()
+    optimizer.plot_equity_curve(data_dict)
+    optimizer.plot_best_parameters_comparison(data_dict)
+    
+    print(f"最佳参数: {best_params}")
+    print("优化完成!")
