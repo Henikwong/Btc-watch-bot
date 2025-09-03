@@ -1,6 +1,8 @@
-# autotrader_fixed_websocket.py
+
+# enhanced_trading_bot.py
 """
-修复WebSocket导入问题的交易机器人版本
+综合改进版交易机器人
+包含WebSocket健壮性、动态ATR、多周期共振和部署优化
 """
 
 import os
@@ -28,6 +30,8 @@ from abc import ABC, abstractmethod
 import optuna
 import uuid
 import hashlib
+import sqlite3
+from contextlib import contextmanager
 
 # 修复WebSocket导入问题
 try:
@@ -92,6 +96,14 @@ class BalanceInfo:
     free: float
     used: float
 
+@dataclass
+class HealthStatus:
+    total_symbols: int
+    connected_symbols: int
+    disconnected_symbols: int
+    last_check: datetime
+    error_count: int
+
 # ================== 配置管理 ==================
 class Config:
     """完整的配置管理"""
@@ -117,6 +129,7 @@ class Config:
     RISK_ATR_MULT = float(os.getenv("RISK_ATR_MULT", "1.5"))
     PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
+    MAX_RISK_RATIO = float(os.getenv("MAX_RISK_RATIO", "0.02"))  # 最大风险比
     
     # 时间参数
     POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
@@ -124,6 +137,7 @@ class Config:
     SUMMARY_INTERVAL = int(os.getenv("SUMMARY_INTERVAL", "3600"))
     OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "200"))
     MACD_FILTER_TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
+    ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m")  # 入场时间框架
     
     # API配置
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -135,6 +149,7 @@ class Config:
     MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
     CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
     VOLUME_FILTER_MULTIPLIER = float(os.getenv("VOLUME_FILTER_MULTIPLIER", "0.8"))
+    MAX_CONCURRENT_CONNECTIONS = int(os.getenv("MAX_CONCURRENT_CONNECTIONS", "3"))  # 最大并发连接数
     
     # 风控参数
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.2"))
@@ -158,6 +173,111 @@ class Config:
     # WebSocket配置
     WEBSOCKET_RECONNECT_DELAY = int(os.getenv("WEBSOCKET_RECONNECT_DELAY", "5"))
     WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "30"))
+    WEBSOCKET_MAX_RETRIES = int(os.getenv("WEBSOCKET_MAX_RETRIES", "5"))  # 最大重试次数
+    WEBSOCKET_RETRY_WINDOW = int(os.getenv("WEBSOCKET_RETRY_WINDOW", "300"))  # 重试窗口(秒)
+    
+    # 健康检查配置
+    HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "1800"))  # 30分钟
+
+# ================== 数据库管理 ==================
+class DatabaseManager:
+    """数据库管理器"""
+    
+    def __init__(self, db_path="trading_bot.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """初始化数据库"""
+        with self.get_connection() as conn:
+            # 创建仓位表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 创建订单表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    price REAL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 创建状态表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+    
+    @contextmanager
+    def get_connection(self):
+        """获取数据库连接"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def save_position(self, position_data):
+        """保存仓位信息"""
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO positions (symbol, side, entry_price, quantity, stop_loss, take_profit)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                position_data['symbol'],
+                position_data['side'],
+                position_data['entry_price'],
+                position_data['quantity'],
+                position_data.get('stop_loss'),
+                position_data.get('take_profit')
+            ))
+            conn.commit()
+    
+    def get_active_positions(self):
+        """获取活跃仓位"""
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT * FROM positions')
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def save_state(self, key, value):
+        """保存应用状态"""
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO app_state (key, value)
+                VALUES (?, ?)
+            ''', (key, json.dumps(value)))
+            conn.commit()
+    
+    def load_state(self, key, default=None):
+        """加载应用状态"""
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT value FROM app_state WHERE key = ?', (key,))
+            row = cursor.fetchone()
+            return json.loads(row['value']) if row else default
 
 # ================== 日志系统 ==================
 class AdvancedLogger:
@@ -346,7 +466,7 @@ class BinanceExchange(ExchangeInterface):
 
 # ================== WebSocket数据处理器 ==================
 class WebSocketDataHandler:
-    """WebSocket实时数据处理器"""
+    """增强的WebSocket实时数据处理器"""
     
     def __init__(self, exchange: ExchangeInterface, logger: AdvancedLogger, symbols: List[str]):
         self.exchange = exchange
@@ -356,6 +476,9 @@ class WebSocketDataHandler:
         self.running = False
         self.ohlcv_data = {}
         self.ws_connections = {}
+        self.retry_counts = {symbol: 0 for symbol in symbols}
+        self.last_retry_time = {symbol: 0 for symbol in symbols}
+        self.connection_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_CONNECTIONS)
         
     async def start(self):
         """启动WebSocket连接"""
@@ -381,46 +504,71 @@ class WebSocketDataHandler:
         ws_url = f"wss://fstream.binance.com/ws/{symbol_lower}@kline_1h"
         
         while self.running:
+            # 检查重试次数
+            current_time = time.time()
+            if (self.retry_counts[symbol] >= Config.WEBSOCKET_MAX_RETRIES and 
+                current_time - self.last_retry_time[symbol] < Config.WEBSOCKET_RETRY_WINDOW):
+                self.logger.warning(f"{symbol} WebSocket连接重试次数过多，切换到REST模式")
+                await self._start_polling_for_symbol(symbol)
+                break
+                
+            async with self.connection_semaphore:
+                try:
+                    async with connect(ws_url, ping_interval=20, ping_timeout=10) as websocket:
+                        self.logger.info(f"WebSocket连接已建立: {symbol}")
+                        self.ws_connections[symbol] = websocket
+                        self.retry_counts[symbol] = 0  # 重置重试计数
+                        
+                        while self.running:
+                            try:
+                                message = await asyncio.wait_for(websocket.recv(), timeout=Config.WEBSOCKET_TIMEOUT)
+                                data = json.loads(message)
+                                
+                                if 'k' in data:
+                                    kline = data['k']
+                                    if kline['x']:  # 如果是收盘
+                                        # 给REST端一点点同步时间
+                                        await asyncio.sleep(1.0)
+                                        
+                                        ohlcv = {
+                                            'timestamp': kline['t'],
+                                            'open': float(kline['o']),
+                                            'high': float(kline['h']),
+                                            'low': float(kline['l']),
+                                            'close': float(kline['c']),
+                                            'volume': float(kline['v'])
+                                        }
+                                        
+                                        # 创建DataFrame
+                                        df = pd.DataFrame([ohlcv])
+                                        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+                                        df.set_index('datetime', inplace=True)
+                                        
+                                        await self.data_queue.put((symbol, df))
+                            except asyncio.TimeoutError:
+                                self.logger.debug(f"WebSocket接收超时: {symbol}")
+                            except ws_exceptions.ConnectionClosed:
+                                self.logger.warning(f"WebSocket连接已关闭: {symbol}")
+                                break
+                                
+                except Exception as e:
+                    self.logger.warning(f"WebSocket连接错误 {symbol}: {e}")
+                    self.retry_counts[symbol] += 1
+                    self.last_retry_time[symbol] = current_time
+                    await asyncio.sleep(Config.WEBSOCKET_RECONNECT_DELAY)
+    
+    async def _start_polling_for_symbol(self, symbol: str):
+        """为单个交易对启动轮询模式"""
+        self.logger.info(f"为 {symbol} 使用REST API轮询模式")
+        while self.running:
             try:
-                async with connect(ws_url, ping_interval=20, ping_timeout=10) as websocket:
-                    self.logger.info(f"WebSocket连接已建立: {symbol}")
-                    self.ws_connections[symbol] = websocket
-                    
-                    while self.running:
-                        try:
-                            message = await asyncio.wait_for(websocket.recv(), timeout=Config.WEBSOCKET_TIMEOUT)
-                            data = json.loads(message)
-                            
-                            if 'k' in data:
-                                kline = data['k']
-                                if kline['x']:  # 如果是收盘
-                                    # 给REST端一点点同步时间
-                                    await asyncio.sleep(1.0)
-                                    
-                                    ohlcv = {
-                                        'timestamp': kline['t'],
-                                        'open': float(kline['o']),
-                                        'high': float(kline['h']),
-                                        'low': float(kline['l']),
-                                        'close': float(kline['c']),
-                                        'volume': float(kline['v'])
-                                    }
-                                    
-                                    # 创建DataFrame
-                                    df = pd.DataFrame([ohlcv])
-                                    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-                                    df.set_index('datetime', inplace=True)
-                                    
-                                    await self.data_queue.put((symbol, df))
-                        except asyncio.TimeoutError:
-                            self.logger.debug(f"WebSocket接收超时: {symbol}")
-                        except ws_exceptions.ConnectionClosed:
-                            self.logger.warning(f"WebSocket连接已关闭: {symbol}")
-                            break
-                            
+                ohlcv = await self.exchange.get_historical_data(symbol, "1h", 1)
+                if not ohlcv.empty:
+                    await self.data_queue.put((symbol, ohlcv.iloc[-1:]))
+                await asyncio.sleep(Config.POLL_INTERVAL)
             except Exception as e:
-                self.logger.error(f"WebSocket连接错误 {symbol}: {e}")
-                await asyncio.sleep(Config.WEBSOCKET_RECONNECT_DELAY)
+                self.logger.error(f"轮询数据失败 {symbol}: {e}")
+                await asyncio.sleep(5)
     
     async def _start_polling(self):
         """启动轮询模式"""
@@ -449,6 +597,158 @@ class WebSocketDataHandler:
                 await ws.close()
             except:
                 pass
+    
+    def get_health_status(self) -> HealthStatus:
+        """获取健康状态"""
+        connected = len(self.ws_connections)
+        total = len(self.symbols)
+        return HealthStatus(
+            total_symbols=total,
+            connected_symbols=connected,
+            disconnected_symbols=total - connected,
+            last_check=datetime.now(),
+            error_count=sum(self.retry_counts.values())
+        )
+
+# ================== 动态ATR计算器 ==================
+class DynamicATRCalculator:
+    """动态ATR计算器"""
+    
+    def __init__(self):
+        self.atr_history = {}
+        self.volatility_threshold = 0.02  # 波动率阈值
+    
+    def calculate_dynamic_multipliers(self, symbol: str, current_atr: float, price: float) -> Tuple[float, float]:
+        """计算动态的止损和止盈倍数"""
+        # 初始化历史记录
+        if symbol not in self.atr_history:
+            self.atr_history[symbol] = []
+        
+        # 添加当前ATR到历史记录
+        self.atr_history[symbol].append(current_atr)
+        
+        # 保持历史记录长度
+        if len(self.atr_history[symbol]) > 20:
+            self.atr_history[symbol].pop(0)
+        
+        # 计算ATR波动率
+        if len(self.atr_history[symbol]) > 5:
+            atr_std = np.std(self.atr_history[symbol])
+            atr_mean = np.mean(self.atr_history[symbol])
+            volatility_ratio = atr_std / atr_mean if atr_mean > 0 else 0
+            
+            # 根据波动率调整倍数
+            if volatility_ratio > self.volatility_threshold:
+                # 高波动率环境，使用较小的倍数以保护利润
+                sl_mult = max(1.5, Config.SL_ATR_MULT * 0.8)
+                tp_mult = max(2.0, Config.TP_ATR_MULT * 0.8)
+            else:
+                # 低波动率环境，使用较大的倍数以给价格更多空间
+                sl_mult = Config.SL_ATR_MULT * 1.2
+                tp_mult = Config.TP_ATR_MULT * 1.2
+        else:
+            # 历史数据不足，使用默认值
+            sl_mult = Config.SL_ATR_MULT
+            tp_mult = Config.TP_ATR_MULT
+        
+        return sl_mult, tp_mult
+
+# ================== 多周期信号生成器 ==================
+class MultiTimeframeSignalGenerator:
+    """多周期信号生成器"""
+    
+    def __init__(self, indicator_system):
+        self.indicator_system = indicator_system
+    
+    async def generate_signal(self, symbol: str, exchange: ExchangeInterface) -> Optional[TradeSignal]:
+        """生成多周期信号"""
+        try:
+            # 获取多时间框架数据
+            df_15m = await exchange.get_historical_data(symbol, Config.ENTRY_TIMEFRAME, Config.OHLCV_LIMIT)
+            df_1h = await exchange.get_historical_data(symbol, "1h", Config.OHLCV_LIMIT)
+            df_4h = await exchange.get_historical_data(symbol, Config.MACD_FILTER_TIMEFRAME, Config.OHLCV_LIMIT)
+            
+            if df_15m.empty or df_1h.empty or df_4h.empty:
+                return None
+            
+            # 计算指标
+            df_15m = self.indicator_system.compute_indicators(df_15m, symbol, Config.ENTRY_TIMEFRAME)
+            df_1h = self.indicator_system.compute_indicators(df_1h, symbol, "1h")
+            df_4h = self.indicator_system.compute_indicators(df_4h, symbol, Config.MACD_FILTER_TIMEFRAME)
+            
+            if df_15m.empty or df_1h.empty or df_4h.empty:
+                return None
+            
+            # 获取最新数据
+            current_15m = df_15m.iloc[-1]
+            current_1h = df_1h.iloc[-1]
+            current_4h = df_4h.iloc[-1]
+            
+            # 检查是否有NaN值
+            if (pd.isna(current_15m.get('volume_ma', 0)) or 
+                pd.isna(current_15m.get('volume', 0))):
+                return None
+            
+            # 动态成交量过滤
+            vol_threshold = current_15m.get('volume_ma', 0) * Config.VOLUME_FILTER_MULTIPLIER
+            if current_15m['volume'] < vol_threshold:
+                return None
+            
+            # 多周期信号逻辑
+            price = current_15m['close']
+            atr = current_15m['atr']
+            
+            # 1. 入场信号 (15分钟)
+            entry_bullish = all([
+                current_15m['macd'] > current_15m['macd_signal'],
+                current_15m['ema_12'] > current_15m['ema_26'],
+                40 < current_15m['rsi'] < 70
+            ])
+            
+            entry_bearish = all([
+                current_15m['macd'] < current_15m['macd_signal'],
+                current_15m['ema_12'] < current_15m['ema_26'],
+                30 < current_15m['rsi'] < 60
+            ])
+            
+            # 2. 趋势方向 (1小时和4小时)
+            trend_bullish = all([
+                current_1h['ema_12'] > current_1h['ema_26'],
+                current_4h['ema_12'] > current_4h['ema_26']
+            ])
+            
+            trend_bearish = all([
+                current_1h['ema_12'] < current_1h['ema_26'],
+                current_4h['ema_12'] < current_4h['ema_26']
+            ])
+            
+            # 3. 只有趋势和入场信号一致时才生成信号
+            if entry_bullish and trend_bullish:
+                return TradeSignal(
+                    symbol=symbol,
+                    side=OrderSide.BUY,
+                    price=price,
+                    atr=atr,
+                    quantity=0,
+                    timestamp=datetime.now(),
+                    timeframe=Config.ENTRY_TIMEFRAME
+                )
+            elif entry_bearish and trend_bearish:
+                return TradeSignal(
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    price=price,
+                    atr=atr,
+                    quantity=0,
+                    timestamp=datetime.now(),
+                    timeframe=Config.ENTRY_TIMEFRAME
+                )
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"多周期信号生成失败 {symbol}: {e}")
+            return None
 
 # ================== 指标系统 ==================
 class IndicatorSystem:
@@ -496,63 +796,13 @@ class IndicatorSystem:
         df['volume_ma'] = df['volume'].rolling(window=20).mean()
         df['volume_ratio'] = df['volume'] / df['volume_ma']
         
+        # Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(df['close'])
+        df['bb_upper'] = bollinger.bollinger_hband()
+        df['bb_lower'] = bollinger.bollinger_lband()
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_lower']
+        
         return df.dropna()
-    
-    def generate_signal(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame, symbol: str) -> Optional[TradeSignal]:
-        if df_1h.empty or df_4h.empty:
-            return None
-        
-        current_1h = df_1h.iloc[-1]
-        current_4h = df_4h.iloc[-1]
-        
-        # 检查是否有NaN值
-        if (pd.isna(current_1h.get('volume_ma', 0)) or 
-            pd.isna(current_1h.get('volume', 0))):
-            return None
-        
-        # 动态成交量过滤
-        vol_threshold = current_1h.get('volume_ma', 0) * Config.VOLUME_FILTER_MULTIPLIER
-        if current_1h['volume'] < vol_threshold:
-            return None
-        
-        # 信号逻辑
-        price = current_1h['close']
-        atr = current_1h['atr']
-        
-        bullish_conditions = all([
-            current_1h['macd'] > current_1h['macd_signal'],
-            current_1h['ema_12'] > current_1h['ema_26'],
-            40 < current_1h['rsi'] < 70,
-            current_4h['ema_12'] > current_4h['ema_26']
-        ])
-        
-        bearish_conditions = all([
-            current_1h['macd'] < current_1h['macd_signal'],
-            current_1h['ema_12'] < current_1h['ema_26'],
-            30 < current_1h['rsi'] < 60,
-            current_4h['ema_12'] < current_4h['ema_26']
-        ])
-        
-        if bullish_conditions:
-            return TradeSignal(
-                symbol=symbol,
-                side=OrderSide.BUY,
-                price=price,
-                atr=atr,
-                quantity=0,  # 将在执行时计算
-                timestamp=datetime.now()
-            )
-        elif bearish_conditions:
-            return TradeSignal(
-                symbol=symbol,
-                side=OrderSide.SELL,
-                price=price,
-                atr=atr,
-                quantity=0,
-                timestamp=datetime.now()
-            )
-        
-        return None
 
 # ================== 交易执行器 ==================
 class TradeExecutor:
@@ -561,6 +811,8 @@ class TradeExecutor:
     def __init__(self, exchange: ExchangeInterface, logger: AdvancedLogger):
         self.exchange = exchange
         self.logger = logger
+        self.dynamic_atr = DynamicATRCalculator()
+        self.consecutive_losses = 0  # 连续亏损次数
         # 定义最小交易量（根据币安期货规则）
         self.min_quantities = {
             'BTC/USDT': 0.001,
@@ -633,8 +885,9 @@ class TradeExecutor:
             if atr <= 0 or price <= 0:
                 return 0.0
             
-            # 账户风险资金
-            risk_amount = balance * Config.RISK_RATIO
+            # 账户风险资金（考虑连续亏损调整）
+            risk_adjustment = max(0.5, 1.0 - (self.consecutive_losses * 0.1))  # 每连续亏损一次减少10%风险
+            risk_amount = balance * Config.RISK_RATIO * risk_adjustment
             
             # 每份仓位的风险（假设止损距离 = ATR * SL倍数）
             risk_per_unit = atr * Config.SL_ATR_MULT
@@ -678,13 +931,19 @@ class TradeExecutor:
                 self.logger.error(f"{signal.symbol} 可用保证金不足，放弃下单")
                 return False, None
 
-            # 记录详细的调试信息，包括ATR和止盈止损价格
-            sl_price = signal.price - signal.atr * Config.SL_ATR_MULT if signal.side == OrderSide.BUY else signal.price + signal.atr * Config.SL_ATR_MULT
-            tp_price = signal.price + signal.atr * Config.TP_ATR_MULT if signal.side == OrderSide.BUY else signal.price - signal.atr * Config.TP_ATR_MULT
+            # 计算动态ATR倍数
+            sl_mult, tp_mult = self.dynamic_atr.calculate_dynamic_multipliers(
+                signal.symbol, signal.atr, signal.price
+            )
             
+            # 计算止损和止盈价格
+            sl_price = signal.price - signal.atr * sl_mult if signal.side == OrderSide.BUY else signal.price + signal.atr * sl_mult
+            tp_price = signal.price + signal.atr * tp_mult if signal.side == OrderSide.BUY else signal.price - signal.atr * tp_mult
+            
+            # 记录详细的调试信息，包括ATR和止盈止损价格
             self.logger.info(
                 f"[{signal.symbol}] 价格={signal.price:.2f}, ATR={signal.atr:.2f}, "
-                f"SL={sl_price:.2f}, TP={tp_price:.2f}, "
+                f"SL={sl_price:.2f}({sl_mult:.1f}×ATR), TP={tp_price:.2f}({tp_mult:.1f}×ATR), "
                 f"qty(raw→rules→cap)={raw_qty:.6f}→{qty_rules:.6f}→{qty_cap:.6f}, "
                 f"freeUSDT={free_usdt:.2f}, leverage={Config.LEVERAGE}"
             )
@@ -715,9 +974,9 @@ class TradeExecutor:
                 self.logger.error(f"订单执行失败 {signal.symbol}: {result.error}")
                 return False, None
 
-            # 设置止盈止损
-            tp_success = await self.place_tp_order(signal)
-            sl_success = await self.place_sl_order(signal)
+            # 设置止盈止损（使用动态倍数）
+            tp_success = await self.place_tp_order(signal, tp_price)
+            sl_success = await self.place_sl_order(signal, sl_price)
             
             if tp_success and sl_success:
                 self.logger.info(f"交易执行成功: {signal.symbol} {signal.side.value} 数量: {signal.quantity:.6f}")
@@ -729,6 +988,8 @@ class TradeExecutor:
                     "quantity": signal.quantity,
                     "price": signal.price,
                     "atr": signal.atr,
+                    "sl_mult": sl_mult,
+                    "tp_mult": tp_mult,
                     "order_id": result.order_id
                 })
                 
@@ -752,10 +1013,8 @@ class TradeExecutor:
             self.logger.error(f"执行信号失败 {signal.symbol}: {e}")
             return False, None
     
-    async def place_tp_order(self, signal: TradeSignal) -> bool:
+    async def place_tp_order(self, signal: TradeSignal, tp_price: float) -> bool:
         """完整的止盈单设置"""
-        tp_price = signal.price + signal.atr * Config.TP_ATR_MULT if signal.side == OrderSide.BUY else signal.price - signal.atr * Config.TP_ATR_MULT
-        
         # 精度处理
         tp_price = float(self.exchange.exchange.price_to_precision(signal.symbol, tp_price))
         
@@ -793,10 +1052,8 @@ class TradeExecutor:
         
         return False
     
-    async def place_sl_order(self, signal: TradeSignal) -> bool:
+    async def place_sl_order(self, signal: TradeSignal, sl_price: float) -> bool:
         """完整的止损单设置"""
-        sl_price = signal.price - signal.atr * Config.SL_ATR_MULT if signal.side == OrderSide.BUY else signal.price + signal.atr * Config.SL_ATR_MULT
-        
         # 精度处理
         sl_price = float(self.exchange.exchange.price_to_precision(signal.symbol, sl_price))
         
@@ -833,6 +1090,13 @@ class TradeExecutor:
                 await asyncio.sleep(Config.RETRY_DELAY)
         
         return False
+    
+    def update_consecutive_losses(self, is_loss: bool):
+        """更新连续亏损计数"""
+        if is_loss:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = max(0, self.consecutive_losses - 1)
 
 # ================== 增强的风险管理系统 ==================
 class EnhancedRiskManager:
@@ -846,14 +1110,20 @@ class EnhancedRiskManager:
         self.equity_high = 0
         self.daily_start_equity = 0
         self.daily_start_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        self.floating_pnl = 0  # 浮动盈亏
         
-    async def check_risk_limits(self, balance: float) -> bool:
+    async def check_risk_limits(self, balance: float, positions: List[Dict] = None) -> bool:
         """检查风险限制"""
-        # 检查最大回撤
-        if balance > self.equity_high:
-            self.equity_high = balance
+        # 计算浮动盈亏
+        if positions:
+            self.floating_pnl = await self.calculate_floating_pnl(positions)
         
-        drawdown = (self.equity_high - balance) / self.equity_high if self.equity_high > 0 else 0
+        # 检查最大回撤
+        total_equity = balance + self.floating_pnl
+        if total_equity > self.equity_high:
+            self.equity_high = total_equity
+        
+        drawdown = (self.equity_high - total_equity) / self.equity_high if self.equity_high > 0 else 0
         
         if drawdown > self.max_drawdown:
             self.max_drawdown = drawdown
@@ -864,24 +1134,38 @@ class EnhancedRiskManager:
             return False
         
         # 检查日亏损
-        daily_pnl = await self.calculate_daily_pnl(balance)
+        daily_pnl = await self.calculate_daily_pnl(total_equity)
         if daily_pnl < -Config.DAILY_LOSS_LIMIT * self.equity_high:
             self.logger.critical(f"超过日亏损限制: {daily_pnl:.2f}")
             self.alert_system.send_alert(f"超过日亏损限制: {daily_pnl:.2f}")
             return False
         
+        # 检查最大风险比
+        if self.floating_pnl < -Config.MAX_RISK_RATIO * total_equity:
+            self.logger.critical(f"超过最大风险比限制: {self.floating_pnl:.2f}")
+            self.alert_system.send_alert(f"超过最大风险比限制: {self.floating_pnl:.2f}")
+            return False
+        
         return True
     
-    async def calculate_daily_pnl(self, current_balance: float) -> float:
+    async def calculate_floating_pnl(self, positions: List[Dict]) -> float:
+        """计算浮动盈亏"""
+        floating_pnl = 0
+        for pos in positions:
+            if 'unrealizedPnl' in pos:
+                floating_pnl += float(pos['unrealizedPnl'])
+        return floating_pnl
+    
+    async def calculate_daily_pnl(self, current_equity: float) -> float:
         """计算当日盈亏"""
         # 如果是新的一天，重置起始权益
         now = datetime.now()
         if now.date() != self.daily_start_time.date():
-            self.daily_start_equity = current_balance
+            self.daily_start_equity = current_equity
             self.daily_start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
         # 计算当日盈亏
-        return current_balance - self.daily_start_equity
+        return current_equity - self.daily_start_equity
 
 # ================== 警报系统 ==================
 class AlertSystem:
@@ -908,13 +1192,42 @@ class AlertSystem:
                     self.logger.error(f"Telegram消息发送失败: {response.text}")
             except Exception as e:
                 self.logger.error(f"发送Telegram警报失败: {e}")
+    
+    def send_health_status(self, status: HealthStatus):
+        """发送健康状态"""
+        message = (
+            f"🤖 交易机器人健康状态报告:\n"
+            f"• 总交易对: {status.total_symbols}\n"
+            f"• 已连接: {status.connected_symbols}\n"
+            f"• 已断开: {status.disconnected_symbols}\n"
+            f"• 错误计数: {status.error_count}\n"
+            f"• 最后检查: {status.last_check.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        self.logger.info(message)
+        
+        # 发送到Telegram
+        if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+            try:
+                url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+                payload = {
+                    "chat_id": Config.TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
+                response = requests.post(url, json=payload, timeout=10)
+                if response.status_code != 200:
+                    self.logger.error(f"Telegram健康状态发送失败: {response.text}")
+            except Exception as e:
+                self.logger.error(f"发送Telegram健康状态失败: {e}")
 
 # ================== 状态管理器 ==================
 class StateManager:
     """增强的状态管理器"""
     
-    def __init__(self, logger: AdvancedLogger):
+    def __init__(self, logger: AdvancedLogger, db_manager: DatabaseManager):
         self.logger = logger
+        self.db_manager = db_manager
         self.state_file = "trading_state.json"
         self.state = {}
         self.last_save_time = 0
@@ -923,23 +1236,20 @@ class StateManager:
     def load_state(self):
         """加载状态"""
         try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
-                    self.state = json.load(f)
-                
-                # 恢复活跃持仓
-                if 'active_positions' in self.state:
-                    active_positions = {}
-                    for symbol, pos_data in self.state['active_positions'].items():
-                        try:
-                            active_positions[symbol] = TradeSignal.from_dict(pos_data)
-                        except Exception as e:
-                            self.logger.error(f"恢复持仓状态失败 {symbol}: {e}")
-                    self.state['active_positions'] = active_positions
-                
-                self.logger.info("状态已加载")
-            else:
-                self.logger.info("无保存状态，使用初始状态")
+            # 从数据库加载状态
+            self.state = self.db_manager.load_state('app_state', {})
+            
+            # 恢复活跃持仓
+            if 'active_positions' in self.state:
+                active_positions = {}
+                for symbol, pos_data in self.state['active_positions'].items():
+                    try:
+                        active_positions[symbol] = TradeSignal.from_dict(pos_data)
+                    except Exception as e:
+                        self.logger.error(f"恢复持仓状态失败 {symbol}: {e}")
+                self.state['active_positions'] = active_positions
+            
+            self.logger.info("状态已加载")
         except Exception as e:
             self.logger.error(f"加载状态失败: {e}")
             self.state = {}
@@ -952,12 +1262,6 @@ class StateManager:
                 return
                 
             try:
-                # 创建状态备份
-                if os.path.exists(self.state_file):
-                    backup_file = f"{self.state_file}.backup.{int(time.time())}"
-                    import shutil
-                    shutil.copy2(self.state_file, backup_file)
-                
                 # 创建要写入的副本，不修改原始状态
                 payload = dict(self.state)
                 if 'active_positions' in payload:
@@ -965,9 +1269,9 @@ class StateManager:
                     for k, v in payload['active_positions'].items():
                         serializable_positions[k] = v.to_dict() if isinstance(v, TradeSignal) else v
                     payload['active_positions'] = serializable_positions
-                    
-                with open(self.state_file, 'w') as f:
-                    json.dump(payload, f, indent=2, default=str)
+                
+                # 保存到数据库
+                self.db_manager.save_state('app_state', payload)
                     
                 self.last_save_time = current_time
                 self.logger.debug("状态已保存")
@@ -1064,11 +1368,17 @@ class EnhancedProductionTrader:
         self.websocket_handler = WebSocketDataHandler(self.exchange, self.logger, Config.SYMBOLS)
         self.risk_manager = EnhancedRiskManager(self.exchange, self.logger)
         self.error_handler = EnhancedErrorHandler(self.logger)
-        self.state_manager = StateManager(self.logger)
+        
+        # 数据库和状态管理
+        self.db_manager = DatabaseManager()
+        self.state_manager = StateManager(self.logger, self.db_manager)
+        
         self.active_positions: Dict[str, TradeSignal] = {}
         self.last_state_save = 0
         self.position_check_interval = 300  # 每5分钟检查一次持仓状态
         self.last_position_check = 0
+        self.last_health_check = 0
+        self.signal_generator = MultiTimeframeSignalGenerator(self.indicators)
 
         # 加载保存的状态
         self.state_manager.load_state()
@@ -1080,21 +1390,9 @@ class EnhancedProductionTrader:
         self.running = True
 
     async def process_symbol(self, symbol: str):
-        """处理单一交易对"""
+        """处理单一交易对 - 使用多周期信号"""
         try:
-            # 拉取数据
-            df_1h = await self.exchange.get_historical_data(symbol, "1h", Config.OHLCV_LIMIT)
-            df_4h = await self.exchange.get_historical_data(symbol, Config.MACD_FILTER_TIMEFRAME, Config.OHLCV_LIMIT)
-
-            if df_1h.empty or df_4h.empty:
-                return None
-
-            # 计算指标
-            df_1h = self.indicators.compute_indicators(df_1h, symbol, "1h")
-            df_4h = self.indicators.compute_indicators(df_4h, symbol, Config.MACD_FILTER_TIMEFRAME)
-
-            # 生成信号
-            signal_data = self.indicators.generate_signal(df_1h, df_4h, symbol)
+            signal_data = await self.signal_generator.generate_signal(symbol, self.exchange)
             
             # 记录信号生成日志
             if signal_data:
@@ -1143,6 +1441,26 @@ class EnhancedProductionTrader:
                     
         except Exception as e:
             self.error_handler.handle_error(e, "检查持仓状态")
+    
+    async def health_check(self):
+        """健康检查"""
+        current_time = time.time()
+        if current_time - self.last_health_check < Config.HEALTH_CHECK_INTERVAL:
+            return
+            
+        self.last_health_check = current_time
+        
+        # 获取健康状态
+        health_status = self.websocket_handler.get_health_status()
+        
+        # 记录健康状态
+        self.logger.info(
+            f"健康检查: {health_status.connected_symbols}/{health_status.total_symbols} "
+            f"连接正常, 错误计数: {health_status.error_count}"
+        )
+        
+        # 发送健康状态到Telegram
+        self.risk_manager.alert_system.send_health_status(health_status)
 
     async def run(self):
         """主循环"""
@@ -1158,13 +1476,19 @@ class EnhancedProductionTrader:
                 free_usdt = balance_info.free
                 self.logger.debug(f"账户余额: total={balance_info.total}, free={balance_info.free}, used={balance_info.used}")
 
+                # 获取持仓信息用于风险计算
+                positions = await self.exchange.fetch_positions()
+
                 # 检查风险限制
-                if not await self.risk_manager.check_risk_limits(balance_info.total):
+                if not await self.risk_manager.check_risk_limits(balance_info.total, positions):
                     self.logger.critical("风险限制触发，停止交易")
                     break
 
                 # 检查持仓状态
                 await self.check_positions()
+
+                # 健康检查
+                await self.health_check()
 
                 # 获取实时数据
                 symbol, data = await self.websocket_handler.get_next_data()
@@ -1219,43 +1543,6 @@ class EnhancedProductionTrader:
             except RuntimeError:
                 # 如果已经在另一个 loop 上下文，忽略即可
                 pass
-
-# ================== 贝叶斯优化模块 ==================
-class BayesianOptimizer:
-    """贝叶斯优化模块"""
-    
-    def __init__(self, logger: AdvancedLogger):
-        self.logger = logger
-        self.study = optuna.create_study(
-            direction="maximize",
-            storage=Config.OPTUNA_STORAGE,
-            load_if_exists=True
-        )
-    
-    def objective(self, trial):
-        """优化目标函数"""
-        # 定义超参数搜索空间
-        risk_ratio = trial.suggest_float("risk_ratio", 0.01, 0.1)
-        sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.5, 3.0)
-        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 4.0)
-        volume_filter = trial.suggest_float("volume_filter", 0.5, 1.5)
-        
-        # 这里应该使用历史数据进行回测，计算夏普比率等指标
-        # 简化版：随机生成一个性能指标
-        import random
-        sharpe_ratio = random.uniform(0.5, 2.0)
-        
-        return sharpe_ratio
-    
-    def optimize(self):
-        """执行优化"""
-        self.study.optimize(self.objective, n_trials=Config.OPTUNA_N_TRIALS)
-        
-        # 输出最佳参数
-        self.logger.info(f"最佳参数: {self.study.best_params}")
-        self.logger.info(f"最佳值: {self.study.best_value}")
-        
-        return self.study.best_params
 
 # ================== 启动入口 ==================
 if __name__ == "__main__":
