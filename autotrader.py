@@ -1,8 +1,6 @@
-# autotrader_enhanced_with_logging.py
+# autotrader_fixed_websocket.py
 """
-增强版生产级多币种量化交易机器人 - 修复版
-集成贝叶斯优化、WebSocket支持、高级风控和状态持久化
-添加了ATR和止盈止损信息的详细日志输出
+修复WebSocket导入问题的交易机器人版本
 """
 
 import os
@@ -27,10 +25,18 @@ import threading
 from queue import Queue
 import cachetools
 from abc import ABC, abstractmethod
-import optuna  # 贝叶斯优化
+import optuna
 import uuid
 import hashlib
-from websockets import connect, exceptions as ws_exceptions
+
+# 修复WebSocket导入问题
+try:
+    from websockets import connect
+    from websockets import exceptions as ws_exceptions
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+    print("警告: websockets 库未安装，WebSocket功能将不可用")
 
 # ================== 数据类型定义 ==================
 class OrderSide(Enum):
@@ -104,8 +110,8 @@ class Config:
     SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
     
     # 风险参数
-    RISK_RATIO = float(os.getenv("RISK_RATIO", "0.05"))  # 从 0.15 降到 0.05
-    LEVERAGE = int(os.getenv("LEVERAGE", "5"))  # 从 10 降到 5
+    RISK_RATIO = float(os.getenv("RISK_RATIO", "0.05"))
+    LEVERAGE = int(os.getenv("LEVERAGE", "5"))
     SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "2.0"))
     TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "3.0"))
     RISK_ATR_MULT = float(os.getenv("RISK_ATR_MULT", "1.5"))
@@ -136,11 +142,11 @@ class Config:
     ORDER_TIMEOUT = int(os.getenv("ORDER_TIMEOUT", "30"))
     
     # 新增配置
-    USE_WEBSOCKET = os.getenv("USE_WEBSOCKET", "true").lower() == "true"  # 默认启用WebSocket
+    USE_WEBSOCKET = os.getenv("USE_WEBSOCKET", "true").lower() == "true" and WEBSOCKETS_AVAILABLE
     BAYESIAN_OPTIMIZATION = os.getenv("BAYESIAN_OPTIMIZATION", "false").lower() == "true"
     CROSS_VALIDATION_FOLDS = int(os.getenv("CROSS_VALIDATION_FOLDS", "3"))
-    SLIPPAGE_RATIO = float(os.getenv("SLIPPAGE_RATIO", "0.0005"))  # 0.05%滑点
-    COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))  # 0.1%手续费
+    SLIPPAGE_RATIO = float(os.getenv("SLIPPAGE_RATIO", "0.0005"))
+    COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.001"))
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///optuna.db")
@@ -340,7 +346,7 @@ class BinanceExchange(ExchangeInterface):
 
 # ================== WebSocket数据处理器 ==================
 class WebSocketDataHandler:
-    """真正的WebSocket实时数据处理器"""
+    """WebSocket实时数据处理器"""
     
     def __init__(self, exchange: ExchangeInterface, logger: AdvancedLogger, symbols: List[str]):
         self.exchange = exchange
@@ -354,9 +360,11 @@ class WebSocketDataHandler:
     async def start(self):
         """启动WebSocket连接"""
         self.running = True
-        if Config.USE_WEBSOCKET:
+        if Config.USE_WEBSOCKET and WEBSOCKETS_AVAILABLE:
             await self._start_websocket()
         else:
+            if not WEBSOCKETS_AVAILABLE:
+                self.logger.warning("websockets库未安装，使用REST API轮询模式")
             await self._start_polling()
     
     async def _start_websocket(self):
@@ -1229,7 +1237,7 @@ class BayesianOptimizer:
         # 定义超参数搜索空间
         risk_ratio = trial.suggest_float("risk_ratio", 0.01, 0.1)
         sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.5, 3.0)
-        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 4.0)
+        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 4.0")
         volume_filter = trial.suggest_float("volume_filter", 0.5, 1.5)
         
         # 这里应该使用历史数据进行回测，计算夏普比率等指标
