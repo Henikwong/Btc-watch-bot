@@ -5,7 +5,7 @@ ta>=0.11.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 certifi>=2024.2.2
-python-telegram-bot==13.15
+python-telegram-bot==20.0
 openai==0.28.1
 tqdm>=4.66.1
 optuna>=3.6.1
@@ -13,4 +13,4 @@ backtesting>=0.3.3
 plotly>=5.21.0
 matplotlib>=3.8.0
 websockets>=11.0.3
-aiohttp>=3.8.5
+cachetools>=5.3.1
