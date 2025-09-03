@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gfortran \
     libblas-dev \
     liblapack-dev \
-    libatlas-base-dev \
     libfreetype6-dev \
     pkg-config \
     ca-certificates \
@@ -22,4 +21,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+# 启动你的交易脚本
+CMD ["python", "autotrader.py"]
