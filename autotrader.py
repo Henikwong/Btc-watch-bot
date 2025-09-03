@@ -1,4 +1,4 @@
- current_balance - self.daily_start_equity
+rent_balance - self.daily_start_equity
 
 # ================== 警报系统 ==================
 class AlertSystem:
