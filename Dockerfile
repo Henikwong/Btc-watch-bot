@@ -1,14 +1,16 @@
 FROM python:3.12-slim
 
-# 安装证书 & 基础工具
+# 安装系统依赖（编译 numpy/ta 等需要）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential gcc g++ gfortran libssl-dev libffi-dev libatlas-base-dev && \
-    update-ca-certificates && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# 创建非 root 用户
-RUN useradd -m botuser
-USER botuser
+    build-essential \
+    python3-dev \
+    gcc \
+    libffi-dev \
+    libfreetype6-dev \
+    pkg-config \
+    ca-certificates \
+    curl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
 WORKDIR /app
@@ -16,29 +18,12 @@ WORKDIR /app
 # 复制依赖文件
 COPY requirements.txt .
 
-# 安装依赖
+# 升级 pip 并安装 Python 依赖
+RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 删除编译工具，瘦身镜像
-USER root
-RUN apt-get purge -y build-essential gcc g++ gfortran libatlas-base-dev && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
+# 复制项目代码
+COPY . .
 
-# 切回非 root 用户
-USER botuser
-
-# 复制代码
-COPY --chown=botuser:botuser . .
-
-# 挂载配置和日志目录
-VOLUME /app/config
-VOLUME /app/logs
-
-# 设置环境变量 (避免输出缓冲)
-ENV PYTHONUNBUFFERED=1
-ENV APP_CONFIG=/app/config/config.yaml
-ENV LOG_DIR=/app/logs
-
-# 启动程序
-CMD ["python", "autotrader.py"]
+# 默认命令（可根据你的项目改）
+CMD ["python", "main.py"]
