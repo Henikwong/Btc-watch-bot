@@ -21,5 +21,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# 启动你的交易脚本
 CMD ["python", "autotrader.py"]
