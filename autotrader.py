@@ -1237,7 +1237,7 @@ class BayesianOptimizer:
         # 定义超参数搜索空间
         risk_ratio = trial.suggest_float("risk_ratio", 0.01, 0.1)
         sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.5, 3.0)
-        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 4.0")
+        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 4.0)
         volume_filter = trial.suggest_float("volume_filter", 0.5, 1.5)
         
         # 这里应该使用历史数据进行回测，计算夏普比率等指标
