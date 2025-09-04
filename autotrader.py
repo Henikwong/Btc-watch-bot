@@ -397,6 +397,24 @@ class TimedCache:
             return (datetime.now() - timestamp).total_seconds() < max_age_seconds
 
 # ================== 交易所接口 ==================
+# 装饰器，用于封装重试逻辑
+def retry_with_exponential_backoff(retries=3, delay=2, backoff=2):
+    """指数退避重试装饰器"""
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(retries):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == retries - 1:
+                        raise e
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+            return None
+        return wrapper
+    return decorator
+
 class ExchangeInterface(ABC):
     """交易所接口抽象类"""
     
@@ -449,27 +467,26 @@ class BinanceExchange(ExchangeInterface):
                     self.exchange.set_margin_mode(mode, sym, params={})
             except Exception as e:
                 self.logger.warning(f"设置杠杆/保证金模式失败 {sym}: {e}")
-    
+
+    @retry_with_exponential_backoff(retries=Config.MAX_RETRIES, delay=Config.RETRY_DELAY)
     async def get_historical_data(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         """异步获取历史数据"""
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                # 使用线程池执行同步IO操作
-                ohlcv = await asyncio.to_thread(
-                    self.exchange.fetch_ohlcv, symbol, timeframe, None, limit
-                )
-                
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('datetime', inplace=True)
-                return df
-                
-            except Exception as e:
-                if attempt == Config.MAX_RETRIES - 1:
-                    self.logger.error(f"获取历史数据失败 {symbol}: {e}")
-                    raise
-                await asyncio.sleep(Config.RETRY_DELAY * (attempt + 1))
+        try:
+            # 使用线程池执行同步IO操作
+            ohlcv = await asyncio.to_thread(
+                self.exchange.fetch_ohlcv, symbol, timeframe, None, limit
+            )
+            
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('datetime', inplace=True)
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"获取历史数据失败 {symbol}: {e}")
+            raise
     
+    @retry_with_exponential_backoff(retries=Config.MAX_RETRIES, delay=Config.RETRY_DELAY)
     async def create_order(self, symbol: str, order_type: str, side: str, amount: float, price: Optional[float] = None, params: Optional[Dict] = None) -> OrderResult:
         """异步创建订单"""
         try:
@@ -487,6 +504,7 @@ class BinanceExchange(ExchangeInterface):
             error_msg = str(e)
             return OrderResult(success=False, error=error_msg, symbol=symbol, side=OrderSide(side))
     
+    @retry_with_exponential_backoff(retries=Config.MAX_RETRIES, delay=Config.RETRY_DELAY)
     async def fetch_positions(self) -> List[Dict]:
         """异步获取持仓信息"""
         try:
@@ -495,6 +513,7 @@ class BinanceExchange(ExchangeInterface):
             self.logger.error(f"获取持仓失败: {e}")
             return []
     
+    @retry_with_exponential_backoff(retries=Config.MAX_RETRIES, delay=Config.RETRY_DELAY)
     async def fetch_balance(self) -> BalanceInfo:
         """异步获取余额信息"""
         try:
@@ -786,7 +805,7 @@ class MultiTimeframeSignalGenerator:
                     atr=atr,
                     quantity=0,
                     timestamp=datetime.now(),
-                    timeframe=Config.ENTRY_TIMEFRAME
+                    timeframe=Config.ENTRY_TIMEFRAMe
                 )
             
             return None
@@ -919,7 +938,7 @@ class TradeExecutor:
         capped = float(ex.amount_to_precision(symbol, capped))
         return max(0.0, capped)
     
-    def calculate_position_size(self, balance: float, price: float, atr: float) -> float:
+    def calculate_position_size(self, balance: float, price: float, atr: float, symbol: str) -> float:
         """
         根据账户余额、价格和ATR计算仓位大小
         - balance: 可用余额（USDT）
@@ -929,6 +948,9 @@ class TradeExecutor:
         try:
             if atr <= 0 or price <= 0:
                 return 0.0
+            
+            # 获取最小交易量
+            min_qty = self.min_quantities.get(symbol, 0.001)
             
             # 账户风险资金（考虑连续亏损调整）
             risk_adjustment = max(0.5, 1.0 - (self.consecutive_losses * 0.1))  # 每连续亏损一次减少10%风险
@@ -941,6 +963,9 @@ class TradeExecutor:
             
             # 理论仓位数量（币的数量）
             position_size = risk_amount / risk_per_unit
+            
+            # 确保不低于最小交易量
+            position_size = max(position_size, min_qty)
             
             # 考虑杠杆的最大允许仓位（超出余额会被强制缩小）
             max_notional = balance * Config.LEVERAGE
@@ -959,7 +984,7 @@ class TradeExecutor:
             free_usdt = balance_info.free
             
             # 计算理论仓位
-            raw_qty = self.calculate_position_size(free_usdt, signal.price, signal.atr)
+            raw_qty = self.calculate_position_size(free_usdt, signal.price, signal.atr, signal.symbol)
             if raw_qty <= 0:
                 self.logger.warning(f"仓位计算为0或负数: {signal.symbol}")
                 return False, None
@@ -1010,6 +1035,7 @@ class TradeExecutor:
                 self.logger.warning(f"{signal.symbol} 首次下单保证金不足，自动缩小 30% 再试")
                 signal.quantity = float(self.exchange.exchange.amount_to_precision(signal.symbol, signal.quantity * 0.7))
                 if signal.quantity <= 0:
+                    self.update_consecutive_losses(True)
                     return False, None
                 result = await self.exchange.create_order(
                     signal.symbol, 'market', signal.side.value, signal.quantity, None, order_params
@@ -1017,6 +1043,7 @@ class TradeExecutor:
 
             if not result.success:
                 self.logger.error(f"订单执行失败 {signal.symbol}: {result.error}")
+                self.update_consecutive_losses(True)
                 return False, None
 
             # 设置止盈止损（使用动态倍数）
@@ -1032,12 +1059,13 @@ class TradeExecutor:
                     "side": signal.side.value,
                     "quantity": signal.quantity,
                     "price": signal.price,
-                    "atr": signal.atr,
+                    "atr": atr,
                     "sl_mult": sl_mult,
                     "tp_mult": tp_mult,
                     "order_id": result.order_id
                 })
                 
+                self.update_consecutive_losses(False) # 交易成功，重置或减少连续亏损计数
                 return True, signal
             else:
                 self.logger.warning(f"止盈止损设置部分失败: {signal.symbol}")
@@ -1052,10 +1080,13 @@ class TradeExecutor:
                     self.logger.info(f"已撤销订单: {signal.symbol}")
                 except Exception as e:
                     self.logger.error(f"撤销订单失败: {e}")
+                
+                self.update_consecutive_losses(True) # 交易失败，增加连续亏损计数
                 return False, None
 
         except Exception as e:
             self.logger.error(f"执行信号失败 {signal.symbol}: {e}")
+            self.update_consecutive_losses(True) # 异常情况也视为亏损
             return False, None
     
     async def place_tp_order(self, signal: TradeSignal, tp_price: float) -> bool:
@@ -1073,14 +1104,30 @@ class TradeExecutor:
                     params['positionSide'] = 'LONG' if signal.side == OrderSide.BUY else 'SHORT'
                 
                 order_side = 'sell' if signal.side == OrderSide.BUY else 'buy'
-                result = await self.exchange.create_order(
-                    signal.symbol,
-                    'take_profit_market',
-                    order_side,
-                    signal.quantity,
-                    None,
-                    params
-                )
+                
+                # 尝试使用take_profit_market订单类型
+                try:
+                    result = await self.exchange.create_order(
+                        signal.symbol,
+                        'take_profit_market',
+                        order_side,
+                        signal.quantity,
+                        None,
+                        params
+                    )
+                except Exception:
+                    # 如果不支持take_profit_market，尝试使用限价单+条件
+                    self.logger.warning(f"take_profit_market订单类型不支持，尝试替代方案")
+                    params['type'] = 'LIMIT'
+                    params['timeInForce'] = 'GTC'
+                    result = await self.exchange.create_order(
+                        signal.symbol,
+                        'limit',
+                        order_side,
+                        signal.quantity,
+                        tp_price,
+                        params
+                    )
                 
                 if result.success:
                     self.logger.info(f"止盈单设置成功: {signal.symbol} @ {tp_price:.2f}")
@@ -1112,6 +1159,7 @@ class TradeExecutor:
                     params['positionSide'] = 'LONG' if signal.side == OrderSide.BUY else 'SHORT'
                 
                 order_side = 'sell' if signal.side == OrderSide.BUY else 'buy'
+                
                 result = await self.exchange.create_order(
                     signal.symbol,
                     'stop_market',
@@ -1178,9 +1226,9 @@ class EnhancedRiskManager:
             self.alert_system.send_alert(f"超过最大回撤限制: {drawdown:.2%}")
             return False
         
-        # 检查日亏损
+        # 检查日亏损 - 使用每日起始权益作为基准
         daily_pnl = await self.calculate_daily_pnl(total_equity)
-        if daily_pnl < -Config.DAILY_LOSS_LIMIT * self.equity_high:
+        if daily_pnl < -Config.DAILY_LOSS_LIMIT * self.daily_start_equity:
             self.logger.critical(f"超过日亏损限制: {daily_pnl:.2f}")
             self.alert_system.send_alert(f"超过日亏损限制: {daily_pnl:.2f}")
             return False
@@ -1280,24 +1328,25 @@ class StateManager:
         
     def load_state(self):
         """加载状态"""
-        try:
-            # 从数据库加载状态
-            self.state = self.db_manager.load_state('app_state', {})
-            
-            # 恢复活跃持仓
-            if 'active_positions' in self.state:
-                active_positions = {}
-                for symbol, pos_data in self.state['active_positions'].items():
-                    try:
-                        active_positions[symbol] = TradeSignal.from_dict(pos_data)
-                    except Exception as e:
-                        self.logger.error(f"恢复持仓状态失败 {symbol}: {e}")
-                self.state['active_positions'] = active_positions
-            
-            self.logger.info("状态已加载")
-        except Exception as e:
-            self.logger.error(f"加载状态失败: {e}")
-            self.state = {}
+        with self.lock:
+            try:
+                # 从数据库加载状态
+                self.state = self.db_manager.load_state('app_state', {})
+                
+                # 恢复活跃持仓
+                if 'active_positions' in self.state:
+                    active_positions = {}
+                    for symbol, pos_data in self.state['active_positions'].items():
+                        try:
+                            active_positions[symbol] = TradeSignal.from_dict(pos_data)
+                        except Exception as e:
+                            self.logger.error(f"恢复持仓状态失败 {symbol}: {e}")
+                    self.state['active_positions'] = active_positions
+                
+                self.logger.info("状态已加载")
+            except Exception as e:
+                self.logger.error(f"加载状态失败: {e}")
+                self.state = {}
     
     def save_state(self, force: bool = False):
         """保存状态"""
@@ -1398,7 +1447,7 @@ class EnhancedErrorHandler:
     
     def handle_general_error(self, error: Exception, context: str):
         """处理一般错误"""
-        self.logger.error(f"一般错误 {context}: {error}")
+        self.logger.error(f"一般错误 {context}: {e}")
 
 # ================== 主交易机器人 ==================
 class EnhancedProductionTrader:
@@ -1428,6 +1477,12 @@ class EnhancedProductionTrader:
         # 加载保存的状态
         self.state_manager.load_state()
         self.active_positions = self.state_manager.get_state('active_positions', {})
+        self.risk_manager.equity_high = self.state_manager.get_state('equity_high', 0)
+        self.executor.consecutive_losses = self.state_manager.get_state('consecutive_losses', 0)
+        
+        daily_start_time_str = self.state_manager.get_state('daily_start_time')
+        if daily_start_time_str:
+            self.risk_manager.daily_start_time = datetime.fromisoformat(daily_start_time_str)
 
         # 注册优雅退出
         signal.signal(signal.SIGINT, self.stop)
@@ -1448,6 +1503,42 @@ class EnhancedProductionTrader:
         except Exception as e:
             self.error_handler.handle_error(e, f"处理 {symbol}")
             return None
+    
+    async def close_all_positions(self):
+        """平仓所有持仓"""
+        self.logger.info("开始平仓所有持仓")
+        
+        try:
+            # 获取当前持仓
+            positions = await self.exchange.fetch_positions()
+            
+            for pos in positions:
+                if float(pos.get('contracts', 0)) > 0:
+                    symbol = pos['symbol']
+                    side = pos['side']
+                    size = float(pos['contracts'])
+                    
+                    # 创建平仓订单
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    order_params = {'reduceOnly': True}
+                    if Config.HEDGE_MODE:
+                        order_params['positionSide'] = 'LONG' if side == 'long' else 'SHORT'
+                    
+                    result = await self.exchange.create_order(
+                        symbol, 'market', close_side, size, None, order_params
+                    )
+                    
+                    if result.success:
+                        self.logger.info(f"平仓成功: {symbol} {side} {size}")
+                        # 从活跃持仓中移除
+                        if symbol in self.active_positions:
+                            del self.active_positions[symbol]
+                            self.state_manager.set_state('active_positions', self.active_positions)
+                    else:
+                        self.logger.error(f"平仓失败: {symbol} - {result.error}")
+                        
+        except Exception as e:
+            self.logger.error(f"平仓过程中发生错误: {e}")
 
     async def check_positions(self):
         """检查当前持仓状态"""
@@ -1465,10 +1556,10 @@ class EnhancedProductionTrader:
             # 修复: 正确解析持仓方向
             for pos in positions:
                 # 兼容 ccxt 常见字段：contracts(张数)、side('long'/'short')、entryPrice(开仓均价)
-                contracts = float(pos.get('contracts') or 0)
-                if contracts > 0:
+                contracts = float(pos.get('contracts', 0) or pos.get('info', {}).get('positionAmt', 0))
+                if contracts != 0:
                     symbol = pos.get('symbol')
-                    side_str = (pos.get('side') or '').lower()
+                    side_str = (pos.get('side') or 'long' if contracts > 0 else 'short').lower()
                     side = PositionSide.LONG if side_str == 'long' else PositionSide.SHORT
                     entry_price = float(pos.get('entryPrice') or 0)
                     exchange_positions[symbol] = {
@@ -1527,6 +1618,7 @@ class EnhancedProductionTrader:
                 # 检查风险限制
                 if not await self.risk_manager.check_risk_limits(balance_info.total, positions):
                     self.logger.critical("风险限制触发，停止交易")
+                    await self.close_all_positions()
                     break
 
                 # 检查持仓状态
@@ -1535,38 +1627,37 @@ class EnhancedProductionTrader:
                 # 健康检查
                 await self.health_check()
 
-                # 获取实时数据
-                symbol, data = await self.websocket_handler.get_next_data()
-
-                # 处理信号生成和交易执行
-                signal = await self.process_symbol(symbol)
-                
-                if signal:
-                    # 风控：限制最大持仓数
-                    if len(self.active_positions) >= Config.MAX_POSITIONS:
-                        self.logger.warning(f"持仓已满({Config.MAX_POSITIONS})，跳过 {signal.symbol}")
-                        continue
-
-                    # 如果已有同一方向持仓，跳过
-                    if signal.symbol in self.active_positions:
-                        existing_signal = self.active_positions[signal.symbol]
-                        if existing_signal.side == signal.side:
-                            self.logger.debug(f"{signal.symbol} 已有同方向持仓，跳过新信号")
+                # 处理所有交易对，而不仅仅是WebSocket触发的
+                for symbol in Config.SYMBOLS:
+                    # 处理信号生成和交易执行
+                    signal = await self.process_symbol(symbol)
+                    
+                    if signal:
+                        # 风控：限制最大持仓数
+                        if len(self.active_positions) >= Config.MAX_POSITIONS:
+                            self.logger.warning(f"持仓已满({Config.MAX_POSITIONS})，跳过 {signal.symbol}")
                             continue
 
-                    # 执行交易
-                    success, executed_sig = await self.executor.execute_signal(signal, free_usdt)
-                    if success and executed_sig:
-                        self.active_positions[signal.symbol] = executed_sig
-                        self.state_manager.set_state('active_positions', self.active_positions)
+                        # 如果已有同一方向持仓，跳过
+                        if signal.symbol in self.active_positions:
+                            existing_signal = self.active_positions[signal.symbol]
+                            if existing_signal.side == signal.side:
+                                self.logger.debug(f"{signal.symbol} 已有同方向持仓，跳过新信号")
+                                continue
 
+                        # 执行交易
+                        success, executed_sig = await self.executor.execute_signal(signal, free_usdt)
+                        if success and executed_sig:
+                            self.active_positions[signal.symbol] = executed_sig
+                            self.state_manager.set_state('active_positions', self.active_positions)
+                            
                 # 定期保存状态
                 current_time = time.time()
                 if current_time - self.last_state_save >= Config.STATE_SAVE_INTERVAL:
                     self.state_manager.save_state(force=True)
                     self.last_state_save = current_time
                 
-                await asyncio.sleep(1)  # 更短的等待时间，因为使用WebSocket
+                await asyncio.sleep(Config.POLL_INTERVAL)  # 使用配置的轮询间隔
 
             except Exception as e:
                 self.error_handler.handle_error(e, "主循环")
