@@ -138,7 +138,7 @@ class Config:
         self.atr_period = 14
         self.atr_multiplier = 1.5
         self.risk_per_trade = 2.0  # 每笔交易风险百分比
-        self.min_order_value = 10.0  # 最小订单价值(USDT)
+        self.min_order_value = 20.0  # 最小订单价值(USDT)
         self.db_path = "trading_bot.db"
         self.telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.environ.get('TELEGRAM_CHAT_ID')
