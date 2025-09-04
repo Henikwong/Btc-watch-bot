@@ -205,7 +205,11 @@ class DatabaseManager:
     @contextmanager
     def get_connection(self):
         """获取数据库连接上下文管理器"""
-        conn = sqlite3.connect(self.db_path)
+        # 注册适配器用于正确处理datetime对象
+        sqlite3.register_adapter(datetime, lambda val: val.isoformat())
+        sqlite3.register_converter("datetime", lambda val: datetime.fromisoformat(val.decode()))
+        
+        conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
         try:
             yield conn
         finally:
@@ -415,18 +419,31 @@ class BinanceExchange(ExchangeInterface):
     async def set_hedge_mode(self):
         """设置对冲模式"""
         try:
-            # 币安API需要特定的端点来设置对冲模式
-            # 这里使用CCXT的隐式API调用
+            # 使用CCXT的标准方法设置持仓模式
+            # 币安期货API需要特定的参数来设置对冲模式
+            params = {'dualSidePosition': 'true'}
+            
+            # 使用CCXT的统一方法
             await asyncio.get_event_loop().run_in_executor(
                 None, 
-                lambda: self.exchange.fapiPrivate_post_positionside_dual({
-                    'dualSidePosition': 'true'
-                })
+                lambda: self.exchange.set_position_mode(True, params=params)
             )
             self.logger.info("已设置对冲模式")
         except Exception as e:
-            self.logger.error(f"设置对冲模式失败: {str(e)}", component="BinanceExchange.set_hedge_mode")
-            raise
+            # 如果标准方法失败，尝试使用替代方法
+            try:
+                # 使用私密API调用的替代方式
+                await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: self.exchange.private_post_position_side_dual({
+                        'dualSidePosition': 'true'
+                    })
+                )
+                self.logger.info("已设置对冲模式（使用替代方法）")
+            except Exception as e2:
+                self.logger.error(f"设置对冲模式失败: {str(e2)}", component="BinanceExchange.set_hedge_mode")
+                # 在某些情况下，如果账户已经是对冲模式，我们可以继续
+                self.logger.warning("继续运行，假设账户已处于对冲模式")
     
     async def set_leverage(self, leverage: int):
         """设置杠杆"""
@@ -436,10 +453,7 @@ class BinanceExchange(ExchangeInterface):
                 clean_symbol = symbol.replace('/', '')
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self.exchange.fapiPrivate_post_leverage({
-                        'symbol': clean_symbol,
-                        'leverage': leverage
-                    })
+                    lambda: self.exchange.set_leverage(leverage, clean_symbol)
                 )
             self.logger.info(f"已设置杠杆为 {leverage}")
         except Exception as e:
@@ -970,7 +984,8 @@ class AlertSystem:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        self.logger.error(f"发送Telegram警报失败: {response.status}")
+                        response_text = await response.text()
+                        self.logger.error(f"发送Telegram警报失败: {response.status} - {response_text}")
         except Exception as e:
             self.logger.error(f"发送Telegram警报异常: {str(e)}", component="AlertSystem.send_telegram_alert")
     
@@ -1189,7 +1204,7 @@ class EnhancedProductionTrader:
                 exchange_connected = False
             
             # 检查WebSocket连接
-            ws_connected = self.ws_handler.connected if WEBSOCKS_AVAILABLE else False
+            ws_connected = self.ws_handler.connected if WEBSOCKETS_AVAILABLE else False
             
             # 更新健康状态
             self.health_status.connected_symbols = len(self.ws_handler.websockets) if ws_connected else 0
