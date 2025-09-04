@@ -639,7 +639,7 @@ class WebSocketDataHandler:
         self.logger.info("使用REST API轮询模式")
         while self.running:
             try:
-                for symbol in self.symbols:
+                for symbol in Config.SYMBOLS:
                     ohlcv = await self.exchange.get_historical_data(symbol, "1h", 1)
                     if not ohlcv.empty:
                         await self.data_queue.put((symbol, ohlcv.iloc[-1:]))
@@ -805,7 +805,7 @@ class MultiTimeframeSignalGenerator:
                     atr=atr,
                     quantity=0,
                     timestamp=datetime.now(),
-                    timeframe=Config.ENTRY_TIMEFRAMe
+                    timeframe=Config.ENTRY_TIMEFRAME
                 )
             
             return None
