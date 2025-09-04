@@ -24,6 +24,7 @@ import uuid
 import hashlib
 import sqlite3
 from contextlib import contextmanager
+import math
 
 # 修复WebSocket导入问题
 try:
@@ -108,6 +109,7 @@ class OrderResult:
     error: Optional[str] = None
     symbol: Optional[str] = None
     side: Optional[OrderSide] = None
+    amount_usdt: Optional[float] = None
 
 @dataclass
 class BalanceInfo:
@@ -138,7 +140,7 @@ class Config:
         self.atr_period = 14
         self.atr_multiplier = 1.5
         self.risk_per_trade = 2.0  # 每笔交易风险百分比
-        self.min_order_value = 20.0  # 最小订单价值(USDT)
+        self.min_order_value = 10.0  # 最小订单价值(USDT)
         self.db_path = "trading_bot.db"
         self.telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.environ.get('TELEGRAM_CHAT_ID')
@@ -177,7 +179,8 @@ class DatabaseManager:
                     status TEXT NOT NULL,
                     profit_loss REAL DEFAULT 0,
                     close_price REAL,
-                    close_time DATETIME
+                    close_time DATETIME,
+                    amount_usdt REAL NOT NULL DEFAULT 0
                 )
             ''')
             # 创建信号记录表
@@ -202,6 +205,24 @@ class DatabaseManager:
                     value TEXT NOT NULL
                 )
             ''')
+            # 创建仓位记录表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    amount_usdt REAL NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    closed BOOLEAN DEFAULT FALSE,
+                    close_price REAL,
+                    close_time DATETIME,
+                    pnl REAL DEFAULT 0
+                )
+            ''')
             conn.commit()
     
     @contextmanager
@@ -216,8 +237,8 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO trades (id, symbol, side, price, quantity, timestamp, order_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (id, symbol, side, price, quantity, timestamp, order_id, status, amount_usdt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_data['id'],
                 trade_data['symbol'],
@@ -226,7 +247,8 @@ class DatabaseManager:
                 trade_data['quantity'],
                 trade_data['timestamp'],
                 trade_data.get('order_id'),
-                trade_data['status']
+                trade_data['status'],
+                trade_data.get('amount_usdt', 0)
             ))
             conn.commit()
     
@@ -279,6 +301,34 @@ class DatabaseManager:
             cursor.execute('SELECT value FROM bot_state WHERE key = ?', (key,))
             result = cursor.fetchone()
             return result[0] if result else default
+    
+    def save_position(self, position_data: Dict):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO positions (id, symbol, side, entry_price, quantity, timestamp, amount_usdt, stop_loss, take_profit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                position_data['id'],
+                position_data['symbol'],
+                position_data['side'],
+                position_data['entry_price'],
+                position_data['quantity'],
+                position_data['timestamp'],
+                position_data['amount_usdt'],
+                position_data.get('stop_loss'),
+                position_data.get('take_profit')
+            ))
+            conn.commit()
+    
+    def update_position(self, position_id: str, updates: Dict):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            set_clause = ', '.join([f"{k} = ?" for k in updates.keys()])
+            values = list(updates.values())
+            values.append(position_id)
+            cursor.execute(f'UPDATE positions SET {set_clause} WHERE id = ?', values)
+            conn.commit()
 
 # ================== 日志系统 ==================
 class AdvancedLogger:
@@ -629,7 +679,7 @@ class DynamicATRCalculator:
         
         try:
             # 获取K线数据
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=200)  # 确保足够的数据计算ATR
             if len(ohlcv) < self.config.atr_period + 1:
                 self.logger.warning(f"数据不足，无法计算{symbol}的ATR")
                 return None
@@ -683,39 +733,18 @@ class MultiTimeframeSignalGenerator:
                 self.logger.warning(f"无法计算{symbol}的ATR，跳过信号生成")
                 return None
             
-            # 获取余额以计算仓位大小
-            balance = await self.exchange.fetch_balance()
-            if balance is None or balance.total <= 0:
-                self.logger.error("无法获取余额，跳过信号生成")
-                return None
-            
-            # 计算仓位大小 - 使用严格的仓位控制
-            risk_amount = balance.total * (self.config.risk_per_trade / 100.0)
-            position_size = risk_amount / (atr * self.config.atr_multiplier)
-            
-            # 确保最小订单价值
-            order_value = position_size * current_price
-            if order_value < self.config.min_order_value:
-                self.logger.info(f"订单价值{order_value:.2f}小于最小限制{self.config.min_order_value}，跳过{symbol}")
-                return None
-            
-            # 确保不超过最大仓位百分比
-            max_position_value = balance.total * (self.config.max_position_size_percent / 100.0)
-            if order_value > max_position_value:
-                position_size = max_position_value / current_price
-                self.logger.info(f"调整{symbol}的仓位大小以符合最大仓位限制")
-            
             # 简化信号生成逻辑 - 实际应根据策略生成
             # 这里使用随机信号作为示例
             import random
             side = OrderSide.BUY if random.random() > 0.5 else OrderSide.SELL
             
+            # 创建一个信号，但数量将在执行时根据风险管理计算
             signal = TradeSignal(
                 symbol=symbol,
                 side=side,
                 price=current_price,
                 atr=atr,
-                quantity=position_size,
+                quantity=0,  # 将在执行时计算
                 timestamp=datetime.now(),
                 confidence=0.7,  # 置信度
                 timeframe="1h"
@@ -772,24 +801,125 @@ class IndicatorSystem:
 # ================== 交易执行器 ==================
 class TradeExecutor:
     """优化的交易执行器"""
-    def __init__(self, exchange: ExchangeInterface, config: Config, db_manager: DatabaseManager):
+    def __init__(self, exchange: BinanceExchange, config: Config, db_manager: DatabaseManager):
         self.exchange = exchange
         self.config = config
         self.db_manager = db_manager
         self.open_orders = {}
         self.logger = AdvancedLogger("TradeExecutor", db_manager)
     
+    def calculate_position_size(self, symbol: str, risk_percent: Optional[float] = None) -> float:
+        """
+        根据最大仓位百分比计算合适的仓位大小
+        :param symbol: 交易对
+        :param risk_percent: 风险百分比，如果为None则使用配置的默认值
+        :return: 以USDT计算的仓位大小
+        """
+        try:
+            # 获取当前余额
+            balance = asyncio.run(self.exchange.fetch_balance())
+            if balance is None:
+                return self.config.min_order_value
+                
+            total_usdt = balance.total
+            
+            # 计算最大可用资金
+            risk_pct = risk_percent or self.config.max_position_size_percent
+            max_usdt = total_usdt * (risk_pct / 100.0)
+            
+            # 确保不低于最小订单价值
+            if max_usdt < self.config.min_order_value:
+                self.logger.warning(f"计算仓位大小 {max_usdt} 小于最小值 {self.config.min_order_value}")
+                return self.config.min_order_value
+                
+            return max_usdt
+            
+        except Exception as e:
+            self.logger.error(f"计算{symbol}仓位大小失败: {str(e)}")
+            return self.config.min_order_value  # 失败时返回最小订单价值
+
+    def place_order(self, symbol: str, side: str, amount_usdt: float, price: float = None) -> OrderResult:
+        """
+        下单函数，自动处理最小下单量、Hedge Mode 及仓位限制
+        :param symbol: 交易对
+        :param side: 'buy' 或 'sell'
+        :param amount_usdt: 用USDT计算的下单金额
+        :param price: 限价单价格，如果为None则下市价单
+        :return: OrderResult对象
+        """
+        try:
+            # 保证最小订单价值
+            if amount_usdt < self.config.min_order_value:
+                self.logger.warning(f"{symbol} 订单金额 {amount_usdt} 小于最小值 {self.config.min_order_value}，已调整")
+                amount_usdt = self.config.min_order_value
+
+            # 获取交易对信息
+            market = asyncio.run(self.exchange.exchange.load_markets())
+            market_info = market[symbol]
+            min_amount = market_info['limits']['amount']['min']
+            
+            # 获取当前价格
+            if price is None:
+                ticker = asyncio.run(self.exchange.fetch_ticker(symbol))
+                price = ticker['last']
+                
+            # 计算数量
+            amount = amount_usdt / price
+            
+            # 保证数量不小于交易所最小下单量
+            if amount < min_amount:
+                self.logger.warning(f"{symbol} 计算数量 {amount} 小于最小数量 {min_amount}，已调整")
+                amount = min_amount
+                
+            # 确保精度符合交易所要求
+            amount = self.exchange.exchange.amount_to_precision(symbol, amount)
+
+            # Hedge Mode 处理
+            params = {}
+            if self.config.hedge_mode:
+                # LONG / SHORT 根据 side 自动选择
+                position_side = "LONG" if side.lower() == "buy" else "SHORT"
+                params['positionSide'] = position_side
+
+            # 下单
+            order = asyncio.run(self.exchange.create_order(
+                symbol=symbol,
+                order_type='market' if price is None else 'limit',
+                side=side.lower(),
+                amount=float(amount),
+                price=self.exchange.exchange.price_to_precision(symbol, price) if price else None,
+                params=params
+            ))
+            
+            self.logger.info(f"{symbol} {side} 下单成功: {order['id']}, 数量: {amount}, 金额: {amount_usdt} USDT")
+            return OrderResult(
+                success=True,
+                order_id=order['id'],
+                symbol=symbol,
+                side=OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL,
+                amount_usdt=amount_usdt
+            )
+
+        except ccxt.InsufficientFunds as e:
+            error_msg = f"{symbol} 下单失败: 资金不足"
+            self.logger.error(error_msg)
+            return OrderResult(success=False, error=error_msg, symbol=symbol)
+            
+        except ccxt.BaseError as e:
+            error_msg = f"{symbol} 下单失败: {str(e)}"
+            self.logger.error(error_msg)
+            return OrderResult(success=False, error=error_msg, symbol=symbol)
+            
+        except Exception as e:
+            error_msg = f"{symbol} 下单失败: {str(e)}"
+            self.logger.error(error_msg)
+            return OrderResult(success=False, error=error_msg, symbol=symbol)
+
     async def execute_signal(self, signal: TradeSignal) -> OrderResult:
         # 检查信号有效性
-        if signal.quantity <= 0 or signal.price <= 0:
-            self.logger.error(f"无效的信号参数: 数量={signal.quantity}, 价格={signal.price}")
+        if signal.price <= 0:
+            self.logger.error(f"无效的信号参数: 价格={signal.price}")
             return OrderResult(success=False, error="无效的信号参数")
-        
-        # 检查最小订单价值
-        order_value = signal.quantity * signal.price
-        if order_value < self.config.min_order_value:
-            self.logger.info(f"订单价值{order_value:.2f}小于最小限制{self.config.min_order_value}，跳过执行")
-            return OrderResult(success=False, error="订单价值太小")
         
         # 保存信号到数据库
         signal_id = str(uuid.uuid4())
@@ -817,16 +947,20 @@ class TradeExecutor:
         except Exception as e:
             self.logger.error(f"获取{signal.symbol}持仓失败: {e}")
         
+        # 使用风险管理计算仓位大小
+        amount_usdt = self.calculate_position_size(signal.symbol, self.config.risk_per_trade)
+        
         # 执行订单
-        try:
-            order_type = "market"  # 使用市价单
-            order = await self.exchange.create_order(
-                symbol=signal.symbol,
-                order_type=order_type,
-                side=signal.side.value,
-                amount=signal.quantity,
-                price=None  # 市价单不需要价格
-            )
+        result = self.place_order(
+            symbol=signal.symbol,
+            side=signal.side.value,
+            amount_usdt=amount_usdt,
+            price=None  # 市价单
+        )
+        
+        if result.success:
+            # 计算实际数量
+            actual_quantity = amount_usdt / signal.price
             
             # 保存交易记录
             trade_id = str(uuid.uuid4())
@@ -835,34 +969,59 @@ class TradeExecutor:
                 'symbol': signal.symbol,
                 'side': signal.side.value,
                 'price': signal.price,
-                'quantity': signal.quantity,
+                'quantity': actual_quantity,
                 'timestamp': datetime.now().isoformat(),
-                'order_id': order['id'],
-                'status': 'open'
+                'order_id': result.order_id,
+                'status': 'open',
+                'amount_usdt': amount_usdt
             }
             self.db_manager.save_trade(trade_data)
+            
+            # 保存仓位记录
+            position_id = str(uuid.uuid4())
+            position_data = {
+                'id': position_id,
+                'symbol': signal.symbol,
+                'side': signal.side.value,
+                'entry_price': signal.price,
+                'quantity': actual_quantity,
+                'timestamp': datetime.now().isoformat(),
+                'amount_usdt': amount_usdt,
+                'stop_loss': signal.price - (signal.atr * self.config.atr_multiplier) if signal.side == OrderSide.BUY else signal.price + (signal.atr * self.config.atr_multiplier),
+                'take_profit': signal.price + (signal.atr * self.config.atr_multiplier * 2) if signal.side == OrderSide.BUY else signal.price - (signal.atr * self.config.atr_multiplier * 2)
+            }
+            self.db_manager.save_position(position_data)
             
             # 标记信号已执行
             self.db_manager.mark_signal_executed(signal_id)
             
-            self.logger.info(f"已执行{signal.symbol} {signal.side.value}订单，数量: {signal.quantity:.6f}")
-            return OrderResult(success=True, order_id=order['id'], symbol=signal.symbol, side=signal.side)
-        except Exception as e:
-            self.logger.error(f"执行{signal.symbol}订单失败: {e}")
-            return OrderResult(success=False, error=str(e), symbol=signal.symbol, side=signal.side)
+            self.logger.info(f"已执行{signal.symbol} {signal.side.value}订单，数量: {actual_quantity:.6f}, 金额: {amount_usdt:.2f} USDT")
+        else:
+            self.logger.error(f"执行{signal.symbol}订单失败: {result.error}")
+            
+        return result
     
     async def close_position(self, symbol: str, side: OrderSide, quantity: float) -> OrderResult:
         try:
             close_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
-            order = await self.exchange.create_order(
+            # 获取当前价格
+            ticker = await self.exchange.fetch_ticker(symbol)
+            price = ticker['last']
+            amount_usdt = quantity * price
+            
+            result = self.place_order(
                 symbol=symbol,
-                order_type="market",
                 side=close_side.value,
-                amount=quantity
+                amount_usdt=amount_usdt,
+                price=None
             )
             
-            self.logger.info(f"已平仓{symbol}，数量: {quantity:.6f}")
-            return OrderResult(success=True, order_id=order['id'], symbol=symbol, side=close_side)
+            if result.success:
+                self.logger.info(f"已平仓{symbol}，数量: {quantity:.6f}, 金额: {amount_usdt:.2f} USDT")
+            else:
+                self.logger.error(f"平仓{symbol}失败: {result.error}")
+                
+            return result
         except Exception as e:
             self.logger.error(f"平仓{symbol}失败: {e}")
             return OrderResult(success=False, error=str(e), symbol=symbol)
@@ -1006,14 +1165,14 @@ class AlertSystem:
             self.logger.error(f"发送Telegram警报失败: {e}")
             return False
     
-    async def send_trade_alert(self, signal: TradeSignal, executed: bool = False):
+    async def send_trade_alert(self, signal: TradeSignal, executed: bool = False, amount_usdt: float = 0):
         """发送交易警报"""
         status = "已执行" if executed else "生成"
         message = f"<b>交易信号{status}</b>\n" \
                  f"品种: {signal.symbol}\n" \
                  f"方向: {signal.side.value}\n" \
                  f"价格: ${signal.price:.4f}\n" \
-                 f"数量: {signal.quantity:.6f}\n" \
+                 f"金额: ${amount_usdt:.2f} USDT\n" \
                  f"时间: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
         
         await self.send_telegram_alert(message)
@@ -1214,16 +1373,19 @@ class EnhancedProductionTrader:
                     self.logger.info(f"{symbol}风险检查未通过，跳过执行")
                     continue
                 
+                # 计算仓位大小
+                amount_usdt = self.trade_executor.calculate_position_size(symbol, self.config.risk_per_trade)
+                
                 # 发送信号警报
-                await self.alert_system.send_trade_alert(signal, executed=False)
+                await self.alert_system.send_trade_alert(signal, executed=False, amount_usdt=amount_usdt)
                 
                 # 执行信号
                 result = await self.trade_executor.execute_signal(signal)
                 
                 if result.success:
-                    self.logger.info(f"成功执行{signal.symbol} {signal.side.value}订单")
+                    self.logger.info(f"成功执行{signal.symbol} {signal.side.value}订单，金额: {result.amount_usdt:.2f} USDT")
                     # 发送执行警报
-                    await self.alert_system.send_trade_alert(signal, executed=True)
+                    await self.alert_system.send_trade_alert(signal, executed=True, amount_usdt=result.amount_usdt)
                 else:
                     self.logger.error(f"执行{signal.symbol}订单失败: {result.error}")
                     
