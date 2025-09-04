@@ -1,5 +1,3 @@
-
-# enhanced_trading_bot.py
 """
 综合改进版交易机器人
 包含WebSocket健壮性、动态ATR、多周期共振和部署优化
@@ -41,6 +39,25 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
     print("警告: websockets 库未安装，WebSocket功能将不可用")
+
+# ================== 日志配置 - 修复Railway日志级别识别问题 ==================
+# 清除任何现有的日志处理器
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# 配置根日志记录器
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+# 禁用过于详细的库日志
+logging.getLogger("ccxt").setLevel(logging.INFO)
+logging.getLogger("websockets").setLevel(logging.INFO)
+logging.getLogger("asyncio").setLevel(logging.INFO)
 
 # ================== 数据类型定义 ==================
 class OrderSide(Enum):
@@ -288,17 +305,20 @@ class AdvancedLogger:
     
     def setup_logging(self):
         """配置日志"""
-        log_level = logging.DEBUG if Config.MODE == Mode.BACKTEST else logging.INFO
-        
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(f'trading_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-                logging.StreamHandler()
-            ]
-        )
+        # 使用全局配置的日志系统，不再重复配置
         self.logger = logging.getLogger(__name__)
+        
+        # 根据模式设置日志级别
+        log_level = logging.DEBUG if Config.MODE == Mode.BACKTEST else logging.INFO
+        self.logger.setLevel(log_level)
+        
+        # 在生产环境中添加文件处理器
+        if Config.MODE != Mode.BACKTEST:
+            log_file = f'trading_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            file_handler.setLevel(log_level)
+            self.logger.addHandler(file_handler)
     
     def debug(self, message: str):
         self.logger.debug(message)
