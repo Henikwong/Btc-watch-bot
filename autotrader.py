@@ -1,8 +1,3 @@
-"""
-综合改进版交易机器人
-包含WebSocket健壮性、动态ATR、多周期共振和部署优化
-"""
-
 import os
 import time
 import ccxt
@@ -25,7 +20,6 @@ import threading
 from queue import Queue
 import cachetools
 from abc import ABC, abstractmethod
-import optuna
 import uuid
 import hashlib
 import sqlite3
@@ -40,18 +34,49 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
     print("警告: websockets 库未安装，WebSocket功能将不可用")
 
-# ================== 日志配置 - 修复Railway日志级别识别问题 ==================
+# ================== 环境检测 ==================
+IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
+
+# ================== Railway优化的日志配置 ==================
 # 清除任何现有的日志处理器
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
+# Railway特定的日志格式化器
+class RailwayLogFormatter(logging.Formatter):
+    LEVEL_MAP = {
+        logging.DEBUG: 'DEBUG',
+        logging.INFO: 'INFO',
+        logging.WARNING: 'WARNING',
+        logging.ERROR: 'ERROR',
+        logging.CRITICAL: 'CRITICAL'
+    }
+    
+    def format(self, record):
+        # 确保levelname被正确映射
+        if record.levelno in self.LEVEL_MAP:
+            record.levelname = self.LEVEL_MAP[record.levelno]
+        
+        # 在Railway环境中使用简化格式
+        if IS_RAILWAY:
+            return f"{record.levelname} - {record.name} - {record.getMessage()}"
+        
+        # 本地开发使用详细格式
+        return super().format(record)
+
+# 配置根日志记录器
+log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+log_level = logging.INFO
+
+# 创建处理器
+handler = logging.StreamHandler(sys.stdout)
+formatter = RailwayLogFormatter(log_format)
+handler.setFormatter(formatter)
+
 # 配置根日志记录器
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    level=log_level,
+    handlers=[handler]
 )
 
 # 禁用过于详细的库日志
@@ -313,7 +338,7 @@ class AdvancedLogger:
         self.logger.setLevel(log_level)
         
         # 在生产环境中添加文件处理器
-        if Config.MODE != Mode.BACKTEST:
+        if Config.MODE != Mode.BACKTEST and not IS_RAILWAY:
             log_file = f'trading_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
             file_handler = logging.FileHandler(log_file)
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -1571,3 +1596,6 @@ if __name__ == "__main__":
         asyncio.run(trader.run())
     except KeyboardInterrupt:
         trader.stop()
+    except Exception as e:
+        logging.critical(f"未处理的异常: {e}")
+        sys.exit(1)
