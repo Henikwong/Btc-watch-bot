@@ -182,20 +182,33 @@ class HedgeMartingaleBot:
         self.martingale = MartingaleManager()
         self.running = True
 
-    async def run(self):
-        if not self.api.initialize():
-            return
-        logger.info("🚀 开始自动交易...")
-        while self.running:
-            balance = self.api.get_balance()
-            for symbol in SYMBOLS:
-                await self.process_symbol(symbol, balance)
-            await asyncio.sleep(POLL_INTERVAL)
-
     async def process_symbol(self, symbol, balance):
         df = self.api.get_ohlcv_data(symbol,TIMEFRAME)
         if df is None or df.empty:
             return
         ind = self.analyzer.calculate_indicators(df)
         signal = self.analyzer.generate_signal(symbol, ind)
-        if signal    asyncio.run(main())
+        if not signal:
+            return
+
+        # 下单逻辑
+        size = self.martingale.calculate_size(balance, ind['atr'], symbol)
+        if signal.type == SignalType.BUY:
+            self.api.execute_market_order(symbol, 'buy', size, 'LONG')
+            self.martingale.add_position(symbol, 'buy', size, signal.price)
+            self.martingale.last_layer_time[symbol] = datetime.now()
+        elif signal.type == SignalType.SELL:
+            self.api.execute_market_order(symbol, 'sell', size, 'SHORT')
+            self.martingale.add_position(symbol, 'sell', size, signal.price)
+            self.martingale.last_layer_time[symbol] = datetime.now()
+
+# ================== 启动入口 ==================
+async def main():
+    bot = HedgeMartingaleBot()
+    await bot.run()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 手动停止")
