@@ -858,6 +858,11 @@ class TradeExecutor:
         self.logger = logger
         self.dynamic_atr = DynamicATRCalculator()
         self.consecutive_losses = 0  # 连续亏损次数
+        self.daily_loss = 0.0  # 当日亏损
+        self.weekly_loss = 0.0  # 本周亏损
+        self.daily_loss_limit = 0.05  # 日亏损限制 5%
+        self.weekly_loss_limit = 0.15  # 周亏损限制 15%
+        
         # 定义最小交易量（根据币安期货规则）
         self.min_quantities = {
             'BTC/USDT': 0.001,
@@ -871,6 +876,40 @@ class TradeExecutor:
             'ADA/USDT': 10,
             'LINK/USDT': 0.1,
         }
+        
+        # 最小订单价值（USDT）
+        self.min_order_value = 5.0  # 币安期货最小订单价值
+
+    def _can_open_trade(self, symbol: str, signal: Optional[TradeSignal], position_size: float, current_price: float) -> bool:
+        """交易前检查是否满足所有条件"""
+        # 1. 信号过滤
+        if not signal:
+            self.logger.info(f"⏸ {symbol} 无交易信号（指标未触发）")
+            return False
+
+        # 2. 仓位不足
+        if position_size <= 0:
+            self.logger.warning(f"⚠️ {symbol} 仓位计算为0，资金不足或风控限制")
+            return False
+
+        # 3. 订单金额小于交易所要求
+        order_value = position_size * current_price
+        if order_value < self.min_order_value:
+            self.logger.warning(f"⚠️ {symbol} 下单金额 {order_value:.2f} < 最小订单 {self.min_order_value}")
+            return False
+
+        # 4. 风控：超过日/周亏损限制
+        if self.daily_loss >= self.daily_loss_limit:
+            self.logger.warning(f"🛑 {symbol} 今日亏损 {self.daily_loss:.2%} ≥ 限制 {self.daily_loss_limit:.2%}")
+            return False
+
+        if self.weekly_loss >= self.weekly_loss_limit:
+            self.logger.warning(f"🛑 {symbol} 本周亏损 {self.weekly_loss:.2%} ≥ 限制 {self.weekly_loss_limit:.2%}")
+            return False
+
+        # 如果都通过 → 可以下单
+        self.logger.info(f"✅ {symbol} 符合条件，准备下单: {signal.side.value}, 仓位: {position_size:.6f}, 价值: {order_value:.2f} USDT")
+        return True
 
     def _apply_exchange_filters(self, symbol: str, qty: float, price: float) -> float:
         """应用交易所规则修正数量"""
@@ -960,6 +999,11 @@ class TradeExecutor:
             
             # 计算理论仓位
             raw_qty = self.calculate_position_size(free_usdt, signal.price, signal.atr)
+            
+            # 交易前检查
+            if not self._can_open_trade(signal.symbol, signal, raw_qty, signal.price):
+                return False, None
+                
             if raw_qty <= 0:
                 self.logger.warning(f"仓位计算为0或负数: {signal.symbol}")
                 return False, None
