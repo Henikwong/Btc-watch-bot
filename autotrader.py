@@ -26,58 +26,11 @@ import sqlite3
 from contextlib import contextmanager
 import math
 
-# ================== 修复WebSocket导入问题 ==================
-try:
-    from websockets import connect
-    from websockets import exceptions as ws_exceptions
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
-    print("警告: websockets 库未安装，WebSocket功能将不可用")
-
-# ================== 环境检测 ==================
-IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
-IS_DOCKER = os.path.exists('/.dockerenv')
-
-# ================== Railway优化的日志配置 ==================
-# 清除任何现有的日志处理器
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
-
-# Railway特定的日志格式化器
-class RailwayLogFormatter(logging.Formatter):
-    def format(self, record):
-        # 简化日志格式以适应云环境
-        if IS_RAILWAY or IS_DOCKER:
-            return f"{record.levelname}: {record.getMessage()}"
-        return super().format(record)
-
-# 配置根日志记录器
-log_level = logging.INFO
-log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s' if not IS_RAILWAY else '%(levelname)s: %(message)s'
-
-handler = logging.StreamHandler(sys.stdout)
-formatter = RailwayLogFormatter(log_format)
-handler.setFormatter(formatter)
-
-logging.basicConfig(
-    level=log_level,
-    handlers=[handler],
-    format=log_format if not IS_RAILWAY else None
-)
-
-# 禁用过于详细的库日志
-logging.getLogger("ccxt").setLevel(logging.WARNING)
-if WEBSOCKETS_AVAILABLE:
-    logging.getLogger("websockets").setLevel(logging.WARNING)
-logging.getLogger("asyncio").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-
 # ================== 配置参数 ==================
 # 双开马丁策略参数
 MAX_MARTINGALE_LAYERS = int(os.getenv("MAX_MARTINGALE_LAYERS", "3"))
 MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE_MULTIPLIER", "2.0"))
-MARTINGALE_TRIGGER_LOSS = float(os.getenv("MARTINGALE_TRIGGER_LOSS", "0.05"))  # 新增：马丁触发比例
+MARTINGALE_TRIGGER_LOSS = float(os.getenv("MARTINGALE_TRIGGER_LOSS", "0.05"))
 INITIAL_RISK_PERCENT = float(os.getenv("INITIAL_RISK_PERCENT", "0.01"))
 MAX_NOTIONAL_PER_SYMBOL = float(os.getenv("MAX_NOTIONAL_PER_SYMBOL", "500"))
 DUAL_OPEN_ENABLED = os.getenv("DUAL_OPEN_ENABLED", "true").lower() == "true"
@@ -90,10 +43,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TESTNET = os.getenv("TESTNET", "true").lower() == "true"
 
+# 交易所初始化重试配置
+EXCHANGE_INIT_RETRIES = int(os.getenv("EXCHANGE_INIT_RETRIES", "5"))
+EXCHANGE_INIT_RETRY_DELAY = int(os.getenv("EXCHANGE_INIT_RETRY_DELAY", "3"))
+
 # 交易参数
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")]
 TIMEFRAMES = ["1h", "4h"]
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # 默认5分钟
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))
 
 # 风险管理参数
 MAX_DRAWDOWN_PERCENT = float(os.getenv("MAX_DRAWDOWN_PERCENT", "10.0"))
@@ -169,212 +126,263 @@ class MartingaleLayer:
     stop_loss: float
     take_profit: float
 
-# ================== 交易所接口实现 ==================
+@dataclass
+class DualMartingaleStatus:
+    symbol: str
+    long_layers: int
+    short_layers: int
+    long_exposure: float
+    short_exposure: float
+    long_avg_price: float
+    short_avg_price: float
+    net_exposure: float
+
+# ================== 交易所接口实现（带重试机制） ==================
 class BinanceExchange:
-    """币安交易所实现（优化版）"""
+    """币安交易所实现（带重试机制的优化版）"""
     
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
         self.exchange = None
-        self.logger = logging.getLogger("BinanceExchange")
-        self.rate_limiter = asyncio.Semaphore(10)  # 限制并发请求
+        self.initialized = False
+        self.logger = logging.getLogger(__name__)
+    
+    def initialize_with_retry(self, max_retries: int = EXCHANGE_INIT_RETRIES, 
+                             retry_delay: int = EXCHANGE_INIT_RETRY_DELAY) -> bool:
+        """带重试机制的交易所初始化"""
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(f"尝试初始化交易所 (第 {attempt} 次尝试，最多 {max_retries} 次)")
+                
+                # 创建交易所实例
+                exchange = ccxt.binance({
+                    'apiKey': self.api_key,
+                    'secret': self.api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'future',
+                        'adjustForTimeDifference': True,
+                    }
+                })
+                
+                # 设置测试网模式
+                if self.testnet:
+                    exchange.set_sandbox_mode(True)
+                    self.logger.info("币安测试网模式已启用")
+                else:
+                    self.logger.info("币安主网模式已启用")
+                
+                # 测试连接
+                exchange.load_markets()
+                self.logger.info(f"成功连接到交易所，加载了 {len(exchange.markets)} 个交易对")
+                
+                self.exchange = exchange
+                self.initialized = True
+                return True
+                
+            except ccxt.NetworkError as e:
+                self.logger.warning(f"网络错误 (尝试 {attempt}/{max_retries}): {str(e)}")
+                if attempt < max_retries:
+                    self.logger.info(f"{retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
+                else:
+                    self.logger.error(f"交易所初始化失败，已达到最大重试次数: {str(e)}")
+                    return False
+                    
+            except ccxt.ExchangeError as e:
+                self.logger.error(f"交易所错误 (尝试 {attempt}/{max_retries}): {str(e)}")
+                # 交易所逻辑错误，不需要重试
+                return False
+                
+            except Exception as e:
+                self.logger.error(f"未知错误 (尝试 {attempt}/{max_retries}): {str(e)}")
+                if attempt < max_retries:
+                    self.logger.info(f"{retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
+                else:
+                    self.logger.error(f"交易所初始化失败，已达到最大重试次数: {str(e)}")
+                    return False
         
-    async def initialize(self):
-        """初始化交易所连接"""
+        return False
+
+    def is_initialized(self) -> bool:
+        return self.initialized and self.exchange is not None
+
+    def get_balance(self) -> BalanceInfo:
+        if not self.is_initialized():
+            raise Exception("交易所未初始化")
         try:
-            exchange_class = getattr(ccxt, 'binance')
-            self.exchange = exchange_class({
-                'apiKey': self.api_key,
-                'secret': self.api_secret,
-                'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'future',
-                    'adjustForTimeDifference': True,
-                },
-                'timeout': 30000,
-            })
-            
-            if self.testnet:
-                self.exchange.set_sandbox_mode(True)
-                self.logger.info("币安测试网模式已启用")
-            
-            # 异步加载市场信息
-            await self._run_in_thread(self.exchange.load_markets)
-            self.logger.info("交易所初始化成功")
-            
+            balance = self.exchange.fetch_balance()
+            return BalanceInfo(
+                total=float(balance['total']['USDT']),
+                free=float(balance['free']['USDT']),
+                used=float(balance['used']['USDT'])
+            )
         except Exception as e:
-            self.logger.error(f"交易所初始化失败: {e}")
+            self.logger.error(f"获取余额失败: {str(e)}")
             raise
-    
-    async def _run_in_thread(self, func, *args, **kwargs):
-        """在线程池中运行同步函数"""
-        loop = asyncio.get_event_loop()
-        async with self.rate_limiter:
-            return await loop.run_in_executor(None, func, *args, **kwargs)
-    
-    async def get_balance(self) -> BalanceInfo:
-        """获取余额信息"""
+
+    def create_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None) -> OrderResult:
+        if not self.is_initialized():
+            return OrderResult(success=False, error="交易所未初始化")
+        
         try:
-            balance = await self._run_in_thread(self.exchange.fetch_balance)
-            total = float(balance['total'].get('USDT', 0))
-            free = float(balance['free'].get('USDT', 0))
-            used = float(balance['used'].get('USDT', 0))
-            return BalanceInfo(total=total, free=free, used=used)
-        except Exception as e:
-            self.logger.error(f"获取余额失败: {e}")
-            return BalanceInfo(total=0, free=0, used=0)
-    
-    async def create_order(self, symbol: str, order_type: str, side: OrderSide, 
-                          quantity: float, price: Optional[float] = None) -> OrderResult:
-        """创建订单"""
-        try:
-            order_side = side.value
-            order = await self._run_in_thread(
-                self.exchange.create_order,
-                symbol, order_type, order_side, quantity, price
+            order_type = 'limit' if price else 'market'
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type=order_type,
+                side=side,
+                amount=quantity,
+                price=price
             )
             
             return OrderResult(
                 success=True,
                 order_id=order['id'],
                 symbol=symbol,
-                side=side,
-                price=float(order.get('price', 0)),
+                side=OrderSide.BUY if side == 'buy' else OrderSide.SELL,
+                price=float(order['price']),
                 quantity=float(order['amount'])
             )
         except Exception as e:
-            self.logger.error(f"创建订单失败: {e}")
+            self.logger.error(f"创建订单失败: {str(e)}")
             return OrderResult(success=False, error=str(e))
-    
-    async def get_positions(self, symbol: Optional[str] = None) -> List[PositionInfo]:
-        """获取仓位信息"""
+
+    def get_positions(self) -> List[PositionInfo]:
+        if not self.is_initialized():
+            return []
+        
         try:
-            positions = await self._run_in_thread(self.exchange.fetch_positions, [symbol] if symbol else None)
+            positions = self.exchange.fetch_positions()
             result = []
-            
             for pos in positions:
-                if symbol and pos['symbol'] != symbol:
-                    continue
-                
-                contracts = float(pos.get('contracts', 0))
-                if contracts > 0:
-                    position_side = PositionSide.LONG if pos['side'] == 'long' else PositionSide.SHORT
+                if float(pos['contracts']) > 0:
                     result.append(PositionInfo(
                         symbol=pos['symbol'],
-                        side=position_side,
-                        size=contracts,
-                        entry_price=float(pos.get('entryPrice', 0)),
-                        unrealized_pnl=float(pos.get('unrealizedPnl', 0)),
-                        leverage=int(pos.get('leverage', 1)),
+                        side=PositionSide.LONG if pos['side'] == 'long' else PositionSide.SHORT,
+                        size=float(pos['contracts']),
+                        entry_price=float(pos['entryPrice']),
+                        unrealized_pnl=float(pos['unrealizedPnl']),
+                        leverage=int(pos['leverage']),
                         timestamp=datetime.now()
                     ))
-            
             return result
         except Exception as e:
-            self.logger.error(f"获取仓位失败: {e}")
+            self.logger.error(f"获取仓位失败: {str(e)}")
             return []
-    
-    async def get_ohlcv(self, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
+
+    def get_ohlcv(self, symbol: str, timeframe: str = '1h', limit: int = 100) -> Optional[pd.DataFrame]:
         """获取K线数据"""
+        if not self.is_initialized():
+            return None
+            
         try:
-            ohlcv = await self._run_in_thread(
-                self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit
-            )
-            
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('datetime', inplace=True)
             return df
         except Exception as e:
-            self.logger.error(f"获取K线数据失败: {e}")
-            return pd.DataFrame()
-    
-    async def close_position(self, symbol: str, side: PositionSide) -> OrderResult:
-        """平仓"""
-        try:
-            positions = await self.get_positions(symbol)
-            position = next((p for p in positions if p.side == side), None)
-            
-            if not position or position.size == 0:
-                return OrderResult(success=False, error="没有找到对应仓位")
-            
-            close_side = OrderSide.SELL if side == PositionSide.LONG else OrderSide.BUY
-            return await self.create_order(symbol, 'market', close_side, position.size)
-        except Exception as e:
-            self.logger.error(f"平仓失败: {e}")
-            return OrderResult(success=False, error=str(e))
+            self.logger.error(f"获取K线数据失败 {symbol}: {str(e)}")
+            return None
 
 # ================== 指标系统 ==================
 class IndicatorSystem:
     """完整的指标计算系统"""
     
     def __init__(self):
-        self.logger = logging.getLogger("IndicatorSystem")
-        self.cache = {}
+        self.logger = logging.getLogger(__name__)
     
-    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        """计算ATR指标"""
-        try:
-            if len(df) < period:
-                return 0.0
-                
-            atr_indicator = ta.volatility.AverageTrueRange(
-                high=df['high'], 
-                low=df['low'], 
-                close=df['close'], 
-                window=period
-            )
-            return float(atr_indicator.average_true_range().iloc[-1])
-        except Exception as e:
-            self.logger.error(f"计算ATR失败: {e}")
-            return 0.0
-    
-    def calculate_ema(self, df: pd.DataFrame, period: int) -> float:
-        """计算EMA指标"""
-        try:
-            if len(df) < period:
-                return float(df['close'].iloc[-1])
-                
-            ema = ta.trend.EMAIndicator(df['close'], window=period)
-            return float(ema.ema_indicator().iloc[-1])
-        except Exception as e:
-            self.logger.error(f"计算EMA失败: {e}")
-            return float(df['close'].iloc[-1]) if not df.empty else 0.0
-    
-    def calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> float:
-        """计算RSI指标"""
-        try:
-            if len(df) < period:
-                return 50.0
-                
-            rsi = ta.momentum.RSIIndicator(df['close'], window=period)
-            return float(rsi.rsi().iloc[-1])
-        except Exception as e:
-            self.logger.error(f"计算RSI失败: {e}")
-            return 50.0
-    
-    def get_trend_direction(self, df: pd.DataFrame) -> str:
-        """判断趋势方向"""
-        try:
-            if len(df) < 50:
-                return "neutral"
-                
-            ema_fast = self.calculate_ema(df, 20)
-            ema_slow = self.calculate_ema(df, 50)
-            current_price = float(df['close'].iloc[-1])
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算技术指标"""
+        if df is None or df.empty:
+            return df
             
-            if current_price > ema_fast > ema_slow:
-                return "bullish"
-            elif current_price < ema_fast < ema_slow:
-                return "bearish"
-            else:
-                return "neutral"
-        except Exception as e:
-            self.logger.error(f"判断趋势失败: {e}")
-            return "neutral"
+        df = df.copy()
+        
+        # EMA指标
+        df['ema_12'] = ta.trend.EMAIndicator(df['close'], window=12).ema_indicator()
+        df['ema_26'] = ta.trend.EMAIndicator(df['close'], window=26).ema_indicator()
+        
+        # MACD指标
+        macd = ta.trend.MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_histogram'] = macd.macd_diff()
+        
+        # RSI指标
+        df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        
+        # ATR指标
+        df['atr'] = ta.volatility.AverageTrueRange(
+            df['high'], df['low'], df['close'], window=14
+        ).average_true_range()
+        
+        # 布林带
+        bollinger = ta.volatility.BollingerBands(df['close'])
+        df['bb_upper'] = bollinger.bollinger_hband()
+        df['bb_middle'] = bollinger.bollinger_mavg()
+        df['bb_lower'] = bollinger.bollinger_lband()
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        
+        # 成交量指标
+        df['volume_ma'] = df['volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_ma']
+        
+        return df.dropna()
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str) -> Optional[TradeSignal]:
+        """生成交易信号"""
+        if df is None or df.empty or len(df) < 50:
+            return None
+            
+        current = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # 检查是否有足够的指标数据
+        if any(pd.isna(current[col]) for col in ['ema_12', 'ema_26', 'macd', 'rsi', 'atr']):
+            return None
+        
+        # 趋势判断
+        trend_bullish = current['ema_12'] > current['ema_26']
+        trend_bearish = current['ema_12'] < current['ema_26']
+        
+        # MACD信号
+        macd_bullish = current['macd'] > current['macd_signal'] and prev['macd'] <= prev['macd_signal']
+        macd_bearish = current['macd'] < current['macd_signal'] and prev['macd'] >= prev['macd_signal']
+        
+        # RSI信号
+        rsi_overbought = current['rsi'] > 70
+        rsi_oversold = current['rsi'] < 30
+        
+        # 生成信号
+        price = float(current['close'])
+        atr = float(current['atr'])
+        
+        if trend_bullish and macd_bullish and not rsi_overbought:
+            return TradeSignal(
+                symbol=symbol,
+                side=OrderSide.BUY,
+                price=price,
+                atr=atr,
+                quantity=0,  # 数量将在执行时计算
+                timestamp=datetime.now(),
+                confidence=0.8
+            )
+        elif trend_bearish and macd_bearish and not rsi_oversold:
+            return TradeSignal(
+                symbol=symbol,
+                side=OrderSide.SELL,
+                price=price,
+                atr=atr,
+                quantity=0,
+                timestamp=datetime.now(),
+                confidence=0.8
+            )
+        
+        return None
 
 # ================== 交易执行器 ==================
 class TradeExecutor:
@@ -382,506 +390,468 @@ class TradeExecutor:
     
     def __init__(self, exchange: BinanceExchange):
         self.exchange = exchange
-        self.logger = logging.getLogger("TradeExecutor")
-        self.daily_pnl = 0.0
-        self.max_drawdown = 0.0
-        self.last_balance = 0.0
+        self.logger = logging.getLogger(__name__)
     
-    async def execute_signal(self, signal: TradeSignal) -> OrderResult:
-        """执行交易信号"""
-        try:
-            balance = await self.exchange.get_balance()
-            risk_amount = balance.total * INITIAL_RISK_PERCENT
-            quantity = risk_amount / signal.price
+    def calculate_position_size(self, balance: float, price: float, atr: float, risk_percent: float = INITIAL_RISK_PERCENT) -> float:
+        """计算仓位大小"""
+        if price <= 0 or atr <= 0:
+            return 0
             
-            # 确保最小交易量
-            quantity = max(quantity, 0.001)  # 最小交易量
-            
-            return await self.exchange.create_order(
-                symbol=signal.symbol,
-                order_type='market',
-                side=signal.side,
-                quantity=quantity
-            )
-        except Exception as e:
-            self.logger.error(f"执行信号失败: {e}")
-            return OrderResult(success=False, error=str(e))
-    
-    async def set_stop_loss_take_profit(self, symbol: str, entry_price: float, 
-                                       atr: float, side: OrderSide) -> Tuple[float, float]:
-        """设置止损和止盈价格"""
-        if atr == 0:
-            atr = entry_price * 0.02  # 默认2%的ATR
-            
-        if side == OrderSide.BUY:
-            stop_loss = entry_price - (atr * 2)
-            take_profit = entry_price + (atr * 3)
-        else:
-            stop_loss = entry_price + (atr * 2)
-            take_profit = entry_price - (atr * 3)
+        # 风险金额
+        risk_amount = balance * risk_percent
         
-        return stop_loss, take_profit
+        # 每单位风险（基于ATR）
+        risk_per_unit = atr
+        
+        # 计算仓位大小
+        position_size = risk_amount / risk_per_unit
+        
+        # 确保最小交易量
+        min_size = 0.001  # 根据交易所调整
+        return max(position_size, min_size)
     
-    async def check_risk_limits(self) -> bool:
-        """检查风险限制"""
+    async def execute_order(self, signal: TradeSignal, balance: float) -> OrderResult:
+        """执行交易订单"""
+        if not self.exchange.is_initialized():
+            return OrderResult(success=False, error="交易所未初始化")
+        
         try:
-            balance = await self.exchange.get_balance()
+            # 计算仓位大小
+            position_size = self.calculate_position_size(balance, signal.price, signal.atr)
+            if position_size <= 0:
+                return OrderResult(success=False, error="仓位计算错误")
             
-            # 检查每日亏损限制
-            if self.daily_pnl < -DAILY_LOSS_LIMIT:
-                self.logger.warning(f"达到每日亏损限制: {self.daily_pnl:.2f}%")
-                return False
+            signal.quantity = position_size
             
-            # 检查最大回撤
-            if balance.total < self.last_balance:
-                drawdown = (self.last_balance - balance.total) / self.last_balance * 100
-                self.max_drawdown = max(self.max_drawdown, drawdown)
+            # 创建订单
+            result = self.exchange.create_order(
+                symbol=signal.symbol,
+                side=signal.side.value,
+                quantity=position_size,
+                price=None  # 市价单
+            )
+            
+            if result.success:
+                self.logger.info(f"订单执行成功: {signal.symbol} {signal.side.value} {position_size:.6f}")
+            else:
+                self.logger.error(f"订单执行失败: {result.error}")
                 
-                if self.max_drawdown > MAX_DRAWDOWN_PERCENT:
-                    self.logger.warning(f"达到最大回撤限制: {self.max_drawdown:.2f}%")
-                    return False
-            
-            self.last_balance = balance.total
-            return True
+            return result
             
         except Exception as e:
-            self.logger.error(f"检查风险限制失败: {e}")
-            return True
+            self.logger.error(f"执行订单失败: {str(e)}")
+            return OrderResult(success=False, error=str(e))
 
 # ================== 双开马丁策略管理器 ==================
-class DualSideManager:
+class DualMartingaleManager:
     """管理单个symbol的双向仓位与受控马丁加仓"""
     
-    def __init__(self, exchange: BinanceExchange, executor: TradeExecutor, 
-                 indicators: IndicatorSystem, symbol: str):
+    def __init__(self, symbol: str, exchange: BinanceExchange, executor: TradeExecutor):
+        self.symbol = symbol
         self.exchange = exchange
         self.executor = executor
-        self.indicators = indicators
-        self.symbol = symbol
-        self.logger = logging.getLogger(f"DualManager.{symbol.replace('/', '')}")
+        self.logger = logging.getLogger(__name__)
         
-        # 马丁加仓层记录
-        self.martingale_layers: Dict[PositionSide, List[MartingaleLayer]] = {
-            PositionSide.LONG: [],
-            PositionSide.SHORT: []
-        }
+        # 马丁层管理
+        self.long_layers: List[MartingaleLayer] = []
+        self.short_layers: List[MartingaleLayer] = []
         
         # 状态跟踪
         self.last_check_time = datetime.now()
-        self.is_trend_filter_active = TREND_FILTER_ENABLED
-        self.initial_opened = False
+        self.consecutive_losses = 0
     
-    async def open_initial_pair(self) -> bool:
-        """开初始双向仓位"""
-        if not DUAL_OPEN_ENABLED:
-            self.logger.info("双开功能已禁用")
+    def get_status(self) -> DualMartingaleStatus:
+        """获取当前状态"""
+        long_exposure = sum(layer.size for layer in self.long_layers)
+        short_exposure = sum(layer.size for layer in self.short_layers)
+        
+        long_avg = (sum(layer.entry_price * layer.size for layer in self.long_layers) / long_exposure 
+                   if long_exposure > 0 else 0)
+        short_avg = (sum(layer.entry_price * layer.size for layer in self.short_layers) / short_exposure 
+                    if short_exposure > 0 else 0)
+        
+        return DualMartingaleStatus(
+            symbol=self.symbol,
+            long_layers=len(self.long_layers),
+            short_layers=len(self.short_layers),
+            long_exposure=long_exposure,
+            short_exposure=short_exposure,
+            long_avg_price=long_avg,
+            short_avg_price=short_avg,
+            net_exposure=long_exposure - short_exposure
+        )
+    
+    def should_add_long_layer(self, current_price: float) -> bool:
+        """检查是否应该加多仓"""
+        if len(self.long_layers) >= MAX_MARTINGALE_LAYERS:
             return False
             
-        if self.initial_opened:
-            self.logger.info("初始仓位已开立")
+        if not self.long_layers:
             return True
             
-        try:
-            # 检查风险限制
-            if not await self.executor.check_risk_limits():
-                self.logger.warning("风险限制检查未通过，暂停开仓")
-                return False
+        # 计算平均入场价和当前亏损
+        avg_entry = self._calculate_avg_entry_price(self.long_layers)
+        if avg_entry <= 0:
+            return True
             
-            df = await self.exchange.get_ohlcv(self.symbol, "1h", 100)
-            if df.empty:
-                self.logger.error("无法获取K线数据")
-                return False
-            
-            current_price = float(df['close'].iloc[-1])
-            atr = self.indicators.calculate_atr(df)
-            
-            if atr == 0:
-                atr = current_price * 0.02
-            
-            balance = await self.exchange.get_balance()
-            risk_amount = balance.total * INITIAL_RISK_PERCENT
-            quantity = risk_amount / current_price
-            
-            # 风控检查
-            total_notional = quantity * current_price * 2
-            if total_notional > MAX_NOTIONAL_PER_SYMBOL:
-                quantity = MAX_NOTIONAL_PER_SYMBOL / (current_price * 2)
-                self.logger.warning(f"调整仓位大小以符合风控限制: {quantity:.6f}")
-            
-            # 创建交易信号
-            buy_signal = TradeSignal(
-                symbol=self.symbol,
-                side=OrderSide.BUY,
-                price=current_price,
-                atr=atr,
-                quantity=quantity,
-                timestamp=datetime.now()
-            )
-            
-            sell_signal = TradeSignal(
-                symbol=self.symbol,
-                side=OrderSide.SELL,
-                price=current_price,
-                atr=atr,
-                quantity=quantity,
-                timestamp=datetime.now()
-            )
-            
-            # 执行订单
-            buy_result = await self.executor.execute_signal(buy_signal)
-            await asyncio.sleep(1)  # 避免频繁请求
-            sell_result = await self.executor.execute_signal(sell_signal)
-            
-            if buy_result.success and sell_result.success:
-                self.logger.info(f"✅ 成功开立双向仓位")
-                
-                # 记录初始层
-                buy_stop_loss, buy_take_profit = await self.executor.set_stop_loss_take_profit(
-                    self.symbol, current_price, atr, OrderSide.BUY
-                )
-                
-                sell_stop_loss, sell_take_profit = await self.executor.set_stop_loss_take_profit(
-                    self.symbol, current_price, atr, OrderSide.SELL
-                )
-                
-                self.martingale_layers[PositionSide.LONG].append(MartingaleLayer(
-                    symbol=self.symbol,
-                    side=PositionSide.LONG,
-                    size=quantity,
-                    entry_price=current_price,
-                    layer=0,
-                    timestamp=datetime.now(),
-                    stop_loss=buy_stop_loss,
-                    take_profit=buy_take_profit
-                ))
-                
-                self.martingale_layers[PositionSide.SHORT].append(MartingaleLayer(
-                    symbol=self.symbol,
-                    side=PositionSide.SHORT,
-                    size=quantity,
-                    entry_price=current_price,
-                    layer=0,
-                    timestamp=datetime.now(),
-                    stop_loss=sell_stop_loss,
-                    take_profit=sell_take_profit
-                ))
-                
-                self.initial_opened = True
-                return True
-            else:
-                errors = []
-                if not buy_result.success:
-                    errors.append(f"买: {buy_result.error}")
-                if not sell_result.success:
-                    errors.append(f"卖: {sell_result.error}")
-                self.logger.error(f"开立双向仓位失败: {', '.join(errors)}")
-                
-                # 清理已成功的订单
-                if buy_result.success:
-                    await self.exchange.close_position(self.symbol, PositionSide.LONG)
-                if sell_result.success:
-                    await self.exchange.close_position(self.symbol, PositionSide.SHORT)
-                    
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"开立初始双向仓位失败: {e}")
+        current_loss = (avg_entry - current_price) / avg_entry
+        return current_loss >= MARTINGALE_TRIGGER_LOSS
+    
+    def should_add_short_layer(self, current_price: float) -> bool:
+        """检查是否应该加空仓"""
+        if len(self.short_layers) >= MAX_MARTINGALE_LAYERS:
             return False
+            
+        if not self.short_layers:
+            return True
+            
+        # 计算平均入场价和当前亏损
+        avg_entry = self._calculate_avg_entry_price(self.short_layers)
+        if avg_entry <= 0:
+            return True
+            
+        current_loss = (current_price - avg_entry) / avg_entry
+        return current_loss >= MARTINGALE_TRIGGER_LOSS
     
-    async def monitor_and_martingale(self):
-        """监控仓位并执行马丁加仓逻辑"""
-        try:
-            current_time = datetime.now()
-            if (current_time - self.last_check_time).total_seconds() < UPDATE_INTERVAL:
-                return
-            
-            self.last_check_time = current_time
-            
-            # 检查风险限制
-            if not await self.executor.check_risk_limits():
-                self.logger.warning("风险限制检查未通过，暂停操作")
-                return
-            
-            # 获取当前市场数据
-            df = await self.exchange.get_ohlcv(self.symbol, "1h", 100)
-            if df.empty:
-                return
-            
-            current_price = float(df['close'].iloc[-1])
-            atr = self.indicators.calculate_atr(df)
-            
-            # 检查趋势过滤
-            if self.is_trend_filter_active:
-                trend = self.indicators.get_trend_direction(df)
-                if trend == "bullish" and len(self.martingale_layers[PositionSide.SHORT]) > 0:
-                    self.logger.info("趋势看涨，暂停空头加仓")
-                elif trend == "bearish" and len(self.martingale_layers[PositionSide.LONG]) > 0:
-                    self.logger.info("趋势看跌，暂停多头加仓")
-            
-            # 检查是否需要加仓
-            await self._check_martingale_opportunity(PositionSide.LONG, current_price, atr)
-            await self._check_martingale_opportunity(PositionSide.SHORT, current_price, atr)
-            
-            # 检查止盈止损
-            await self._check_take_profit_stop_loss(current_price)
-            
-        except Exception as e:
-            self.logger.error(f"监控马丁加仓失败: {e}")
-    
-    async def _check_martingale_opportunity(self, side: PositionSide, current_price: float, atr: float):
-        """检查马丁加仓机会"""
-        layers = self.martingale_layers[side]
+    def _calculate_avg_entry_price(self, layers: List[MartingaleLayer]) -> float:
+        """计算平均入场价"""
         if not layers:
-            return
-        
-        # 获取当前仓位信息
-        positions = await self.exchange.get_positions(self.symbol)
-        position = next((p for p in positions if p.side == side), None)
-        
-        if not position or position.size == 0:
-            return
-        
-        # 计算当前亏损比例
-        unrealized_pnl_percent = abs(position.unrealized_pnl) / (position.entry_price * position.size)
-        
-        # 如果亏损达到设定比例且还有加仓层数可用
-        if unrealized_pnl_percent >= MARTINGALE_TRIGGER_LOSS and len(layers) < MAX_MARTINGALE_LAYERS + 1:
-            self.logger.info(f"📈 检测到{side.value}浮亏 {unrealized_pnl_percent:.2%}，达到触发条件 {MARTINGALE_TRIGGER_LOSS:.2%}，执行马丁加仓")
+            return 0
             
-            # 计算加仓数量
-            last_layer = layers[-1]
-            new_size = last_layer.size * MARTINGALE_MULTIPLIER
+        total_size = sum(layer.size for layer in layers)
+        total_value = sum(layer.entry_price * layer.size for layer in layers)
+        return total_value / total_size if total_size > 0 else 0
+    
+    def calculate_layer_size(self, side: PositionSide, balance: float, current_price: float) -> float:
+        """计算马丁加仓的仓位大小"""
+        current_layers = self.long_layers if side == PositionSide.LONG else self.short_layers
+        layer_number = len(current_layers) + 1
+        
+        # 基础风险计算
+        base_risk = balance * INITIAL_RISK_PERCENT
+        layer_multiplier = MARTINGALE_MULTIPLIER ** (layer_number - 1)
+        risk_amount = base_risk * layer_multiplier
+        
+        # 使用ATR计算风险（简化版）
+        risk_per_unit = current_price * 0.02  # 假设2%的价格波动
+        
+        position_size = risk_amount / risk_per_unit
+        
+        # 检查最大名义价值限制
+        notional_value = position_size * current_price
+        if notional_value > MAX_NOTIONAL_PER_SYMBOL:
+            position_size = MAX_NOTIONAL_PER_SYMBOL / current_price
             
-            # 检查总仓位限制
-            total_notional = sum(layer.size * layer.entry_price for layer in layers) + (new_size * current_price)
-            if total_notional > MAX_NOTIONAL_PER_SYMBOL:
-                self.logger.warning(f"达到最大仓位限制 {MAX_NOTIONAL_PER_SYMBOL} USDT，停止加仓")
-                return
+        return position_size
+    
+    async def add_martingale_layer(self, side: PositionSide, current_price: float, balance: float) -> Optional[MartingaleLayer]:
+        """添加马丁加仓层"""
+        should_add = (self.should_add_long_layer(current_price) if side == PositionSide.LONG 
+                     else self.should_add_short_layer(current_price))
+        
+        if not should_add:
+            return None
             
-            # 执行加仓
-            order_side = OrderSide.BUY if side == PositionSide.LONG else OrderSide.SELL
-            order_result = await self.exchange.create_order(
-                self.symbol, 'market', order_side, new_size
-            )
+        layer_size = self.calculate_layer_size(side, balance, current_price)
+        if layer_size <= 0:
+            return None
             
-            if order_result.success:
-                # 记录新层
-                stop_loss, take_profit = await self.executor.set_stop_loss_take_profit(
-                    self.symbol, current_price, atr, order_side
-                )
-                
-                new_layer = MartingaleLayer(
+        layer_number = len(self.long_layers if side == PositionSide.LONG else self.short_layers) + 1
+        
+        # 计算止损和止盈
+        if side == PositionSide.LONG:
+            stop_loss = current_price * (1 - 0.03)  # 3%止损
+            take_profit = current_price * (1 + 0.06)  # 6%止盈
+        else:
+            stop_loss = current_price * (1 + 0.03)  # 3%止损
+            take_profit = current_price * (1 - 0.06)  # 6%止盈
+            
+        layer = MartingaleLayer(
+            symbol=self.symbol,
+            side=side,
+            size=layer_size,
+            entry_price=current_price,
+            layer=layer_number,
+            timestamp=datetime.now(),
+            stop_loss=stop_loss,
+            take_profit=take_profit
+        )
+        
+        if side == PositionSide.LONG:
+            self.long_layers.append(layer)
+        else:
+            self.short_layers.append(layer)
+            
+        self.logger.info(f"{self.symbol} {side.value} 第{layer_number}层马丁加仓，大小: {layer_size:.6f}")
+        
+        return layer
+    
+    async def check_take_profit(self, current_price: float) -> bool:
+        """检查止盈条件"""
+        status = self.get_status()
+        
+        # 检查多仓止盈
+        if status.long_exposure > 0 and current_price >= status.long_avg_price * 1.03:
+            self.logger.info(f"{self.symbol} 多仓达到止盈条件")
+            return True
+            
+        # 检查空仓止盈
+        if status.short_exposure > 0 and current_price <= status.short_avg_price * 0.97:
+            self.logger.info(f"{self.symbol} 空仓达到止盈条件")
+            return True
+            
+        return False
+    
+    async def close_all_positions(self):
+        """平掉所有仓位"""
+        self.logger.info(f"开始平仓 {self.symbol}")
+        
+        # 平多仓
+        if self.long_layers:
+            total_long = sum(layer.size for layer in self.long_layers)
+            if total_long > 0:
+                result = self.exchange.create_order(
                     symbol=self.symbol,
-                    side=side,
-                    size=new_size,
-                    entry_price=current_price,
-                    layer=len(layers),
-                    timestamp=datetime.now(),
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
+                    side='sell',
+                    quantity=total_long,
+                    price=None
                 )
-                
-                layers.append(new_layer)
-                self.logger.info(f"✅ 马丁加仓成功: 第{len(layers)}层，数量={new_size:.6f}")
-            else:
-                self.logger.error(f"❌ 马丁加仓失败: {order_result.error}")
-    
-    async def _check_take_profit_stop_loss(self, current_price: float):
-        """检查止盈止损条件"""
-        for side, layers in self.martingale_layers.items():
-            if not layers:
-                continue
-
-            # 计算加权平均开仓价
-            total_size = sum(layer.size for layer in layers)
-            if total_size == 0:
-                continue
-
-            # 取最后一层的止损和止盈（动态调整）
-            last_layer = layers[-1]
-            stop_loss = last_layer.stop_loss
-            take_profit = last_layer.take_profit
-
-            # 多头检查
-            if side == PositionSide.LONG:
-                if current_price <= stop_loss:
-                    self.logger.warning(f"⚠️ {self.symbol} 多头触发止损，平仓")
-                    await self.exchange.close_position(self.symbol, PositionSide.LONG)
-                    self.martingale_layers[side].clear()
-                elif current_price >= take_profit:
-                    self.logger.info(f"✅ {self.symbol} 多头止盈，平仓")
-                    await self.exchange.close_position(self.symbol, PositionSide.LONG)
-                    self.martingale_layers[side].clear()
-
-            # 空头检查
-            elif side == PositionSide.SHORT:
-                if current_price >= stop_loss:
-                    self.logger.warning(f"⚠️ {self.symbol} 空头触发止损，平仓")
-                    await self.exchange.close_position(self.symbol, PositionSide.SHORT)
-                    self.martingale_layers[side].clear()
-                elif current_price <= take_profit:
-                    self.logger.info(f"✅ {self.symbol} 空头止盈，平仓")
-                    await self.exchange.close_position(self.symbol, PositionSide.SHORT)
-                    self.martingale_layers[side].clear()
-    
-    async def _close_all_layers(self, side: PositionSide):
-        """平掉所有指定方向的仓位"""
-        try:
-            await self.exchange.close_position(self.symbol, side)
-            self.martingale_layers[side] = []
-            self.logger.info(f"已平仓所有{side.value}仓位")
-        except Exception as e:
-            self.logger.error(f"平仓失败: {e}")
+                if result.success:
+                    self.long_layers.clear()
+                    self.logger.info(f"平多仓成功: {total_long:.6f}")
+        
+        # 平空仓
+        if self.short_layers:
+            total_short = sum(layer.size for layer in self.short_layers)
+            if total_short > 0:
+                result = self.exchange.create_order(
+                    symbol=self.symbol,
+                    side='buy',
+                    quantity=total_short,
+                    price=None
+                )
+                if result.success:
+                    self.short_layers.clear()
+                    self.logger.info(f"平空仓成功: {total_short:.6f}")
 
 # ================== 主交易机器人 ==================
 class EnhancedProductionTrader:
     """增强的生产环境交易机器人"""
     
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
         self.exchange = None
-        self.executor = None
         self.indicators = IndicatorSystem()
-        self.dual_managers: Dict[str, DualSideManager] = {}
-        self.logger = logging.getLogger("EnhancedProductionTrader")
-        self.is_running = False
+        self.executor = None
+        self.martingale_managers: Dict[str, DualMartingaleManager] = {}
+        self.initialized = False
+        
+        # 设置信号处理器
+        signal.signal(signal.SIGINT, self.handle_exit)
+        signal.signal(signal.SIGTERM, self.handle_exit)
     
-    async def initialize(self):
-        """初始化交易机器人"""
+    def handle_exit(self, signum, frame):
+        """处理退出信号"""
+        self.logger.info(f"收到信号 {signum}，正在优雅退出...")
+        sys.exit(0)
+    
+    def initialize_exchange(self) -> bool:
+        """初始化交易所连接"""
         try:
-            # 检查API密钥
+            self.logger.info("开始初始化交易所连接...")
+            
             if not BINANCE_API_KEY or not BINANCE_API_SECRET:
                 self.logger.error("请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
                 return False
             
-            # 初始化交易所
-            self.exchange = BinanceExchange(BINANCE_API_KEY, BINANCE_API_SECRET, TESTNET)
-            await self.exchange.initialize()
+            # 创建交易所实例
+            exchange = BinanceExchange(
+                api_key=BINANCE_API_KEY,
+                api_secret=BINANCE_API_SECRET,
+                testnet=TESTNET
+            )
             
-            # 初始化交易执行器
-            self.executor = TradeExecutor(self.exchange)
+            # 使用重试机制初始化
+            if exchange.initialize_with_retry():
+                self.exchange = exchange
+                self.executor = TradeExecutor(exchange)
+                
+                # 为每个交易对创建马丁管理器
+                for symbol in SYMBOLS:
+                    self.martingale_managers[symbol] = DualMartingaleManager(
+                        symbol, exchange, self.executor
+                    )
+                
+                self.initialized = True
+                self.logger.info("交易所初始化成功")
+                return True
+            else:
+                self.logger.error("交易所初始化失败，请检查网络连接或API密钥")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"交易所初始化过程中发生未知错误: {str(e)}")
+            return False
+    
+    def initialize(self) -> bool:
+        """完整的初始化过程"""
+        try:
+            self.logger.info("开始初始化交易机器人...")
             
-            # 初始化双开管理器
-            for symbol in SYMBOLS:
-                self.dual_managers[symbol] = DualSideManager(
-                    self.exchange, self.executor, self.indicators, symbol
-                )
+            # 第一步：初始化交易所
+            if not self.initialize_exchange():
+                return False
             
-            # 显示当前配置
-            self.logger.info(f"📋 策略配置:")
-            self.logger.info(f"   - 马丁触发比例: {MARTINGALE_TRIGGER_LOSS:.2%}")
-            self.logger.info(f"   - 马丁乘数: {MARTINGALE_MULTIPLIER}")
-            self.logger.info(f"   - 最大马丁层数: {MAX_MARTINGALE_LAYERS}")
-            self.logger.info(f"   - 初始风险比例: {INITIAL_RISK_PERCENT:.2%}")
-            self.logger.info(f"   - 单币种最大仓位: {MAX_NOTIONAL_PER_SYMBOL} USDT")
+            # 第二步：检查余额
+            try:
+                balance = self.exchange.get_balance()
+                self.logger.info(f"账户余额: 总额={balance.total:.2f} USDT, 可用={balance.free:.2f} USDT")
+            except Exception as e:
+                self.logger.warning(f"获取余额失败: {str(e)}")
             
-            self.logger.info("✅ 交易机器人初始化成功")
+            # 第三步：检查支持的交易对
+            self.logger.info(f"配置的交易对: {SYMBOLS}")
+            
+            self.logger.info("交易机器人初始化完成")
             return True
             
         except Exception as e:
-            self.logger.error(f"交易机器人初始化失败: {e}")
+            self.logger.error(f"交易机器人初始化失败: {str(e)}")
             return False
+    
+    async def run_trading_cycle(self):
+        """运行交易周期"""
+        if not self.initialized:
+            self.logger.error("交易机器人未初始化，无法运行")
+            return
+        
+        try:
+            # 获取当前余额
+            balance_info = self.exchange.get_balance()
+            free_balance = balance_info.free
+            
+            for symbol in SYMBOLS:
+                await self.process_symbol(symbol, free_balance)
+                
+        except Exception as e:
+            self.logger.error(f"交易周期执行错误: {str(e)}")
+    
+    async def process_symbol(self, symbol: str, balance: float):
+        """处理单个交易对"""
+        try:
+            # 获取K线数据
+            df = self.exchange.get_ohlcv(symbol, '1h', 100)
+            if df is None or df.empty:
+                return
+            
+            # 计算指标
+            df_with_indicators = self.indicators.calculate_indicators(df)
+            
+            # 生成交易信号
+            signal = self.indicators.generate_signal(df_with_indicators, symbol)
+            
+            # 获取当前价格
+            current_price = float(df_with_indicators.iloc[-1]['close'])
+            
+            # 获取马丁管理器
+            martingale_manager = self.martingale_managers[symbol]
+            
+            # 检查止盈条件
+            if await martingale_manager.check_take_profit(current_price):
+                await martingale_manager.close_all_positions()
+                return
+            
+            # 处理交易信号
+            if signal:
+                await self.handle_trading_signal(signal, martingale_manager, current_price, balance)
+            
+            # 检查马丁加仓条件
+            await self.check_martingale_layers(martingale_manager, current_price, balance)
+            
+            # 记录状态
+            status = martingale_manager.get_status()
+            self.logger.info(
+                f"{symbol} 状态: 多{status.long_layers}层({status.long_exposure:.6f}), "
+                f"空{status.short_layers}层({status.short_exposure:.6f}), "
+                f"净暴露: {status.net_exposure:.6f}"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"处理交易对 {symbol} 失败: {str(e)}")
+    
+    async def handle_trading_signal(self, signal: TradeSignal, manager: DualMartingaleManager, 
+                                  current_price: float, balance: float):
+        """处理交易信号"""
+        status = manager.get_status()
+        
+        # 如果已经有相反方向的仓位，先平仓
+        if (signal.side == OrderSide.BUY and status.short_exposure > 0):
+            self.logger.info(f"{signal.symbol} 有相反方向仓位，先平空仓")
+            await manager.close_all_positions()
+        elif (signal.side == OrderSide.SELL and status.long_exposure > 0):
+            self.logger.info(f"{signal.symbol} 有相反方向仓位，先平多仓")
+            await manager.close_all_positions()
+        
+        # 执行新信号
+        result = await self.executor.execute_order(signal, balance)
+        if result.success:
+            # 创建马丁层
+            side = PositionSide.LONG if signal.side == OrderSide.BUY else PositionSide.SHORT
+            await manager.add_martingale_layer(side, current_price, balance)
+    
+    async def check_martingale_layers(self, manager: DualMartingaleManager, 
+                                    current_price: float, balance: float):
+        """检查马丁加仓条件"""
+        status = manager.get_status()
+        
+        # 检查多仓加仓
+        if status.long_layers > 0 and status.long_layers < MAX_MARTINGALE_LAYERS:
+            await manager.add_martingale_layer(PositionSide.LONG, current_price, balance)
+        
+        # 检查空仓加仓
+        if status.short_layers > 0 and status.short_layers < MAX_MARTINGALE_LAYERS:
+            await manager.add_martingale_layer(PositionSide.SHORT, current_price, balance)
     
     async def run(self):
         """运行交易机器人"""
-        if not await self.initialize():
-            self.logger.error("初始化失败，程序退出")
+        if not self.initialized:
+            self.logger.error("交易机器人未初始化，无法运行")
             return
         
-        self.is_running = True
-        self.logger.info("🚀 启动增强版交易机器人")
+        self.logger.info("开始运行交易机器人...")
         
         try:
-            # 初始开立双向仓位
-            if DUAL_OPEN_ENABLED:
-                for symbol, manager in self.dual_managers.items():
-                    success = await manager.open_initial_pair()
-                    if success:
-                        self.logger.info(f"✅ 成功为 {symbol} 开立初始双向仓位")
-                    else:
-                        self.logger.error(f"❌ 为 {symbol} 开立初始双向仓位失败")
-            
-            # 主循环
-            while self.is_running:
+            while True:
                 try:
-                    tasks = []
-                    for symbol, manager in self.dual_managers.items():
-                        tasks.append(manager.monitor_and_martingale())
-                    
-                    # 并行执行所有监控任务
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # 显示状态信息
-                    await self.display_status()
-                    
-                    # 等待下一次检查
+                    await self.run_trading_cycle()
                     await asyncio.sleep(UPDATE_INTERVAL)
                     
-                except asyncio.CancelledError:
-                    break
                 except Exception as e:
-                    self.logger.error(f"主循环错误: {e}")
-                    await asyncio.sleep(30)  # 出错后等待30秒再继续
+                    self.logger.error(f"交易周期执行错误: {str(e)}")
+                    await asyncio.sleep(60)  # 错误后等待1分钟再继续
                     
         except asyncio.CancelledError:
-            self.logger.info("交易机器人已停止")
+            self.logger.info("交易任务被取消")
         except Exception as e:
-            self.logger.error(f"交易循环异常: {e}")
-        finally:
-            self.is_running = False
-    
-    async def display_status(self):
-        """显示当前状态信息"""
-        try:
-            balance = await self.exchange.get_balance()
-            self.logger.info(f"💰 账户余额: 总={balance.total:.2f} USDT, 可用={balance.free:.2f} USDT")
-            
-            for symbol in SYMBOLS:
-                positions = await self.exchange.get_positions(symbol)
-                for pos in positions:
-                    if pos.size > 0:
-                        pnl_percent = (pos.unrealized_pnl / (pos.entry_price * pos.size)) * 100
-                        self.logger.info(
-                            f"📊 {symbol} {pos.side.value}: 大小={pos.size:.4f}, "
-                            f"入场价={pos.entry_price:.2f}, 未实现盈亏={pnl_percent:.2f}%"
-                        )
-                        
-                # 显示马丁层信息
-                manager = self.dual_managers[symbol]
-                for side, layers in manager.martingale_layers.items():
-                    if layers:
-                        total_size = sum(layer.size for layer in layers)
-                        avg_price = sum(layer.size * layer.entry_price for layer in layers) / total_size
-                        self.logger.info(
-                            f"   {side.value}马丁层: {len(layers)}层, 总大小={total_size:.4f}, "
-                            f"均价={avg_price:.2f}"
-                        )
-        except Exception as e:
-            self.logger.error(f"显示状态失败: {e}")
-    
-    def stop(self):
-        """安全停止"""
-        self.is_running = False
-        self.logger.info("⏹️ 交易机器人正在停止...")
+            self.logger.error(f"交易机器人运行错误: {str(e)}")
 
 # ================== 程序入口 ==================
 async def main():
     """主函数"""
     trader = EnhancedProductionTrader()
     
-    # 设置信号处理
-    def signal_handler(sig, frame):
-        logging.info("收到停止信号，正在关闭...")
-        trader.stop()
+    # 初始化交易机器人
+    if not trader.initialize():
+        logging.error("初始化失败，程序退出")
+        sys.exit(1)
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+    # 运行交易机器人
     try:
         await trader.run()
     except KeyboardInterrupt:
-        trader.stop()
+        logging.info("用户中断程序")
     except Exception as e:
-        logging.critical(f"未处理的异常: {e}")
+        logging.error(f"程序运行错误: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -890,5 +860,5 @@ if __name__ == "__main__":
         logging.error("请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
         sys.exit(1)
     
-    # 启动机器人
+    # 运行主程序
     asyncio.run(main())
