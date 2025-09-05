@@ -38,10 +38,10 @@ TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "true").lower() == "tru
 PARTIAL_TP_RATIO = float(os.getenv("PARTIAL_TP_RATIO", "0.3"))
 HEDGE_MODE = os.getenv("HEDGE_MODE", "false").lower() == "true"
 
-# 交易所API配置
+# 交易所API配置 - 主网合约模式
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-TESTNET = os.getenv("TESTNET", "true").lower() == "true"
+CONTRACT_TYPE = os.getenv("CONTRACT_TYPE", "future")  # future: U本位, delivery: 币本位
 
 # 交易所初始化重试配置
 EXCHANGE_INIT_RETRIES = int(os.getenv("EXCHANGE_INIT_RETRIES", "5"))
@@ -52,9 +52,9 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",
 TIMEFRAMES = ["1h", "4h"]
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))
 
-# 风险管理参数
-MAX_DRAWDOWN_PERCENT = float(os.getenv("MAX_DRAWDOWN_PERCENT", "10.0"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "5.0"))
+# 风险管理参数 - 主网需要更严格的风控
+MAX_DRAWDOWN_PERCENT = float(os.getenv("MAX_DRAWDOWN_PERCENT", "5.0"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "2.0"))
 
 # ================== 数据类型定义 ==================
 class OrderSide(Enum):
@@ -137,50 +137,78 @@ class DualMartingaleStatus:
     short_avg_price: float
     net_exposure: float
 
-# ================== 交易所接口实现（带重试机制） ==================
+# ================== 交易所接口实现（主网合约模式） ==================
 class BinanceExchange:
-    """币安交易所实现（带重试机制的优化版）"""
+    """币安交易所实现（主网合约模式）"""
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.testnet = testnet
         self.exchange = None
         self.initialized = False
         self.logger = logging.getLogger(__name__)
     
     def initialize_with_retry(self, max_retries: int = EXCHANGE_INIT_RETRIES, 
                              retry_delay: int = EXCHANGE_INIT_RETRY_DELAY) -> bool:
-        """带重试机制的交易所初始化"""
+        """带重试机制的交易所初始化 - 主网合约模式"""
         for attempt in range(1, max_retries + 1):
             try:
-                self.logger.info(f"尝试初始化交易所 (第 {attempt} 次尝试，最多 {max_retries} 次)")
+                self.logger.info(f"尝试初始化币安合约交易所 (第 {attempt} 次尝试，最多 {max_retries} 次)")
                 
-                # 创建交易所实例
-                exchange = ccxt.binance({
+                # 创建交易所实例 - 直接主网合约
+                exchange_config = {
                     'apiKey': self.api_key,
                     'secret': self.api_secret,
                     'enableRateLimit': True,
                     'options': {
-                        'defaultType': 'future',
+                        'defaultType': CONTRACT_TYPE,  # future 或 delivery
                         'adjustForTimeDifference': True,
                     }
-                })
+                }
                 
-                # 设置测试网模式
-                if self.testnet:
-                    exchange.set_sandbox_mode(True)
-                    self.logger.info("币安测试网模式已启用")
-                else:
-                    self.logger.info("币安主网模式已启用")
+                exchange = ccxt.binance(exchange_config)
                 
-                # 测试连接
+                # 测试连接和权限
                 exchange.load_markets()
-                self.logger.info(f"成功连接到交易所，加载了 {len(exchange.markets)} 个交易对")
+                
+                # 检查合约账户余额
+                try:
+                    balance = exchange.fetch_balance()
+                    usdt_balance = balance.get('USDT', {})
+                    total = float(usdt_balance.get('total', 0))
+                    free = float(usdt_balance.get('free', 0))
+                    
+                    self.logger.info(f"✅ 成功连接到币安{CONTRACT_TYPE}合约主网")
+                    self.logger.info(f"📊 加载了 {len(exchange.markets)} 个交易对")
+                    self.logger.info(f"💰 合约账户余额: 总额={total:.2f} USDT, 可用={free:.2f} USDT")
+                    
+                except Exception as e:
+                    self.logger.error(f"获取合约余额失败，请检查API权限: {str(e)}")
+                    return False
                 
                 self.exchange = exchange
                 self.initialized = True
+                
+                # 主网模式下的重要警告
+                self.logger.warning("⚠️ ⚠️ ⚠️ 重要警告 ⚠️ ⚠️ ⚠️")
+                self.logger.warning("当前运行在币安合约主网模式")
+                self.logger.warning("所有交易都是真实交易，请确保：")
+                self.logger.warning("1. API密钥已开启期货交易权限")
+                self.logger.warning("2. 了解合约交易的风险")
+                self.logger.warning("3. 资金安全由您自己负责")
+                self.logger.warning("4. 建议先用小资金测试")
+                
                 return True
+                
+            except ccxt.AuthenticationError as e:
+                self.logger.error(f"API认证失败 (尝试 {attempt}/{max_retries}): {str(e)}")
+                self.logger.error("请检查: 1. API密钥是否正确 2. 是否开启期货权限 3. IP白名单设置")
+                return False
+                
+            except ccxt.PermissionDenied as e:
+                self.logger.error(f"权限不足 (尝试 {attempt}/{max_retries}): {str(e)}")
+                self.logger.error("请到币安官网开启期货交易权限")
+                return False
                 
             except ccxt.NetworkError as e:
                 self.logger.warning(f"网络错误 (尝试 {attempt}/{max_retries}): {str(e)}")
@@ -192,8 +220,18 @@ class BinanceExchange:
                     return False
                     
             except ccxt.ExchangeError as e:
-                self.logger.error(f"交易所错误 (尝试 {attempt}/{max_retries}): {str(e)}")
-                # 交易所逻辑错误，不需要重试
+                error_msg = str(e)
+                self.logger.error(f"交易所错误 (尝试 {attempt}/{max_retries}): {error_msg}")
+                
+                # 特殊错误处理
+                if "-2015" in error_msg:
+                    self.logger.error("错误代码 -2015: API密钥没有期货交易权限")
+                    self.logger.error("请到币安官网 → 管理API → 启用期货交易")
+                elif "-1021" in error_msg:
+                    self.logger.error("错误代码 -1021: 时间戳错误，请检查系统时间")
+                elif "-1003" in error_msg:
+                    self.logger.error("错误代码 -1003: 请求过于频繁，请降低频率")
+                    
                 return False
                 
             except Exception as e:
@@ -215,11 +253,14 @@ class BinanceExchange:
             raise Exception("交易所未初始化")
         try:
             balance = self.exchange.fetch_balance()
-            return BalanceInfo(
-                total=float(balance['total']['USDT']),
-                free=float(balance['free']['USDT']),
-                used=float(balance['used']['USDT'])
-            )
+            usdt_balance = balance.get('USDT', {})
+            total = float(usdt_balance.get('total', 0))
+            free = float(usdt_balance.get('free', 0))
+            used = float(usdt_balance.get('used', 0))
+            
+            self.logger.info(f"账户余额 - 总额: {total:.2f} USDT, 可用: {free:.2f} USDT, 已用: {used:.2f} USDT")
+            return BalanceInfo(total=total, free=free, used=used)
+            
         except Exception as e:
             self.logger.error(f"获取余额失败: {str(e)}")
             raise
@@ -230,6 +271,17 @@ class BinanceExchange:
         
         try:
             order_type = 'limit' if price else 'market'
+            
+            # 检查最小交易量
+            market = self.exchange.market(symbol)
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+            if quantity < min_amount:
+                return OrderResult(success=False, error=f"交易量低于最小值: {min_amount}")
+            
+            # 主网合约订单 - 记录详细信息
+            order_value = quantity * (price if price else self.get_current_price(symbol))
+            self.logger.warning(f"🚀 准备执行主网合约订单: {symbol} {side} {quantity:.6f} 价值: {order_value:.2f} USDT")
+            
             order = self.exchange.create_order(
                 symbol=symbol,
                 type=order_type,
@@ -237,6 +289,8 @@ class BinanceExchange:
                 amount=quantity,
                 price=price
             )
+            
+            self.logger.warning(f"✅ 主网合约订单执行成功: {symbol} {side} {quantity:.6f} 订单ID: {order['id']}")
             
             return OrderResult(
                 success=True,
@@ -246,9 +300,28 @@ class BinanceExchange:
                 price=float(order['price']),
                 quantity=float(order['amount'])
             )
+            
         except Exception as e:
-            self.logger.error(f"创建订单失败: {str(e)}")
-            return OrderResult(success=False, error=str(e))
+            error_msg = str(e)
+            self.logger.error(f"创建订单失败: {error_msg}")
+            
+            # 主网模式下的特殊错误处理
+            if "insufficient balance" in error_msg.lower():
+                self.logger.critical("💥 余额不足！请立即充值")
+            elif "margin" in error_msg.lower():
+                self.logger.critical("💥 保证金不足！请调整仓位大小")
+            elif "position" in error_msg.lower():
+                self.logger.critical("💥 仓位限制！请检查现有仓位")
+            
+            return OrderResult(success=False, error=error_msg)
+
+    def get_current_price(self, symbol: str) -> float:
+        """获取当前价格"""
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            return float(ticker['last'])
+        except:
+            return 0.0
 
     def get_positions(self) -> List[PositionInfo]:
         if not self.is_initialized():
@@ -258,16 +331,24 @@ class BinanceExchange:
             positions = self.exchange.fetch_positions()
             result = []
             for pos in positions:
-                if float(pos['contracts']) > 0:
+                contracts = float(pos.get('contracts', 0))
+                if contracts > 0:
                     result.append(PositionInfo(
                         symbol=pos['symbol'],
                         side=PositionSide.LONG if pos['side'] == 'long' else PositionSide.SHORT,
-                        size=float(pos['contracts']),
-                        entry_price=float(pos['entryPrice']),
-                        unrealized_pnl=float(pos['unrealizedPnl']),
-                        leverage=int(pos['leverage']),
+                        size=contracts,
+                        entry_price=float(pos.get('entryPrice', 0)),
+                        unrealized_pnl=float(pos.get('unrealizedPnl', 0)),
+                        leverage=int(pos.get('leverage', 1)),
                         timestamp=datetime.now()
                     ))
+            
+            # 记录持仓信息
+            if result:
+                for pos in result:
+                    pnl_color = "🟢" if pos.unrealized_pnl >= 0 else "🔴"
+                    self.logger.info(f"{pnl_color} 持仓: {pos.symbol} {pos.side.value} {pos.size:.6f} 盈亏: {pos.unrealized_pnl:.2f} USDT")
+            
             return result
         except Exception as e:
             self.logger.error(f"获取仓位失败: {str(e)}")
@@ -367,7 +448,7 @@ class IndicatorSystem:
                 side=OrderSide.BUY,
                 price=price,
                 atr=atr,
-                quantity=0,  # 数量将在执行时计算
+                quantity=0,
                 timestamp=datetime.now(),
                 confidence=0.8
             )
@@ -407,7 +488,7 @@ class TradeExecutor:
         position_size = risk_amount / risk_per_unit
         
         # 确保最小交易量
-        min_size = 0.001  # 根据交易所调整
+        min_size = 0.001
         return max(position_size, min_size)
     
     async def execute_order(self, signal: TradeSignal, balance: float) -> OrderResult:
@@ -422,6 +503,10 @@ class TradeExecutor:
                 return OrderResult(success=False, error="仓位计算错误")
             
             signal.quantity = position_size
+            
+            # 主网模式下的额外确认
+            order_value = position_size * signal.price
+            self.logger.warning(f"⚠️ 准备执行主网合约订单: {signal.symbol} {signal.side.value} {position_size:.6f} 价值: {order_value:.2f} USDT")
             
             # 创建订单
             result = self.exchange.create_order(
@@ -532,8 +617,8 @@ class DualMartingaleManager:
         layer_multiplier = MARTINGALE_MULTIPLIER ** (layer_number - 1)
         risk_amount = base_risk * layer_multiplier
         
-        # 使用ATR计算风险（简化版）
-        risk_per_unit = current_price * 0.02  # 假设2%的价格波动
+        # 使用ATR计算风险
+        risk_per_unit = current_price * 0.02
         
         position_size = risk_amount / risk_per_unit
         
@@ -560,11 +645,11 @@ class DualMartingaleManager:
         
         # 计算止损和止盈
         if side == PositionSide.LONG:
-            stop_loss = current_price * (1 - 0.03)  # 3%止损
-            take_profit = current_price * (1 + 0.06)  # 6%止盈
+            stop_loss = current_price * (1 - 0.03)
+            take_profit = current_price * (1 + 0.06)
         else:
-            stop_loss = current_price * (1 + 0.03)  # 3%止损
-            take_profit = current_price * (1 - 0.06)  # 6%止盈
+            stop_loss = current_price * (1 + 0.03)
+            take_profit = current_price * (1 - 0.06)
             
         layer = MartingaleLayer(
             symbol=self.symbol,
@@ -634,9 +719,9 @@ class DualMartingaleManager:
                     self.short_layers.clear()
                     self.logger.info(f"平空仓成功: {total_short:.6f}")
 
-# ================== 主交易机器人 ==================
+# ================== 主交易机器人（主网合约模式） ==================
 class EnhancedProductionTrader:
-    """增强的生产环境交易机器人"""
+    """增强的生产环境交易机器人（主网合约模式）"""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -653,22 +738,29 @@ class EnhancedProductionTrader:
     def handle_exit(self, signum, frame):
         """处理退出信号"""
         self.logger.info(f"收到信号 {signum}，正在优雅退出...")
+        # 尝试平掉所有仓位
+        if self.initialized:
+            asyncio.run(self.close_all_positions())
         sys.exit(0)
+    
+    async def close_all_positions(self):
+        """平掉所有仓位"""
+        for symbol, manager in self.martingale_managers.items():
+            await manager.close_all_positions()
     
     def initialize_exchange(self) -> bool:
         """初始化交易所连接"""
         try:
-            self.logger.info("开始初始化交易所连接...")
+            self.logger.info("开始初始化币安合约交易所连接...")
             
             if not BINANCE_API_KEY or not BINANCE_API_SECRET:
                 self.logger.error("请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
                 return False
             
-            # 创建交易所实例
+            # 创建交易所实例 - 主网合约模式
             exchange = BinanceExchange(
                 api_key=BINANCE_API_KEY,
-                api_secret=BINANCE_API_SECRET,
-                testnet=TESTNET
+                api_secret=BINANCE_API_SECRET
             )
             
             # 使用重试机制初始化
@@ -683,7 +775,7 @@ class EnhancedProductionTrader:
                     )
                 
                 self.initialized = True
-                self.logger.info("交易所初始化成功")
+                self.logger.info("币安合约交易所初始化成功")
                 return True
             else:
                 self.logger.error("交易所初始化失败，请检查网络连接或API密钥")
@@ -705,7 +797,12 @@ class EnhancedProductionTrader:
             # 第二步：检查余额
             try:
                 balance = self.exchange.get_balance()
-                self.logger.info(f"账户余额: 总额={balance.total:.2f} USDT, 可用={balance.free:.2f} USDT")
+                self.logger.info(f"合约账户余额: 总额={balance.total:.2f} USDT, 可用={balance.free:.2f} USDT")
+                
+                # 资金警告
+                if balance.free < 50:
+                    self.logger.warning("⚠️ 可用资金较少，建议充值")
+                    
             except Exception as e:
                 self.logger.warning(f"获取余额失败: {str(e)}")
             
@@ -828,7 +925,7 @@ class EnhancedProductionTrader:
                     
                 except Exception as e:
                     self.logger.error(f"交易周期执行错误: {str(e)}")
-                    await asyncio.sleep(60)  # 错误后等待1分钟再继续
+                    await asyncio.sleep(60)
                     
         except asyncio.CancelledError:
             self.logger.info("交易任务被取消")
