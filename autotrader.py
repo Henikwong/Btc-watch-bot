@@ -71,6 +71,44 @@ class TradeSignal:
     def __str__(self):
         return f"{self.symbol} {self.type.value}@{self.price:.2f} (Conf: {self.confidence:.2f})"
 
+# ================== 技术指标分析 ==================
+class TechnicalAnalyzer:
+    @staticmethod
+    def calculate_indicators(df: pd.DataFrame) -> dict:
+        """计算技术指标 - 简化版本"""
+        if df is None or len(df) < 50:
+            return {}
+        
+        # 基本指标计算
+        price = df['close'].iloc[-1]
+        volume = df['volume'].iloc[-1]
+        
+        # 简单移动平均
+        sma_20 = df['close'].rolling(window=20).mean().iloc[-1]
+        
+        return {
+            'price': price,
+            'volume': volume,
+            'sma_20': sma_20,
+            # 添加更多指标...
+        }
+
+    @staticmethod
+    def generate_signal(symbol: str, indicators: dict) -> Optional[TradeSignal]:
+        """生成交易信号 - 简化版本"""
+        if not indicators:
+            return None
+            
+        price = indicators['price']
+        
+        # 简单信号逻辑 - 可以根据需要扩展
+        if price > indicators.get('sma_20', price * 1.05):
+            return TradeSignal(symbol, SignalType.BUY, price, 0.7, indicators)
+        elif price < indicators.get('sma_20', price * 0.95):
+            return TradeSignal(symbol, SignalType.SELL, price, 0.7, indicators)
+            
+        return None
+
 # ================== 交易所接口 ==================
 class BinanceFutureAPI:
     def __init__(self, api_key: str, api_secret: str, symbols: List[str]):
@@ -407,7 +445,7 @@ class HedgeMartingaleBot:
     def __init__(self, symbols: List[str]):
         self.symbols = symbols  # 使用传入的symbols而不是全局变量
         self.api = BinanceFutureAPI(BINANCE_API_KEY, BINANCE_API_SECRET, symbols)
-        self.analyzer = TechnicalAnalyzer()
+        self.analyzer = TechnicalAnalyzer()  # 现在这个类已经定义了
         self.martingale = DualMartingaleManager()
         self.running = True
         signal.signal(signal.SIGINT, self.shutdown)
