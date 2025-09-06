@@ -9,6 +9,7 @@ import logging
 import asyncio
 import signal
 import json
+import math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 from enum import Enum
@@ -27,6 +28,7 @@ LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 RISK_RATIO = float(os.getenv("RISK_RATIO", "0.15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "10"))  # 每个仓位的初始USDT价值
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"  # 模拟模式，不实际下单
 
 # 马丁策略参数
 MAX_LAYERS = int(os.getenv("MAX_MARTINGALE_LAYERS", "4"))
@@ -37,7 +39,22 @@ MIN_LAYER_INTERVAL = int(os.getenv("MIN_LAYER_INTERVAL_MINUTES", "240"))  # 加�
 
 # 止损止盈参数
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))  # 30%止损
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.2"))  # 20%止盈
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.015"))  # 1.5%止盈
+
+# 重试参数
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
+
+# 币安最小名义价值要求（USDT）
+MIN_NOTIONAL = {
+    "LTC/USDT": 20,
+    "XRP/USDT": 5,
+    "ADA/USDT": 5,
+    "DOGE/USDT": 20,
+    "LINK/USDT": 20,
+    "BTC/USDT": 10,
+    "ETH/USDT": 10,
+}
 
 # 指标参数
 RSI_OVERBOUGHT = 70
@@ -71,6 +88,36 @@ class TradeSignal:
 
     def __str__(self):
         return f"{self.symbol} {self.type.value}@{self.price:.2f} (Conf: {self.confidence:.2f})"
+
+# ================== 工具函数 ==================
+def quantize_amount(amount: float, market) -> float:
+    """量化交易量到交易所允许的精度"""
+    try:
+        # 尝试从filters获取stepSize
+        step = None
+        for f in market['info'].get('filters', []):
+            if f.get('filterType') == 'LOT_SIZE':
+                step = float(f.get('stepSize'))
+                break
+        
+        if step is None:
+            # 回退到精度
+            prec = market.get('precision', {}).get('amount')
+            if isinstance(prec, int):
+                return round(amount, prec)
+            # 默认精度
+            return float(Decimal(amount).quantize(Decimal('0.000001'), rounding=ROUND_DOWN))
+        
+        # 使用Decimal进行精确计算
+        step_dec = Decimal(str(step))
+        amount_dec = Decimal(str(amount))
+        # 向下取整到step的倍数
+        quantized = (amount_dec // step_dec) * step_dec
+        return float(quantized)
+    except Exception as e:
+        logger.error(f"量化数量失败: {e}")
+        # 回退到简单舍入
+        return round(amount, 6)
 
 # ================== 技术指标分析 ==================
 class TechnicalAnalyzer:
@@ -180,63 +227,6 @@ class BinanceFutureAPI:
             logger.error(f"获取价格失败 {symbol}: {e}")
             return None
 
-    def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
-        try:
-            # 获取交易对精度信息
-            market = self.symbol_info.get(symbol)
-            if not market:
-                logger.error(f"找不到交易对信息: {symbol}")
-                return False
-                
-            # 计算合约数量
-            current_price = self.get_current_price(symbol)
-            if current_price is None:
-                logger.error(f"无法获取 {symbol} 的价格")
-                return False
-                
-            # 计算合约数量
-            contract_size = amount / current_price
-            
-            # 获取精度信息
-            precision = market['precision']['amount']
-            if isinstance(precision, int):
-                # 如果精度是整数，表示小数点后的位数
-                contract_size = round(contract_size, precision)
-            else:
-                # 如果精度是浮点数，表示最小交易量
-                contract_size = max(contract_size, precision)
-                contract_size = contract_size - (contract_size % precision)
-            
-            # 确保不低于最小交易量
-            min_amount = market['limits']['amount']['min']
-            if contract_size < min_amount:
-                contract_size = min_amount
-                logger.warning(f"交易量低于最小值，使用最小值: {min_amount}")
-
-            # 确保数量是浮点数
-            contract_size = float(contract_size)
-            
-            # 使用更简单的方法创建订单
-            params = {
-                "positionSide": position_side,
-                "type": "MARKET"
-            }
-            
-            order = self.exchange.create_order(
-                symbol,
-                'market',
-                side.lower(),
-                contract_size,
-                None,
-                params
-            )
-            
-            logger.info(f"订单成功 {symbol} {side} {contract_size:.6f} ({position_side}) - 订单ID: {order['id']}")
-            return True
-        except Exception as e:
-            logger.error(f"下单失败 {symbol} {side}: {e}")
-            return False
-
     def get_positions(self, symbol: str) -> Dict[str, dict]:
         """获取当前持仓信息"""
         try:
@@ -254,6 +244,100 @@ class BinanceFutureAPI:
         except Exception as e:
             logger.error(f"获取持仓失败 {symbol}: {e}")
             return {}
+
+    def create_order_with_fallback(self, symbol: str, side: str, contract_size: float, position_side: str):
+        """创建订单，如果失败则尝试回退到单向模式"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                # 尝试带positionSide下单
+                params = {"positionSide": position_side}
+                order = self.exchange.create_order(
+                    symbol,
+                    'market',
+                    side.lower(),
+                    contract_size,
+                    None,
+                    params
+                )
+                return order
+            except Exception as e:
+                err_msg = str(e)
+                # 如果是position side不匹配的错误，尝试不带positionSide下单
+                if "-4061" in err_msg or "position side does not match" in err_msg.lower():
+                    logger.warning(f"positionSide与账户设置不符，尝试不带positionSide重试")
+                    try:
+                        order = self.exchange.create_order(
+                            symbol,
+                            'market',
+                            side.lower(),
+                            contract_size
+                        )
+                        return order
+                    except Exception as e2:
+                        logger.error(f"重试不带positionSide失败: {e2}")
+                        if attempt == MAX_RETRIES - 1:
+                            return None
+                else:
+                    logger.error(f"下单失败: {e}")
+                    if attempt == MAX_RETRIES - 1:
+                        return None
+            
+            # 等待一段时间后重试
+            time.sleep(RETRY_DELAY * (2 ** attempt))
+        
+        return None
+
+    def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
+        if DRY_RUN:
+            logger.info(f"模拟下单 {symbol} {side} {amount:.6f} ({position_side})")
+            return True
+            
+        try:
+            # 获取交易对信息
+            market = self.symbol_info.get(symbol)
+            if not market:
+                logger.error(f"找不到交易对信息: {symbol}")
+                return False
+                
+            # 获取当前价格
+            current_price = self.get_current_price(symbol)
+            if current_price is None:
+                logger.error(f"无法获取 {symbol} 的价格")
+                return False
+                
+            # 计算合约数量
+            contract_size = amount / current_price
+            
+            # 量化到交易所精度
+            contract_size = quantize_amount(contract_size, market)
+            
+            # 确保不低于最小交易量
+            min_amount = market['limits']['amount']['min']
+            if contract_size < min_amount:
+                contract_size = min_amount
+                logger.warning(f"交易量低于最小值，使用最小值: {min_amount}")
+
+            # 检查最小名义价值
+            min_notional = MIN_NOTIONAL.get(symbol, 10)  # 默认10 USDT
+            notional_value = contract_size * current_price
+            if notional_value < min_notional:
+                # 调整合约数量以满足最小名义价值要求
+                contract_size = min_notional / current_price
+                contract_size = quantize_amount(contract_size, market)
+                logger.warning(f"名义价值 {notional_value:.2f} USDT 低于最小值 {min_notional} USDT，调整合约数量为 {contract_size:.6f}")
+            
+            # 创建订单
+            order = self.create_order_with_fallback(symbol, side, contract_size, position_side)
+            if order:
+                logger.info(f"订单成功 {symbol} {side} {contract_size:.6f} ({position_side}) - 订单ID: {order['id']}")
+                return True
+            else:
+                logger.error(f"下单失败 {symbol} {side}: 所有重试均失败")
+                return False
+                
+        except Exception as e:
+            logger.error(f"下单失败 {symbol} {side}: {e}")
+            return False
 
 # ================== 双仓马丁策略管理 ==================
 class DualMartingaleManager:
@@ -502,6 +586,20 @@ class HedgeMartingaleBot:
 
     async def open_immediate_hedge(self, symbol: str, balance: float):
         """程序启动时立即开双仓"""
+        # 检查交易所是否已有仓位
+        exchange_positions = self.api.get_positions(symbol)
+        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+        
+        if has_long or has_short:
+            logger.info(f"⏩ {symbol} 交易所已有仓位，跳过开仓")
+            # 同步本地记录
+            if has_long:
+                self.martingale.add_position(symbol, "buy", exchange_positions['long']['size'], exchange_positions['long']['entry_price'])
+            if has_short:
+                self.martingale.add_position(symbol, "sell", exchange_positions['short']['size'], exchange_positions['short']['entry_price'])
+            return
+        
         # 获取当前价格
         current_price = self.api.get_current_price(symbol)
         if current_price is None:
