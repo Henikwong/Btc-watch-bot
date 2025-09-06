@@ -194,6 +194,7 @@ class BinanceFutureAPI:
                 logger.error(f"无法获取 {symbol} 的价格")
                 return False
                 
+            # 计算合约数量
             contract_size = amount / current_price
             
             # 调整数量到最小精度
@@ -206,6 +207,9 @@ class BinanceFutureAPI:
                 contract_size = min_amount
                 logger.warning(f"交易量低于最小值，使用最小值: {min_amount}")
 
+            # 确保数量是浮点数，而不是整数
+            contract_size = float(contract_size)
+            
             order = self.exchange.create_market_order(
                 symbol,
                 side.lower(),
