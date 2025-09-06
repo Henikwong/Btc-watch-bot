@@ -22,24 +22,26 @@ load_dotenv()
 # ================== 配置参数 ==================
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "ETH/USDT,LTC/USDT,BNB/USDT,DOGE/USDT,XRP/USDT,SOL/USDT,AVAX/USDT,ADA/USDT,LINK/USDT,UNI/USDT,SUI/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
-RISK_RATIO = float(os.getenv("RISK_RATIO", "0.15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-TRADE_SIZE = float(os.getenv("TRADE_SIZE", "10"))  # 每个仓位的初始USDT价值
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"  # 模拟模式，不实际下单
 
-# 马丁策略参数
-MAX_LAYERS = int(os.getenv("MAX_MARTINGALE_LAYERS", "4"))
-MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE_MULTIPLIER", "2.0"))
-LAYER_TRIGGER = float(os.getenv("MARTINGALE_TRIGGER_LOSS", "0.05"))
-INITIAL_RISK = float(os.getenv("INITIAL_RISK_PERCENT", "0.02"))
-MIN_LAYER_INTERVAL = int(os.getenv("MIN_LAYER_INTERVAL_MINUTES", "240"))  # 加仓最小间隔时间(分钟)
+# 解析仓位大小配置
+POSITION_SIZES_STR = os.getenv("POSITION_SIZES", "2.678%,5%,6%,7%,8%,9%,10%,13%,14%")
+POSITION_SIZES = [float(size.strip('%')) / 100 for size in POSITION_SIZES_STR.split(',')]
+MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位大小配置的数量
 
 # 止损止盈参数
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.3"))  # 30%止损
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.015"))  # 1.5%止盈
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))  # 固定金额止损
+TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").strip('%')) / 100  # 百分比止盈
+
+# 加仓间隔时间(分钟)
+MIN_LAYER_INTERVAL = int(os.getenv("MIN_LAYER_INTERVAL", "240"))
+
+# 冷静期参数
+MAX_DAILY_LAYERS = int(os.getenv("MAX_DAILY_LAYERS", "3"))  # 每天最大加仓次数
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "24"))  # 冷静期小时数
 
 # 重试参数
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
@@ -54,40 +56,22 @@ MIN_NOTIONAL = {
     "LINK/USDT": 20,
     "BTC/USDT": 10,
     "ETH/USDT": 10,
+    "BNB/USDT": 10,
+    "SOL/USDT": 10,
+    "DOT/USDT": 10,
+    "AVAX/USDT": 10,
+    "MATIC/USDT": 10,
+    "UNI/USDT": 10,
+    "SUI/USDT": 10,
 }
-
-# 指标参数
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
 
 # ================== 日志设置 ==================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('hedge_martingale_bot.log')]
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('cointech2u_bot.log')]
 )
-logger = logging.getLogger("HedgeMartingaleBot")
-
-# ================== 数据模型 ==================
-class SignalType(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    NEUTRAL = "NEUTRAL"
-
-class TradeSignal:
-    def __init__(self, symbol: str, signal_type: SignalType, price: float, confidence: float, indicators: dict):
-        self.symbol = symbol
-        self.type = signal_type
-        self.price = price
-        self.confidence = confidence
-        self.indicators = indicators
-        self.timestamp = datetime.now()
-
-    def __str__(self):
-        return f"{self.symbol} {self.type.value}@{self.price:.2f} (Conf: {self.confidence:.2f})"
+logger = logging.getLogger("CoinTech2uBot")
 
 # ================== 工具函数 ==================
 def quantize_amount(amount: float, market) -> float:
@@ -119,43 +103,6 @@ def quantize_amount(amount: float, market) -> float:
         # 回退到简单舍入
         return round(amount, 6)
 
-# ================== 技术指标分析 ==================
-class TechnicalAnalyzer:
-    @staticmethod
-    def calculate_indicators(df: pd.DataFrame) -> dict:
-        """计算技术指标 - 简化版本"""
-        if df is None or len(df) < 50:
-            return {}
-        
-        # 基本指标计算
-        price = df['close'].iloc[-1]
-        volume = df['volume'].iloc[-1]
-        
-        # 简单移动平均
-        sma_20 = df['close'].rolling(window=20).mean().iloc[-1]
-        
-        return {
-            'price': price,
-            'volume': volume,
-            'sma_20': sma_20,
-        }
-
-    @staticmethod
-    def generate_signal(symbol: str, indicators: dict) -> Optional[TradeSignal]:
-        """生成交易信号 - 简化版本"""
-        if not indicators:
-            return None
-            
-        price = indicators['price']
-        
-        # 简单信号逻辑 - 可以根据需要扩展
-        if price > indicators.get('sma_20', price * 1.05):
-            return TradeSignal(symbol, SignalType.BUY, price, 0.7, indicators)
-        elif price < indicators.get('sma_20', price * 0.95):
-            return TradeSignal(symbol, SignalType.SELL, price, 0.7, indicators)
-            
-        return None
-
 # ================== 交易所接口 ==================
 class BinanceFutureAPI:
     def __init__(self, api_key: str, api_secret: str, symbols: List[str]):
@@ -170,7 +117,7 @@ class BinanceFutureAPI:
             self.exchange = ccxt.binance({
                 'apiKey': self.api_key,
                 'secret': self.api_secret,
-                'options': {'defaultType': 'future', 'hedgeMode': True},
+                'options': {'defaultType': 'future'},
                 'enableRateLimit': True
             })
             
@@ -182,11 +129,19 @@ class BinanceFutureAPI:
                 if symbol in markets:
                     self.symbol_info[symbol] = markets[symbol]
                     try:
+                        # 设置杠杆
                         self.exchange.set_leverage(LEVERAGE, symbol)
                         logger.info(f"设置杠杆 {symbol} {LEVERAGE}x")
+                        
+                        # 设置对冲模式
+                        self.exchange.set_position_mode(True, symbol)
+                        logger.info(f"设置对冲模式 {symbol}")
+                        
                         valid_symbols.append(symbol)
                     except Exception as e:
-                        logger.warning(f"设置杠杆失败 {symbol}: {e}")
+                        logger.warning(f"设置杠杆或对冲模式失败 {symbol}: {e}")
+                        # 即使设置失败，也继续使用该交易对
+                        valid_symbols.append(symbol)
                 else:
                     logger.warning(f"交易对 {symbol} 不存在，跳过")
             
@@ -207,17 +162,6 @@ class BinanceFutureAPI:
             logger.error(f"获取余额失败: {e}")
             return 0.0
 
-    def get_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 100) -> Optional[pd.DataFrame]:
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            return df
-        except Exception as e:
-            logger.error(f"K线获取失败 {symbol}: {e}")
-            return None
-
     def get_current_price(self, symbol: str) -> Optional[float]:
         """获取当前价格"""
         try:
@@ -234,7 +178,8 @@ class BinanceFutureAPI:
             result = {}
             for pos in positions:
                 if float(pos['contracts']) > 0:
-                    result[pos['side']] = {
+                    side = pos['side'].lower()
+                    result[side] = {
                         'size': float(pos['contracts']),
                         'entry_price': float(pos['entryPrice']),
                         'side': pos['side'],
@@ -245,8 +190,8 @@ class BinanceFutureAPI:
             logger.error(f"获取持仓失败 {symbol}: {e}")
             return {}
 
-    def create_order_with_fallback(self, symbol: str, side: str, contract_size: float, position_side: str):
-        """创建订单，如果失败则尝试回退到单向模式"""
+    def create_order_with_retry(self, symbol: str, side: str, contract_size: float, position_side: str):
+        """创建订单，带重试机制"""
         for attempt in range(MAX_RETRIES):
             try:
                 # 尝试带positionSide下单
@@ -262,6 +207,8 @@ class BinanceFutureAPI:
                 return order
             except Exception as e:
                 err_msg = str(e)
+                logger.error(f"下单失败 (尝试 {attempt+1}/{MAX_RETRIES}): {e}")
+                
                 # 如果是position side不匹配的错误，尝试不带positionSide下单
                 if "-4061" in err_msg or "position side does not match" in err_msg.lower():
                     logger.warning(f"positionSide与账户设置不符，尝试不带positionSide重试")
@@ -278,7 +225,6 @@ class BinanceFutureAPI:
                         if attempt == MAX_RETRIES - 1:
                             return None
                 else:
-                    logger.error(f"下单失败: {e}")
                     if attempt == MAX_RETRIES - 1:
                         return None
             
@@ -288,10 +234,6 @@ class BinanceFutureAPI:
         return None
 
     def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
-        if DRY_RUN:
-            logger.info(f"模拟下单 {symbol} {side} {amount:.6f} ({position_side})")
-            return True
-            
         try:
             # 获取交易对信息
             market = self.symbol_info.get(symbol)
@@ -327,7 +269,7 @@ class BinanceFutureAPI:
                 logger.warning(f"名义价值 {notional_value:.2f} USDT 低于最小值 {min_notional} USDT，调整合约数量为 {contract_size:.6f}")
             
             # 创建订单
-            order = self.create_order_with_fallback(symbol, side, contract_size, position_side)
+            order = self.create_order_with_retry(symbol, side, contract_size, position_side)
             if order:
                 logger.info(f"订单成功 {symbol} {side} {contract_size:.6f} ({position_side}) - 订单ID: {order['id']}")
                 return True
@@ -341,11 +283,16 @@ class BinanceFutureAPI:
 
 # ================== 双仓马丁策略管理 ==================
 class DualMartingaleManager:
-    def __init__(self):
+    def __init__(self, api):
+        self.api = api
         # 仓位结构: {symbol: {'long': [], 'short': []}}
         self.positions: Dict[str, Dict[str, List[dict]]] = {}
         # 最后加仓时间: {symbol: {'long': datetime, 'short': datetime}}
         self.last_layer_time: Dict[str, Dict[str, datetime]] = {}
+        # 每日加仓次数: {symbol: {'long': count, 'short': count}}
+        self.daily_layer_count: Dict[str, Dict[str, int]] = {}
+        # 冷静期开始时间: {symbol: {'long': datetime, 'short': datetime}}
+        self.cooldown_start: Dict[str, Dict[str, datetime]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # 加载保存的仓位
@@ -357,12 +304,26 @@ class DualMartingaleManager:
             self.positions[symbol] = {'long': [], 'short': []}
         if symbol not in self.last_layer_time:
             self.last_layer_time[symbol] = {'long': None, 'short': None}
+        if symbol not in self.daily_layer_count:
+            self.daily_layer_count[symbol] = {'long': 0, 'short': 0}
+        if symbol not in self.cooldown_start:
+            self.cooldown_start[symbol] = {'long': None, 'short': None}
 
     def add_position(self, symbol: str, side: str, size: float, price: float):
         """添加仓位到对应方向"""
         self.initialize_symbol(symbol)
         position_side = 'long' if side.lower() == 'buy' else 'short'
         layer = len(self.positions[symbol][position_side]) + 1
+        
+        # 如果是加仓（不是初始开仓），增加每日加仓计数
+        if layer > 1:
+            self.daily_layer_count[symbol][position_side] += 1
+            logger.info(f"📊 {symbol} {position_side.upper()} 今日已加仓 {self.daily_layer_count[symbol][position_side]} 次")
+            
+            # 检查是否达到每日加仓上限
+            if self.daily_layer_count[symbol][position_side] >= MAX_DAILY_LAYERS:
+                logger.warning(f"⏳ {symbol} {position_side.upper()} 今日加仓已达 {MAX_DAILY_LAYERS} 次上限，进入 {COOLDOWN_HOURS} 小时冷静期")
+                self.cooldown_start[symbol][position_side] = datetime.now()
         
         self.positions[symbol][position_side].append({
             'side': side,
@@ -378,10 +339,35 @@ class DualMartingaleManager:
         # 保存仓位状态
         self.save_positions()
 
+    def is_in_cooldown(self, symbol: str, position_side: str) -> bool:
+        """检查是否处于冷静期"""
+        self.initialize_symbol(symbol)
+        
+        cooldown_start = self.cooldown_start[symbol][position_side]
+        if cooldown_start is None:
+            return False
+            
+        # 检查冷静期是否已过
+        if datetime.now() - cooldown_start >= timedelta(hours=COOLDOWN_HOURS):
+            # 冷静期结束，重置计数和冷静期
+            self.daily_layer_count[symbol][position_side] = 0
+            self.cooldown_start[symbol][position_side] = None
+            logger.info(f"✅ {symbol} {position_side.upper()} 冷静期结束，可以重新加仓")
+            return False
+            
+        # 仍在冷静期中
+        remaining_time = cooldown_start + timedelta(hours=COOLDOWN_HOURS) - datetime.now()
+        logger.info(f"⏳ {symbol} {position_side.upper()} 处于冷静期，剩余时间: {remaining_time}")
+        return True
+
     def should_add_layer(self, symbol: str, position_side: str, current_price: float) -> bool:
         """检查是否应该加仓"""
         self.initialize_symbol(symbol)
         
+        # 检查是否处于冷静期
+        if self.is_in_cooldown(symbol, position_side):
+            return False
+            
         # 检查是否已达到最大层数
         if len(self.positions[symbol][position_side]) >= MAX_LAYERS:
             logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
@@ -407,49 +393,54 @@ class DualMartingaleManager:
         else:  # short
             pnl_pct = (avg_price - current_price) / avg_price
             
-        logger.info(f"📈 {symbol} {position_side.upper()} 当前盈亏: {pnl_pct*100:.2f}%, 触发阈值: {-LAYER_TRIGGER*100:.2f}%")
+        # 获取当前层数对应的触发跌幅
+        current_layer = len(positions)
+        trigger_pct = -0.025  # 默认2.5%触发加仓
+        
+        logger.info(f"📈 {symbol} {position_side.upper()} 当前盈亏: {pnl_pct*100:.2f}%, 触发阈值: {trigger_pct*100:.2f}%")
         
         # 只有当亏损达到触发阈值时才加仓
-        return pnl_pct <= -LAYER_TRIGGER
+        return pnl_pct <= trigger_pct
 
-    def calculate_layer_size(self, symbol: str, position_side: str, balance: float, current_price: float) -> float:
-        """计算加仓大小"""
+    def calculate_layer_size(self, symbol: str, position_side: str, current_price: float) -> float:
+        """计算加仓大小 - 使用POSITION_SIZES配置"""
         self.initialize_symbol(symbol)
         layer = len(self.positions[symbol][position_side]) + 1
         
-        # 使用固定USDT价值或基于风险的动态计算
-        if TRADE_SIZE > 0:
-            # 使用固定USDT价值
-            size_in_usdt = TRADE_SIZE * (MARTINGALE_MULTIPLIER ** (layer - 1))
-            size = size_in_usdt / current_price
+        # 获取当前层的仓位百分比
+        if layer <= len(POSITION_SIZES):
+            position_pct = POSITION_SIZES[layer - 1]
         else:
-            # 基于风险的动态计算
-            base_size = (balance * INITIAL_RISK) / current_price
-            size = base_size * (MARTINGALE_MULTIPLIER ** (layer - 1))
+            # 如果层级超过配置，使用最后一层的值
+            position_pct = POSITION_SIZES[-1]
         
-        # 限制最大仓位大小不超过余额的20%
-        max_size = balance * 0.2 / current_price
-        final_size = min(size, max_size)
+        # 获取账户余额
+        balance = self.api.get_balance()
         
-        logger.info(f"📏 {symbol} {position_side.upper()} 第{layer}层计算仓位: 基础={size:.6f}, 最终={final_size:.6f}")
-        return final_size
+        # 计算仓位大小（USDT）
+        size_in_usdt = balance * position_pct
+        
+        # 转换为币的数量
+        size = size_in_usdt / current_price
+        
+        logger.info(f"📏 {symbol} {position_side.upper()} 第{layer}层计算仓位: 百分比={position_pct*100:.3f}%, USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
+        return size
 
-    def calculate_initial_size(self, balance: float, current_price: float) -> float:
-        """计算初始仓位大小"""
-        # 使用固定USDT价值或基于风险的动态计算
-        if TRADE_SIZE > 0:
-            # 使用固定USDT价值
-            size = TRADE_SIZE / current_price
-        else:
-            # 基于风险的动态计算
-            size = (balance * INITIAL_RISK) / current_price
+    def calculate_initial_size(self, current_price: float) -> float:
+        """计算初始仓位大小 - 使用POSITION_SIZES配置"""
+        # 获取账户余额
+        balance = self.api.get_balance()
         
-        # 限制最大仓位大小不超过余额的10%
-        max_size = balance * 0.1 / current_price
-        return min(size, max_size)
+        # 使用第一层的百分比
+        position_pct = POSITION_SIZES[0]
+        size_in_usdt = balance * position_pct
+        size = size_in_usdt / current_price
+        
+        logger.info(f"📏 初始仓位计算: 百分比={position_pct*100:.3f}%, USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
+        return size
         
     def should_close_position(self, symbol: str, position_side: str, current_price: float) -> bool:
-        """检查是否应该平仓（止损或止盈）"""
+        """检查是否应该平仓（固定金额止损和百分比止盈）"""
         self.initialize_symbol(symbol)
         if not self.positions[symbol][position_side]:
             return False
@@ -459,20 +450,27 @@ class DualMartingaleManager:
         total_value = sum(p['size'] * p['entry_price'] for p in positions)
         avg_price = total_value / total_size
         
-        # 计算当前盈亏百分比
+        # 计算当前盈亏金额（USDT）
         if position_side == 'long':
-            pnl_pct = (current_price - avg_price) / avg_price
+            pnl_amount = (current_price - avg_price) * total_size
         else:  # short
-            pnl_pct = (avg_price - current_price) / avg_price
+            pnl_amount = (avg_price - current_price) * total_size
             
-        # 如果亏损超过止损点，强制平仓
-        if pnl_pct <= -STOP_LOSS_PCT:
-            logger.warning(f"🚨 {symbol} {position_side.upper()} 亏损超过{STOP_LOSS_PCT*100:.0f}%，强制平仓")
+        # 如果亏损超过100 USDT，强制平仓
+        if pnl_amount <= STOP_LOSS:
+            logger.warning(f"🚨 {symbol} {position_side.upper()} 亏损超过{abs(STOP_LOSS)} USDT，强制平仓")
             return True
             
         # 如果盈利超过止盈点，止盈平仓
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            logger.info(f"🎯 {symbol} {position_side.upper()} 盈利超过{TAKE_PROFIT_PCT*100:.0f}%，止盈平仓")
+        # 这里计算从第一层入场价到当前价的盈利百分比
+        first_entry_price = positions[0]['entry_price']
+        if position_side == 'long':
+            profit_pct = (current_price - first_entry_price) / first_entry_price
+        else:  # short
+            profit_pct = (first_entry_price - current_price) / first_entry_price
+            
+        if profit_pct >= TP_PERCENT:
+            logger.info(f"🎯 {symbol} {position_side.upper()} 盈利超过{TP_PERCENT*100:.2f}%，止盈平仓")
             return True
             
         return False
@@ -495,17 +493,49 @@ class DualMartingaleManager:
         self.initialize_symbol(symbol)
         return len(self.positions[symbol]['long']) > 0 or len(self.positions[symbol]['short']) > 0
     
+    def sync_with_exchange(self, symbol: str):
+        """同步交易所仓位和本地记录"""
+        try:
+            # 获取交易所的实际仓位
+            exchange_positions = self.api.get_positions(symbol)
+            
+            # 检查多仓
+            long_position = exchange_positions.get('long')
+            local_long_size = self.get_position_size(symbol, 'long')
+            
+            # 如果交易所没有多仓但本地记录有，清空本地记录
+            if (not long_position or long_position['size'] == 0) and local_long_size > 0:
+                logger.info(f"🔄 {symbol} 交易所多仓位已平，清空本地记录")
+                self.clear_positions(symbol, 'long')
+            
+            # 检查空仓
+            short_position = exchange_positions.get('short')
+            local_short_size = self.get_position_size(symbol, 'short')
+            
+            # 如果交易所没有空仓但本地记录有，清空本地记录
+            if (not short_position or short_position['size'] == 0) and local_short_size > 0:
+                logger.info(f"🔄 {symbol} 交易所空仓位已平，清空本地记录")
+                self.clear_positions(symbol, 'short')
+                
+        except Exception as e:
+            logger.error(f"同步仓位失败 {symbol}: {e}")
+    
     def save_positions(self):
         """保存仓位状态到文件"""
         try:
             # 转换为可序列化的格式
-            serializable_positions = {}
+            serializable_data = {
+                'positions': {},
+                'daily_layer_count': self.daily_layer_count,
+                'cooldown_start': {}
+            }
+            
             for symbol, sides in self.positions.items():
-                serializable_positions[symbol] = {}
+                serializable_data['positions'][symbol] = {}
                 for side, positions in sides.items():
-                    serializable_positions[symbol][side] = []
+                    serializable_data['positions'][symbol][side] = []
                     for pos in positions:
-                        serializable_positions[symbol][side].append({
+                        serializable_data['positions'][symbol][side].append({
                             'side': pos['side'],
                             'size': pos['size'],
                             'entry_price': pos['entry_price'],
@@ -513,8 +543,14 @@ class DualMartingaleManager:
                             'layer': pos['layer']
                         })
             
+            # 转换cooldown_start
+            for symbol, sides in self.cooldown_start.items():
+                serializable_data['cooldown_start'][symbol] = {}
+                for side, start_time in sides.items():
+                    serializable_data['cooldown_start'][symbol][side] = start_time.isoformat() if start_time else None
+            
             with open(self.positions_file, 'w') as f:
-                json.dump(serializable_positions, f, indent=2)
+                json.dump(serializable_data, f, indent=2)
         except Exception as e:
             logger.error(f"保存仓位状态失败: {e}")
     
@@ -523,33 +559,45 @@ class DualMartingaleManager:
         try:
             if os.path.exists(self.positions_file):
                 with open(self.positions_file, 'r') as f:
-                    serializable_positions = json.load(f)
+                    serializable_data = json.load(f)
                 
                 # 转换回原始格式
-                for symbol, sides in serializable_positions.items():
-                    self.positions[symbol] = {}
-                    for side, positions in sides.items():
-                        self.positions[symbol][side] = []
-                        for pos in positions:
-                            self.positions[symbol][side].append({
-                                'side': pos['side'],
-                                'size': pos['size'],
-                                'entry_price': pos['entry_price'],
-                                'timestamp': datetime.fromisoformat(pos['timestamp']),
-                                'layer': pos['layer']
-                            })
+                if 'positions' in serializable_data:
+                    for symbol, sides in serializable_data['positions'].items():
+                        self.positions[symbol] = {}
+                        for side, positions in sides.items():
+                            self.positions[symbol][side] = []
+                            for pos in positions:
+                                self.positions[symbol][side].append({
+                                    'side': pos['side'],
+                                    'size': pos['size'],
+                                    'entry_price': pos['entry_price'],
+                                    'timestamp': datetime.fromisoformat(pos['timestamp']),
+                                    'layer': pos['layer']
+                                })
+                
+                # 加载每日加仓计数
+                if 'daily_layer_count' in serializable_data:
+                    for symbol, sides in serializable_data['daily_layer_count'].items():
+                        self.daily_layer_count[symbol] = sides
+                
+                # 加载冷静期开始时间
+                if 'cooldown_start' in serializable_data:
+                    for symbol, sides in serializable_data['cooldown_start'].items():
+                        self.cooldown_start[symbol] = {}
+                        for side, start_time_str in sides.items():
+                            self.cooldown_start[symbol][side] = datetime.fromisoformat(start_time_str) if start_time_str else None
                 
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
             logger.error(f"加载仓位状态失败: {e}")
 
 # ================== 主交易机器人 ==================
-class HedgeMartingaleBot:
+class CoinTech2uBot:
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self.api = BinanceFutureAPI(BINANCE_API_KEY, BINANCE_API_SECRET, symbols)
-        self.analyzer = TechnicalAnalyzer()
-        self.martingale = DualMartingaleManager()
+        self.martingale = DualMartingaleManager(self.api)
         self.running = True
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -563,13 +611,12 @@ class HedgeMartingaleBot:
             logger.error("交易所初始化失败，程序退出")
             return
             
-        logger.info("🚀 开始双仓马丁对冲交易...")
+        logger.info("🚀 开始CoinTech2u策略交易...")
         
         # 程序启动时立即对所有币对开双仓
         logger.info("🔄 程序启动时对所有币对开双仓")
-        balance = self.api.get_balance()
         for symbol in self.symbols:
-            await self.open_immediate_hedge(symbol, balance)
+            await self.open_immediate_hedge(symbol)
         
         while self.running:
             try:
@@ -577,27 +624,21 @@ class HedgeMartingaleBot:
                 logger.info(f"当前余额: {balance:.2f} USDT")
                 
                 for symbol in self.symbols:
-                    await self.process_symbol(symbol, balance)
+                    await self.process_symbol(symbol)
                     
                 await asyncio.sleep(POLL_INTERVAL)
             except Exception as e:
                 logger.error(f"交易循环错误: {e}")
                 await asyncio.sleep(10)
 
-    async def open_immediate_hedge(self, symbol: str, balance: float):
+    async def open_immediate_hedge(self, symbol: str):
         """程序启动时立即开双仓"""
-        # 检查交易所是否已有仓位
-        exchange_positions = self.api.get_positions(symbol)
-        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+        # 先同步交易所仓位状态
+        self.martingale.sync_with_exchange(symbol)
         
-        if has_long or has_short:
-            logger.info(f"⏩ {symbol} 交易所已有仓位，跳过开仓")
-            # 同步本地记录
-            if has_long:
-                self.martingale.add_position(symbol, "buy", exchange_positions['long']['size'], exchange_positions['long']['entry_price'])
-            if has_short:
-                self.martingale.add_position(symbol, "sell", exchange_positions['short']['size'], exchange_positions['short']['entry_price'])
+        # 如果已经有仓位，不需要再开
+        if self.martingale.has_open_positions(symbol):
+            logger.info(f"⏩ {symbol} 已有仓位，跳过开仓")
             return
         
         # 获取当前价格
@@ -607,7 +648,7 @@ class HedgeMartingaleBot:
             return
         
         # 计算初始仓位大小
-        position_size = self.martingale.calculate_initial_size(balance, current_price)
+        position_size = self.martingale.calculate_initial_size(current_price)
         if position_size <= 0:
             logger.error(f"{symbol} 仓位大小计算错误，跳过")
             return
@@ -626,8 +667,17 @@ class HedgeMartingaleBot:
         else:
             logger.error(f"❌ {symbol} 开仓失败，需要手动检查")
 
-    async def process_symbol(self, symbol: str, balance: float):
+    async def process_symbol(self, symbol: str):
         """处理单个交易对的交易逻辑"""
+        # 先同步交易所仓位状态
+        self.martingale.sync_with_exchange(symbol)
+        
+        # 如果没有仓位，重新开仓
+        if not self.martingale.has_open_positions(symbol):
+            logger.info(f"🔄 {symbol} 检测到无仓位，重新开双仓")
+            await self.open_immediate_hedge(symbol)
+            return
+        
         # 获取当前价格
         current_price = self.api.get_current_price(symbol)
         if current_price is None:
@@ -636,29 +686,14 @@ class HedgeMartingaleBot:
         # 检查是否需要平仓（止损或止盈）
         for position_side in ['long', 'short']:
             if self.martingale.should_close_position(symbol, position_side, current_price):
-                await self.close_position(symbol, position_side)
+                await self.close_and_reopen_position(symbol, position_side, current_price)
         
         # 检查是否需要加仓
         for position_side in ['long', 'short']:
             if self.martingale.should_add_layer(symbol, position_side, current_price):
-                await self.add_martingale_layer(symbol, position_side, balance, current_price)
-                
-        # 检查是否有新信号
-        df = self.api.get_ohlcv_data(symbol, TIMEFRAME, 100)
-        if df is None or df.empty:
-            return
-            
-        indicators = self.analyzer.calculate_indicators(df)
-        if not indicators:
-            return
-            
-        signal = self.analyzer.generate_signal(symbol, indicators)
-        if signal:
-            logger.info(f"🎯 发现交易信号: {signal}")
-            # 对于双仓策略，我们通常不根据信号开仓，而是始终保持双仓
-            # 这里可以添加额外的逻辑，比如根据信号调整仓位大小
+                await self.add_martingale_layer(symbol, position_side, current_price)
 
-    async def add_martingale_layer(self, symbol: str, position_side: str, balance: float, current_price: float):
+    async def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
         """为指定方向加仓"""
         positions = self.martingale.positions[symbol][position_side]
         if not positions:
@@ -666,7 +701,7 @@ class HedgeMartingaleBot:
             
         side = "buy" if position_side == "long" else "sell"
         position_side_param = "LONG" if position_side == "long" else "SHORT"
-        layer_size = self.martingale.calculate_layer_size(symbol, position_side, balance, current_price)
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price)
         
         logger.info(f"📈 {symbol} {position_side.upper()} 准备加仓第{len(positions)+1}层，方向: {side}, 大小: {layer_size:.6f}")
         
@@ -674,8 +709,8 @@ class HedgeMartingaleBot:
         if success:
             self.martingale.add_position(symbol, side, layer_size, current_price)
 
-    async def close_position(self, symbol: str, position_side: str):
-        """平掉指定方向的所有仓位"""
+    async def close_and_reopen_position(self, symbol: str, position_side: str, current_price: float):
+        """平掉指定方向的所有仓位并立即重新开仓"""
         position_size = self.martingale.get_position_size(symbol, position_side)
         if position_size <= 0:
             return
@@ -684,20 +719,37 @@ class HedgeMartingaleBot:
         if position_side == "long":
             close_side = "sell"
             position_side_param = "LONG"
+            reopen_side = "buy"
         else:  # short
             close_side = "buy"
             position_side_param = "SHORT"
+            reopen_side = "sell"
         
         logger.info(f"📤 {symbol} {position_side.upper()} 平仓，方向: {close_side}, 大小: {position_size:.6f}")
         
+        # 平仓
         success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
         if success:
             self.martingale.clear_positions(symbol, position_side)
             logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
+            
+            # 等待一下再开新仓
+            await asyncio.sleep(2)
+            
+            # 重新开仓
+            new_position_size = self.martingale.calculate_initial_size(current_price)
+            logger.info(f"🔄 {symbol} {position_side.upper()} 重新开仓，大小: {new_position_size:.6f}")
+            
+            reopen_success = self.api.execute_market_order(symbol, reopen_side, new_position_size, position_side_param)
+            if reopen_success:
+                self.martingale.add_position(symbol, reopen_side, new_position_size, current_price)
+                logger.info(f"✅ {symbol} {position_side.upper()} 已重新开仓")
+            else:
+                logger.error(f"❌ {symbol} {position_side.upper()} 重新开仓失败")
 
 # ================== 启动程序 ==================
 async def main():
-    bot = HedgeMartingaleBot(SYMBOLS_CONFIG)
+    bot = CoinTech2uBot(SYMBOLS_CONFIG)
     try:
         await bot.run()
     except KeyboardInterrupt:
@@ -714,6 +766,18 @@ if __name__ == "__main__":
         
     if not SYMBOLS_CONFIG:
         print("错误: 请设置 SYMBOLS 环境变量，例如: BTC/USDT,ETH/USDT")
+        sys.exit(1)
+        
+    # 检查是否安装了必要的库
+    try:
+        import ccxt
+        import pandas
+        import numpy
+        import ta
+        import dotenv
+    except ImportError as e:
+        print(f"错误: 缺少必要的Python库: {e}")
+        print("请运行: pip install ccxt pandas numpy ta python-dotenv")
         sys.exit(1)
         
     asyncio.run(main())
