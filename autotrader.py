@@ -1,11 +1,4 @@
-  }
-            
-            for symbol, sides in self.positions.items():
-                serializable_data['positions'][symbol] = {}
-                for side, positions in sides.items():
-                    serializable_data['positions'][symbol][side] = []
-                    for pos in positions:
-                        serializable_data['positions'][symbol][side].append({
+zable_data['positions'][symbol][side].append({
                             'side': pos['side'],
                             'size': pos['size'],
                             'entry_price': pos['entry_price'],
