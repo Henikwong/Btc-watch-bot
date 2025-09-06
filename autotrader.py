@@ -1,4 +1,3 @@
-
     def check_and_fill_base_position(self, api: BinanceFutureAPI, symbol: str):
         """检查并填充基础仓位 - 核心功能：一测试到没有仓位就补上"""
         try:
