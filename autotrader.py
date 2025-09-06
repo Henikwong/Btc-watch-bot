@@ -105,8 +105,8 @@ class BinanceFutureAPI:
         self.exchange = None
         self.symbol_info = {}  # 缓存交易对信息
 
-    async def initialize(self) -> bool:
-        """异步初始化交易所连接"""
+    def initialize(self) -> bool:
+        """同步初始化交易所连接"""
         try:
             self.exchange = ccxt.binance({
                 'apiKey': self.api_key,
@@ -116,14 +116,14 @@ class BinanceFutureAPI:
             })
             
             # 加载所有交易对信息
-            markets = await self.exchange.load_markets()
+            markets = self.exchange.load_markets()
             valid_symbols = []
             
             for symbol in self.symbols:
                 if symbol in markets:
                     self.symbol_info[symbol] = markets[symbol]
                     try:
-                        await self.exchange.set_leverage(LEVERAGE, symbol)
+                        self.exchange.set_leverage(LEVERAGE, symbol)
                         logger.info(f"设置杠杆 {symbol} {LEVERAGE}x")
                         valid_symbols.append(symbol)
                     except Exception as e:
@@ -140,19 +140,19 @@ class BinanceFutureAPI:
             logger.error(f"交易所初始化失败: {e}")
             return False
 
-    async def get_balance(self) -> float:
+    def get_balance(self) -> float:
         """获取账户余额"""
         try:
-            balance = await self.exchange.fetch_balance()
+            balance = self.exchange.fetch_balance()
             return float(balance['USDT']['free'])
         except Exception as e:
             logger.error(f"获取余额失败: {e}")
             return 0.0
 
-    async def get_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 100) -> Optional[pd.DataFrame]:
+    def get_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 100) -> Optional[pd.DataFrame]:
         """获取K线数据"""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -161,19 +161,19 @@ class BinanceFutureAPI:
             logger.error(f"K线获取失败 {symbol}: {e}")
             return None
 
-    async def get_current_price(self, symbol: str) -> Optional[float]:
+    def get_current_price(self, symbol: str) -> Optional[float]:
         """获取当前价格"""
         try:
-            ticker = await self.exchange.fetch_ticker(symbol)
+            ticker = self.exchange.fetch_ticker(symbol)
             return float(ticker['last'])
         except Exception as e:
             logger.error(f"获取价格失败 {symbol}: {e}")
             return None
 
-    async def get_positions(self, symbol: str) -> Dict[str, dict]:
+    def get_positions(self, symbol: str) -> Dict[str, dict]:
         """获取当前持仓信息"""
         try:
-            positions = await self.exchange.fetch_positions([symbol])
+            positions = self.exchange.fetch_positions([symbol])
             result = {}
             for pos in positions:
                 if float(pos['contracts']) > 0:
@@ -189,13 +189,13 @@ class BinanceFutureAPI:
             logger.error(f"获取持仓失败 {symbol}: {e}")
             return {}
 
-    async def create_order_with_fallback(self, symbol: str, side: str, contract_size: float, position_side: str):
+    def create_order_with_fallback(self, symbol: str, side: str, contract_size: float, position_side: str):
         """创建订单，如果失败则尝试回退到单向模式"""
         for attempt in range(MAX_RETRIES):
             try:
                 # 尝试带positionSide下单
                 params = {"positionSide": position_side}
-                order = await self.exchange.create_order(
+                order = self.exchange.create_order(
                     symbol,
                     'market',
                     side.lower(),
@@ -210,7 +210,7 @@ class BinanceFutureAPI:
                 if "-4061" in err_msg or "position side does not match" in err_msg.lower():
                     logger.warning(f"positionSide与账户设置不符，尝试不带positionSide重试")
                     try:
-                        order = await self.exchange.create_order(
+                        order = self.exchange.create_order(
                             symbol,
                             'market',
                             side.lower(),
@@ -227,11 +227,11 @@ class BinanceFutureAPI:
                         return None
             
             # 等待一段时间后重试
-            await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+            time.sleep(RETRY_DELAY * (2 ** attempt))
         
         return None
 
-    async def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
+    def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
         """执行市价订单"""
         try:
             # 获取交易对信息
@@ -241,7 +241,7 @@ class BinanceFutureAPI:
                 return False
                 
             # 获取当前价格
-            current_price = await self.get_current_price(symbol)
+            current_price = self.get_current_price(symbol)
             if current_price is None:
                 logger.error(f"无法获取 {symbol} 的价格")
                 return False
@@ -268,7 +268,7 @@ class BinanceFutureAPI:
                 logger.warning(f"名义价值 {notional_value:.2f} USDT 低于最小值 {min_notional} USDT，调整合约数量为 {contract_size:.6f}")
             
             # 创建订单
-            order = await self.create_order_with_fallback(symbol, side, contract_size, position_side)
+            order = self.create_order_with_fallback(symbol, side, contract_size, position_side)
             if order:
                 logger.info(f"订单成功 {symbol} {side} {contract_size:.6f} ({position_side}) - 订单ID: {order['id']}")
                 return True
@@ -468,11 +468,11 @@ class DualMartingaleManager:
         except Exception as e:
             logger.error(f"加载仓位状态失败: {e}")
             
-    async def check_and_fill_base_position(self, api: BinanceFutureAPI, symbol: str):
+    def check_and_fill_base_position(self, api: BinanceFutureAPI, symbol: str):
         """检查并填充基础仓位 - 核心功能：一测试到没有仓位就补上"""
         try:
             # 获取交易所当前仓位
-            exchange_positions = await api.get_positions(symbol)
+            exchange_positions = api.get_positions(symbol)
             has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
             has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
             
@@ -499,7 +499,7 @@ class DualMartingaleManager:
                 logger.info(f"🔄 {symbol} 检测到仓位不完整，准备补仓")
                 
                 # 获取当前价格
-                current_price = await api.get_current_price(symbol)
+                current_price = api.get_current_price(symbol)
                 if current_price is None:
                     logger.error(f"无法获取 {symbol} 的价格，跳过补仓")
                     return
@@ -513,7 +513,7 @@ class DualMartingaleManager:
                 # 补多仓
                 if not has_long:
                     logger.info(f"📈 {symbol} 补多仓，大小: {position_size:.6f}")
-                    success = await api.execute_market_order(symbol, "buy", position_size, "LONG")
+                    success = api.execute_market_order(symbol, "buy", position_size, "LONG")
                     if success:
                         self.add_position(symbol, "buy", position_size, current_price)
                         logger.info(f"✅ {symbol} 多仓补充成功")
@@ -523,7 +523,7 @@ class DualMartingaleManager:
                 # 补空仓
                 if not has_short:
                     logger.info(f"📉 {symbol} 补空仓，大小: {position_size:.6f}")
-                    success = await api.execute_market_order(symbol, "sell", position_size, "SHORT")
+                    success = api.execute_market_order(symbol, "sell", position_size, "SHORT")
                     if success:
                         self.add_position(symbol, "sell", position_size, current_price)
                         logger.info(f"✅ {symbol} 空仓补充成功")
@@ -547,8 +547,8 @@ class CoinTech2uBot:
         self.running = False
         self.martingale.save_positions()
 
-    async def run(self):
-        if not await self.api.initialize():
+    def run(self):
+        if not self.api.initialize():
             logger.error("交易所初始化失败，程序退出")
             return
             
@@ -557,28 +557,28 @@ class CoinTech2uBot:
         # 程序启动时立即对所有币对开双仓
         logger.info("🔄 程序启动时对所有币对开双仓")
         for symbol in self.symbols:
-            await self.open_immediate_hedge(symbol)
+            self.open_immediate_hedge(symbol)
         
         while self.running:
             try:
-                balance = await self.api.get_balance()
+                balance = self.api.get_balance()
                 logger.info(f"当前余额: {balance:.2f} USDT")
                 
                 for symbol in self.symbols:
                     # 检查并填充基础仓位 - 核心功能：一测试到没有仓位就补上
-                    await self.martingale.check_and_fill_base_position(self.api, symbol)
+                    self.martingale.check_and_fill_base_position(self.api, symbol)
                     # 处理交易逻辑
-                    await self.process_symbol(symbol)
+                    self.process_symbol(symbol)
                     
-                await asyncio.sleep(POLL_INTERVAL)
+                time.sleep(POLL_INTERVAL)
             except Exception as e:
                 logger.error(f"交易循环错误: {e}")
-                await asyncio.sleep(10)
+                time.sleep(10)
 
-    async def open_immediate_hedge(self, symbol: str):
+    def open_immediate_hedge(self, symbol: str):
         """程序启动时立即开双仓"""
         # 检查交易所是否已有仓位
-        exchange_positions = await self.api.get_positions(symbol)
+        exchange_positions = self.api.get_positions(symbol)
         has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
         has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
         
@@ -592,7 +592,7 @@ class CoinTech2uBot:
             return
         
         # 获取当前价格
-        current_price = await self.api.get_current_price(symbol)
+        current_price = self.api.get_current_price(symbol)
         if current_price is None:
             logger.error(f"无法获取 {symbol} 的价格，跳过")
             return
@@ -606,8 +606,8 @@ class CoinTech2uBot:
         logger.info(f"📊 {symbol} 准备开双仓，价格: {current_price:.2f}, 大小: {position_size:.6f}")
         
         # 同时开多仓和空仓
-        long_success = await self.api.execute_market_order(symbol, "buy", position_size, "LONG")
-        short_success = await self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
+        long_success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
+        short_success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
         
         if long_success and short_success:
             logger.info(f"✅ {symbol} 已同时开多空仓位: 多单 {position_size:.6f} | 空单 {position_size:.6f}")
@@ -617,24 +617,24 @@ class CoinTech2uBot:
         else:
             logger.error(f"❌ {symbol} 开仓失败，需要手动检查")
 
-    async def process_symbol(self, symbol: str):
+    def process_symbol(self, symbol: str):
         """处理单个交易对的交易逻辑"""
         # 获取当前价格
-        current_price = await self.api.get_current_price(symbol)
+        current_price = self.api.get_current_price(symbol)
         if current_price is None:
             return
         
         # 检查是否需要止盈
         for position_side in ['long', 'short']:
             if self.martingale.should_close_position(symbol, position_side, current_price):
-                await self.close_profitable_position(symbol, position_side, current_price)
+                self.close_profitable_position(symbol, position_side, current_price)
         
         # 检查是否需要加仓
         for position_side in ['long', 'short']:
             if self.martingale.should_add_layer(symbol, position_side, current_price):
-                await self.add_martingale_layer(symbol, position_side, current_price)
+                self.add_martingale_layer(symbol, position_side, current_price)
 
-    async def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
+    def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
         """平掉盈利的仓位"""
         position_size = self.martingale.get_position_size(symbol, position_side)
         if position_size <= 0:
@@ -650,22 +650,22 @@ class CoinTech2uBot:
         
         logger.info(f"📤 {symbol} {position_side.upper()} 止盈平仓，方向: {close_side}, 大小: {position_size:.6f}")
         
-        success = await self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
+        success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
         if success:
             self.martingale.clear_positions(symbol, position_side)
             logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
             
             # 平仓后重新开仓
-            await asyncio.sleep(1)  # 等待一下再开新仓
+            time.sleep(1)  # 等待一下再开新仓
             new_position_size = self.martingale.calculate_initial_size(current_price)
             open_side = "buy" if position_side == "long" else "sell"
-            open_success = await self.api.execute_market_order(symbol, open_side, new_position_size, position_side_param)
+            open_success = self.api.execute_market_order(symbol, open_side, new_position_size, position_side_param)
             
             if open_success:
                 self.martingale.add_position(symbol, open_side, new_position_size, current_price)
                 logger.info(f"🔄 {symbol} {position_side.upper()} 已重新开仓")
 
-    async def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
+    def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
         """为指定方向加仓"""
         positions = self.martingale.positions[symbol][position_side]
         if not positions:
@@ -677,15 +677,15 @@ class CoinTech2uBot:
         
         logger.info(f"📈 {symbol} {position_side.upper()} 准备加仓第{len(positions)+1}层，方向: {side}, 大小: {layer_size:.6f}")
         
-        success = await self.api.execute_market_order(symbol, side, layer_size, position_side_param)
+        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
         if success:
             self.martingale.add_position(symbol, side, layer_size, current_price)
 
 # ================== 启动程序 ==================
-async def main():
+def main():
     bot = CoinTech2uBot(SYMBOLS_CONFIG)
     try:
-        await bot.run()
+        bot.run()
     except KeyboardInterrupt:
         logger.info("用户中断程序")
     except Exception as e:
@@ -702,4 +702,4 @@ if __name__ == "__main__":
         print("错误: 请设置 SYMBOLS 环境变量，例如: LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT")
         sys.exit(1)
         
-    asyncio.run(main())
+    main()
