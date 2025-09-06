@@ -261,11 +261,37 @@ class BinanceFutureAPI:
             # 检查最小名义价值
             min_notional = MIN_NOTIONAL.get(symbol, 10)  # 默认10 USDT
             notional_value = contract_size * current_price
+            
+            # 如果名义价值不足，调整合约数量
             if notional_value < min_notional:
-                # 调整合约数量以满足最小名义价值要求
-                contract_size = min_notional / current_price
+                # 计算需要的最小合约数量
+                min_contract_size = min_notional / current_price
+                contract_size = max(contract_size, min_contract_size)
+                
+                # 重新量化到交易所精度
                 contract_size = quantize_amount(contract_size, market)
-                logger.warning(f"名义价值 {notional_value:.2f} USDT 低于最小值 {min_notional} USDT，调整合约数量为 {contract_size:.6f}")
+                
+                # 重新计算名义价值
+                notional_value = contract_size * current_price
+                
+                # 如果仍然不足，继续增加直到满足要求
+                step = 0.001  # 默认步长
+                for f in market['info'].get('filters', []):
+                    if f.get('filterType') == 'LOT_SIZE':
+                        step = float(f.get('stepSize'))
+                        break
+                
+                while notional_value < min_notional:
+                    contract_size += step
+                    contract_size = quantize_amount(contract_size, market)
+                    notional_value = contract_size * current_price
+                    
+                    # 安全保护，避免无限循环
+                    if contract_size > min_contract_size * 10:
+                        logger.error(f"无法满足最小名义价值要求: {notional_value:.2f} < {min_notional}")
+                        return False
+                
+                logger.warning(f"调整合约数量以满足最小名义价值: {contract_size:.6f}, 名义价值: {notional_value:.2f} USDT")
             
             # 创建订单
             order = self.create_order_with_fallback(symbol, side, contract_size, position_side)
