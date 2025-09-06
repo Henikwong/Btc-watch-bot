@@ -20,7 +20,7 @@ load_dotenv()
 # ================== 配置参数 ==================
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 RISK_RATIO = float(os.getenv("RISK_RATIO", "0.15"))
@@ -73,9 +73,10 @@ class TradeSignal:
 
 # ================== 交易所接口 ==================
 class BinanceFutureAPI:
-    def __init__(self, api_key: str, api_secret: str):
+    def __init__(self, api_key: str, api_secret: str, symbols: List[str]):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.symbols = symbols  # 使用传入的symbols而不是全局变量
         self.exchange = None
         self.symbol_info = {}  # 缓存交易对信息
 
@@ -90,20 +91,22 @@ class BinanceFutureAPI:
             
             # 加载所有交易对信息
             markets = self.exchange.load_markets()
-            for symbol in SYMBOLS:
+            valid_symbols = []
+            
+            for symbol in self.symbols:
                 if symbol in markets:
                     self.symbol_info[symbol] = markets[symbol]
                     try:
                         self.exchange.set_leverage(LEVERAGE, symbol)
                         logger.info(f"设置杠杆 {symbol} {LEVERAGE}x")
+                        valid_symbols.append(symbol)
                     except Exception as e:
                         logger.warning(f"设置杠杆失败 {symbol}: {e}")
                 else:
                     logger.warning(f"交易对 {symbol} 不存在，跳过")
             
-            # 从SYMBOLS中移除不存在的交易对
-            global SYMBOLS
-            SYMBOLS = [s for s in SYMBOLS if s in markets]
+            # 更新有效的交易对列表
+            self.symbols = valid_symbols
             
             logger.info("交易所初始化成功")
             return True
@@ -148,7 +151,12 @@ class BinanceFutureAPI:
                 return False
                 
             # 计算合约数量
-            contract_size = amount / float(market['info']['lastPrice'])
+            current_price = self.get_current_price(symbol)
+            if current_price is None:
+                logger.error(f"无法获取 {symbol} 的价格")
+                return False
+                
+            contract_size = amount / current_price
             
             # 调整数量到最小精度
             precision = market['precision']['amount']
@@ -396,8 +404,9 @@ class DualMartingaleManager:
 
 # ================== 主交易机器人 ==================
 class HedgeMartingaleBot:
-    def __init__(self):
-        self.api = BinanceFutureAPI(BINANCE_API_KEY, BINANCE_API_SECRET)
+    def __init__(self, symbols: List[str]):
+        self.symbols = symbols  # 使用传入的symbols而不是全局变量
+        self.api = BinanceFutureAPI(BINANCE_API_KEY, BINANCE_API_SECRET, symbols)
         self.analyzer = TechnicalAnalyzer()
         self.martingale = DualMartingaleManager()
         self.running = True
@@ -418,7 +427,7 @@ class HedgeMartingaleBot:
         # 程序启动时立即对所有币对开双仓
         logger.info("🔄 程序启动时对所有币对开双仓")
         balance = self.api.get_balance()
-        for symbol in SYMBOLS:
+        for symbol in self.symbols:
             await self.open_immediate_hedge(symbol, balance)
         
         while self.running:
@@ -426,7 +435,7 @@ class HedgeMartingaleBot:
                 balance = self.api.get_balance()
                 logger.info(f"当前余额: {balance:.2f} USDT")
                 
-                for symbol in SYMBOLS:
+                for symbol in self.symbols:
                     await self.process_symbol(symbol, balance)
                     
                 await asyncio.sleep(POLL_INTERVAL)
@@ -533,7 +542,7 @@ class HedgeMartingaleBot:
 
 # ================== 启动程序 ==================
 async def main():
-    bot = HedgeMartingaleBot()
+    bot = HedgeMartingaleBot(SYMBOLS_CONFIG)  # 传入配置的symbols
     try:
         await bot.run()  # 🔥 启动交易主循环
     except KeyboardInterrupt:
@@ -548,7 +557,7 @@ if __name__ == "__main__":
         print("错误: 请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
         sys.exit(1)
         
-    if not SYMBOLS:
+    if not SYMBOLS_CONFIG:
         print("错误: 请设置 SYMBOLS 环境变量，例如: BTC/USDT,ETH/USDT")
         sys.exit(1)
         
