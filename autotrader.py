@@ -29,17 +29,26 @@ LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
 
-# Telegram 配置
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 # 策略参数 - CoinTech2u核心逻辑
 TAKE_PROFIT_PCT = 0.015  # 1.5%止盈
 ADD_INTERVAL_HOURS = 12  # 加仓间隔12小时
 MAX_LAYERS = 9  # 最大9层仓位
 
-# cointech2u加仓倍数配置
-MARTINGALE_MULTIPLIERS = [2.678, 5, 6, 7, 8, 9, 10, 13, 14]
+# 加仓触发百分比阈值
+LAYER_TRIGGER_PERCENTAGES = [0.02678, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.13, 0.14]  # 转换为小数
+
+# 趋势捕捉加仓配置
+TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
+TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
+TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
+TREND_COOLDOWN_HOURS = 6  # 趋势加仓冷却时间
+
+# 止损配置
+STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+
+# Telegram 配置
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 重试参数
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
@@ -101,6 +110,68 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"发送 Telegram 消息时出错: {e}")
             return False
+
+# ================== 技术分析函数 ==================
+def analyze_trend(df: pd.DataFrame) -> Tuple[float, str]:
+    """分析趋势方向和强度，使用多时间框架确认
+    
+    Returns:
+        Tuple[float, str]: (趋势强度, 趋势方向) 方向为 'long', 'short' 或 'neutral'
+    """
+    try:
+        # 计算多时间框架EMA指标
+        ema_fast = ta.trend.EMAIndicator(df['close'], window=12).ema_indicator()
+        ema_slow = ta.trend.EMAIndicator(df['close'], window=26).ema_indicator()
+        
+        # 计算RSI指标
+        rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        
+        # 计算MACD
+        macd = ta.trend.MACD(df['close'])
+        macd_line = macd.macd()
+        macd_signal = macd.macd_signal()
+        
+        # 计算ADX趋势强度
+        adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+        
+        # 计算成交量指标
+        volume = df['volume']
+        volume_ma = volume.rolling(window=20).mean()
+        
+        # 获取最新值
+        latest_ema_fast = ema_fast.iloc[-1]
+        latest_ema_slow = ema_slow.iloc[-1]
+        latest_rsi = rsi.iloc[-1]
+        latest_macd_line = macd_line.iloc[-1]
+        latest_macd_signal = macd_signal.iloc[-1]
+        latest_adx = adx.iloc[-1]
+        latest_volume = volume.iloc[-1]
+        latest_volume_ma = volume_ma.iloc[-1]
+        
+        # 判断趋势方向
+        trend_direction = "neutral"
+        if latest_ema_fast > latest_ema_slow and latest_macd_line > latest_macd_signal:
+            trend_direction = "long"
+        elif latest_ema_fast < latest_ema_slow and latest_macd_line < latest_macd_signal:
+            trend_direction = "short"
+            
+        # 计算综合趋势强度 (0-1之间)
+        trend_strength = min(latest_adx / 100, 1.0)  # ADX归一化
+        trend_strength = max(trend_strength, 0)
+        
+        # 考虑RSI极端值
+        if (trend_direction == "long" and latest_rsi > 70) or (trend_direction == "short" and latest_rsi < 30):
+            trend_strength *= 0.7  # 在超买超卖区域减弱信号强度
+            
+        # 成交量确认：如果成交量没有放大，减弱信号强度
+        if latest_volume < latest_volume_ma * 1.2:
+            trend_strength *= 0.8
+            
+        return trend_strength, trend_direction
+        
+    except Exception as e:
+        logger.error(f"趋势分析错误: {e}")
+        return 0, "neutral"
 
 # ================== 工具函数 ==================
 def quantize_amount(amount: float, market) -> float:
@@ -349,6 +420,10 @@ class DualMartingaleManager:
         self.positions: Dict[str, Dict[str, List[dict]]] = {}
         # 最后加仓时间: {symbol: {'long': datetime, 'short': datetime}}
         self.last_layer_time: Dict[str, Dict[str, datetime]] = {}
+        # 趋势捕捉加仓时间: {symbol: {'long': datetime, 'short': datetime}}
+        self.last_trend_catch_time: Dict[str, Dict[str, datetime]] = {}
+        # 趋势捕捉加仓计数: {symbol: {'long': int, 'short': int}}
+        self.trend_catch_count: Dict[str, Dict[str, int]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
@@ -362,8 +437,12 @@ class DualMartingaleManager:
             self.positions[symbol] = {'long': [], 'short': []}
         if symbol not in self.last_layer_time:
             self.last_layer_time[symbol] = {'long': None, 'short': None}
+        if symbol not in self.last_trend_catch_time:
+            self.last_trend_catch_time[symbol] = {'long': None, 'short': None}
+        if symbol not in self.trend_catch_count:
+            self.trend_catch_count[symbol] = {'long': 0, 'short': 0}
 
-    def add_position(self, symbol: str, side: str, size: float, price: float):
+    def add_position(self, symbol: str, side: str, size: float, price: float, is_trend_catch: bool = False):
         """添加仓位到对应方向"""
         self.initialize_symbol(symbol)
         position_side = 'long' if side.lower() == 'buy' else 'short'
@@ -374,22 +453,61 @@ class DualMartingaleManager:
             'size': size,
             'entry_price': price,
             'timestamp': datetime.now(),
-            'layer': layer
+            'layer': layer,
+            'is_trend_catch': is_trend_catch
         })
         
-        self.last_layer_time[symbol][position_side] = datetime.now()
+        if is_trend_catch:
+            self.last_trend_catch_time[symbol][position_side] = datetime.now()
+            self.trend_catch_count[symbol][position_side] += 1
+        else:
+            self.last_layer_time[symbol][position_side] = datetime.now()
         
         # 记录日志
         log_msg = f"📊 {symbol} {position_side.upper()} 第{layer}层仓位: {side} {size:.6f} @ {price:.2f}"
+        if is_trend_catch:
+            log_msg += " (趋势捕捉)"
         logger.info(log_msg)
         
         # 发送 Telegram 通知
         if self.telegram:
-            telegram_msg = f"<b>🔄 仓位更新</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}"
+            if is_trend_catch:
+                telegram_msg = f"<b>🎯 趋势捕捉加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}\n趋势加仓次数: {self.trend_catch_count[symbol][position_side]}/{TREND_CATCH_LAYERS}"
+            else:
+                telegram_msg = f"<b>🔄 常规加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}"
             self.telegram.send_message(telegram_msg)
         
         # 保存仓位状态
         self.save_positions()
+
+    def should_add_trend_catch_layer(self, symbol: str, position_side: str, trend_strength: float) -> Tuple[bool, int]:
+        """检查是否应该进行趋势捕捉加仓"""
+        self.initialize_symbol(symbol)
+        
+        # 检查是否有持仓
+        if not self.positions[symbol][position_side]:
+            return False, 0
+            
+        # 检查趋势强度
+        if trend_strength < TREND_SIGNAL_STRENGTH:
+            return False, 0
+            
+        # 检查是否已达到最大趋势加仓次数
+        if self.trend_catch_count[symbol][position_side] >= TREND_CATCH_LAYERS:
+            return False, 0
+            
+        # 检查趋势加仓冷却期
+        last_trend_catch = self.last_trend_catch_time[symbol][position_side]
+        if last_trend_catch and (datetime.now() - last_trend_catch) < timedelta(hours=TREND_COOLDOWN_HOURS):
+            remaining = (last_trend_catch + timedelta(hours=TREND_COOLDOWN_HOURS) - datetime.now()).total_seconds() / 3600
+            logger.info(f"⏳ {symbol} {position_side.upper()} 趋势加仓冷却期剩余: {remaining:.1f}小时")
+            return False, 0
+            
+        # 获取当前仓位层数
+        current_layers = len(self.positions[symbol][position_side])
+        next_layer = current_layers + 1
+        
+        return True, next_layer
 
     def should_add_layer(self, symbol: str, position_side: str, current_price: float) -> bool:
         """检查是否应该加仓"""
@@ -423,21 +541,40 @@ class DualMartingaleManager:
             
         logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 当前盈亏: {pnl_pct*100:.2f}%")
         
+        # 检查止损条件
+        unrealized_pnl = total_size * (current_price - avg_price) if position_side == 'long' else total_size * (avg_price - current_price)
+        if unrealized_pnl <= STOP_LOSS_PER_SYMBOL:
+            logger.warning(f"🚨 {symbol} {position_side.upper()} 达到止损条件: {unrealized_pnl:.2f} USDT <= {STOP_LOSS_PER_SYMBOL} USDT")
+            return False
+        
+        # 检查是否达到加仓阈值
+        if current_layers < len(LAYER_TRIGGER_PERCENTAGES):
+            threshold = LAYER_TRIGGER_PERCENTAGES[current_layers]  # 当前层对应的亏损阈值
+        else:
+            # 如果层级超过配置，使用最后一层的阈值
+            threshold = LAYER_TRIGGER_PERCENTAGES[-1]
+            
         # 只有当亏损达到触发阈值时才加仓
-        return pnl_pct <= -0.05  # 5%亏损触发加仓
+        return pnl_pct <= -threshold
 
-    def calculate_layer_size(self, symbol: str, position_side: str, current_price: float) -> float:
-        """计算加仓大小 - 使用cointech2u的层级配置"""
+    def calculate_layer_size(self, symbol: str, position_side: str, current_price: float, is_trend_catch: bool = False) -> float:
+        """计算加仓大小 - 使用2倍递增"""
         self.initialize_symbol(symbol)
         layer = len(self.positions[symbol][position_side]) + 1
         
-        # 使用cointech2u的层级配置
-        if layer <= len(MARTINGALE_MULTIPLIERS):
-            size_in_usdt = MARTINGALE_MULTIPLIERS[layer - 1]
+        if is_trend_catch:
+            # 使用趋势捕捉加仓配置
+            if layer <= len(TREND_CATCH_SIZES):
+                size_in_usdt = TREND_CATCH_SIZES[layer - 1]
+            else:
+                # 如果层级超过配置，使用最后一层的值
+                size_in_usdt = TREND_CATCH_SIZES[-1]
         else:
-            # 如果层级超过配置，使用最后一层的值
-            size_in_usdt = MARTINGALE_MULTIPLIERS[-1]
-            
+            # 使用2倍递增的层级配置
+            # 第一层是BASE_TRADE_SIZE，第二层是2倍，第三层是4倍，以此类推
+            multiplier = 2 ** (layer - 1)
+            size_in_usdt = BASE_TRADE_SIZE * multiplier
+        
         size = size_in_usdt / current_price
         
         logger.info(f"📏 {symbol} {position_side.upper()} 第{layer}层计算仓位: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
@@ -497,6 +634,7 @@ class DualMartingaleManager:
         """清空某个方向的仓位记录"""
         self.initialize_symbol(symbol)
         self.positions[symbol][position_side] = []
+        self.trend_catch_count[symbol][position_side] = 0
         logger.info(f"🔄 {symbol} {position_side.upper()} 仓位记录已清空")
         # 保存仓位状态
         self.save_positions()
@@ -521,11 +659,29 @@ class DualMartingaleManager:
                             'size': pos['size'],
                             'entry_price': pos['entry_price'],
                             'timestamp': pos['timestamp'].isoformat(),
-                            'layer': pos['layer']
+                            'layer': pos['layer'],
+                            'is_trend_catch': pos.get('is_trend_catch', False)
                         })
             
+            # 保存趋势捕捉计数
+            serializable_data = {
+                'positions': serializable_positions,
+                'trend_catch_count': self.trend_catch_count,
+                'last_trend_catch_time': {
+                    sym: {side: time.isoformat() if time else None 
+                         for side, time in sides.items()}
+                    for sym, sides in self.last_trend_catch_time.items()
+                },
+                'last_layer_time': {
+                    sym: {side: time.isoformat() if time else None 
+                         for side, time in sides.items()}
+                    for sym, sides in self.last_layer_time.items()
+                },
+                'saved_at': datetime.now().isoformat()
+            }
+            
             with open(self.positions_file, 'w') as f:
-                json.dump(serializable_positions, f, indent=2)
+                json.dump(serializable_data, f, indent=2)
         except Exception as e:
             logger.error(f"保存仓位状态失败: {e}")
     
@@ -534,9 +690,10 @@ class DualMartingaleManager:
         try:
             if os.path.exists(self.positions_file):
                 with open(self.positions_file, 'r') as f:
-                    serializable_positions = json.load(f)
+                    data = json.load(f)
                 
-                # 转换回原始格式
+                # 加载仓位数据
+                serializable_positions = data.get('positions', {})
                 for symbol, sides in serializable_positions.items():
                     self.positions[symbol] = {}
                     for side, positions in sides.items():
@@ -547,8 +704,25 @@ class DualMartingaleManager:
                                 'size': pos['size'],
                                 'entry_price': pos['entry_price'],
                                 'timestamp': datetime.fromisoformat(pos['timestamp']),
-                                'layer': pos['layer']
+                                'layer': pos['layer'],
+                                'is_trend_catch': pos.get('is_trend_catch', False)
                             })
+                
+                # 加载趋势捕捉计数
+                self.trend_catch_count = data.get('trend_catch_count', {})
+                
+                # 加载时间数据
+                self.last_trend_catch_time = {}
+                for sym, sides in data.get('last_trend_catch_time', {}).items():
+                    self.last_trend_catch_time[sym] = {}
+                    for side, time_str in sides.items():
+                        self.last_trend_catch_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
+                
+                self.last_layer_time = {}
+                for sym, sides in data.get('last_layer_time', {}).items():
+                    self.last_layer_time[sym] = {}
+                    for side, time_str in sides.items():
+                        self.last_layer_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
                 
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
@@ -755,6 +929,20 @@ class CoinTech2uBot:
         if current_price is None:
             return
         
+        # 获取K线数据用于趋势分析
+        df = self.api.get_ohlcv_data(symbol, TIMEFRAME, 100)
+        if df is not None:
+            # 分析趋势
+            trend_strength, trend_direction = analyze_trend(df)
+            logger.info(f"📊 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
+            
+            # 检查趋势捕捉加仓
+            for position_side in ['long', 'short']:
+                if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
+                    should_add, next_layer = self.martingale.should_add_trend_catch_layer(symbol, position_side, trend_strength)
+                    if should_add:
+                        self.add_trend_catch_layer(symbol, position_side, current_price)
+        
         # 检查是否需要止盈
         for position_side in ['long', 'short']:
             if self.martingale.should_close_position(symbol, position_side, current_price):
@@ -764,6 +952,27 @@ class CoinTech2uBot:
         for position_side in ['long', 'short']:
             if self.martingale.should_add_layer(symbol, position_side, current_price):
                 self.add_martingale_layer(symbol, position_side, current_price)
+
+    def add_trend_catch_layer(self, symbol: str, position_side: str, current_price: float):
+        """为指定方向添加趋势捕捉加仓"""
+        positions = self.martingale.positions[symbol][position_side]
+        if not positions:
+            return
+            
+        side = "buy" if position_side == "long" else "sell"
+        position_side_param = "LONG" if position_side == "long" else "SHORT"
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, True)
+        
+        current_layers = len(positions)
+        logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 趋势捕捉加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
+        
+        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
+        if success:
+            self.martingale.add_position(symbol, side, layer_size, current_price, True)
+        else:
+            # 发送错误通知
+            if self.telegram:
+                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 趋势捕捉加仓失败</b>")
 
     def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
         """平掉盈利的仓位"""
@@ -811,14 +1020,14 @@ class CoinTech2uBot:
             
         side = "buy" if position_side == "long" else "sell"
         position_side_param = "LONG" if position_side == "long" else "SHORT"
-        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price)
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, False)
         
         current_layers = len(positions)
         logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 准备加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
         
         success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
         if success:
-            self.martingale.add_position(symbol, side, layer_size, current_price)
+            self.martingale.add_position(symbol, side, layer_size, current_price, False)
         else:
             # 发送错误通知
             if self.telegram:
