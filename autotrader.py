@@ -29,13 +29,23 @@ LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
 
-# 策略参数 - CoinTech2u核心逻辑
-TAKE_PROFIT_PCT = 0.015  # 1.5%止盈
-ADD_INTERVAL_HOURS = 12  # 加仓间隔12小时
-MAX_LAYERS = 9  # 最大9层仓位
+# 从环境变量读取加仓比例
+position_sizes_str = os.getenv("POSITION_SIZES", "2.678%,5%,6%,7%,8%,9%,10%,13%,14%")
+POSITION_SIZES = [float(size.strip().replace('%', '')) / 100 for size in position_sizes_str.split(',')]
 
-# 加仓触发百分比阈值
-LAYER_TRIGGER_PERCENTAGES = [0.02678, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.13, 0.14]  # 转换为小数
+# 从环境变量读取止盈比例
+TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").replace('%', '')) / 100
+
+# 从环境变量读取止损设置
+STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))
+
+# 从环境变量读取趋势捕捉和马丁设置
+ENABLE_TREND_CATCH = os.getenv("ENABLE_TREND_CATCH", "true").lower() == "true"
+ENABLE_MARTINGALE = os.getenv("ENABLE_MARTINGALE", "true").lower() == "true"
+
+# 加仓间隔
+ADD_INTERVAL_HOURS = int(os.getenv("ADD_INTERVAL_HOURS", "12"))
+MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 
 # 趋势捕捉加仓配置
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
@@ -482,6 +492,9 @@ class DualMartingaleManager:
 
     def should_add_trend_catch_layer(self, symbol: str, position_side: str, trend_strength: float) -> Tuple[bool, int]:
         """检查是否应该进行趋势捕捉加仓"""
+        if not ENABLE_TREND_CATCH:
+            return False, 0
+            
         self.initialize_symbol(symbol)
         
         # 检查是否有持仓
@@ -510,7 +523,10 @@ class DualMartingaleManager:
         return True, next_layer
 
     def should_add_layer(self, symbol: str, position_side: str, current_price: float) -> bool:
-        """检查是否应该加仓"""
+        """检查是否应该加仓 - 使用环境变量中的配置"""
+        if not ENABLE_MARTINGALE:
+            return False
+            
         self.initialize_symbol(symbol)
         
         # 检查是否已达到最大层数
@@ -522,7 +538,8 @@ class DualMartingaleManager:
         # 检查加仓时间间隔
         last_time = self.last_layer_time[symbol][position_side]
         if last_time and (datetime.now() - last_time) < timedelta(hours=ADD_INTERVAL_HOURS):
-            logger.info(f"⏰ {symbol} {position_side.upper()} 加仓间隔时间不足，跳过加仓")
+            remaining = (last_time + timedelta(hours=ADD_INTERVAL_HOURS) - datetime.now()).total_seconds() / 3600
+            logger.info(f"⏰ {symbol} {position_side.upper()} 加仓冷却期剩余: {remaining:.1f}小时")
             return False
             
         positions = self.positions[symbol][position_side]
@@ -547,18 +564,24 @@ class DualMartingaleManager:
             logger.warning(f"🚨 {symbol} {position_side.upper()} 达到止损条件: {unrealized_pnl:.2f} USDT <= {STOP_LOSS_PER_SYMBOL} USDT")
             return False
         
-        # 检查是否达到加仓阈值
-        if current_layers < len(LAYER_TRIGGER_PERCENTAGES):
-            threshold = LAYER_TRIGGER_PERCENTAGES[current_layers]  # 当前层对应的亏损阈值
+        # 检查是否达到加仓阈值 - 使用环境变量中的配置
+        if current_layers < len(POSITION_SIZES):
+            threshold = POSITION_SIZES[current_layers]  # 当前层对应的亏损阈值
         else:
             # 如果层级超过配置，使用最后一层的阈值
-            threshold = LAYER_TRIGGER_PERCENTAGES[-1]
+            threshold = POSITION_SIZES[-1]
             
         # 只有当亏损达到触发阈值时才加仓
-        return pnl_pct <= -threshold
+        should_add = pnl_pct <= -threshold
+        if should_add:
+            logger.info(f"✅ {symbol} {position_side.upper()} 达到加仓条件: 亏损{abs(pnl_pct)*100:.2f}% >= 阈值{threshold*100:.2f}%")
+        else:
+            logger.info(f"❌ {symbol} {position_side.upper()} 未达到加仓条件: 亏损{abs(pnl_pct)*100:.2f}% < 阈值{threshold*100:.2f}%")
+            
+        return should_add
 
     def calculate_layer_size(self, symbol: str, position_side: str, current_price: float, is_trend_catch: bool = False) -> float:
-        """计算加仓大小 - 使用2倍递增"""
+        """计算加仓大小 - 使用环境变量中的配置"""
         self.initialize_symbol(symbol)
         layer = len(self.positions[symbol][position_side]) + 1
         
@@ -570,10 +593,13 @@ class DualMartingaleManager:
                 # 如果层级超过配置，使用最后一层的值
                 size_in_usdt = TREND_CATCH_SIZES[-1]
         else:
-            # 使用2倍递增的层级配置
-            # 第一层是BASE_TRADE_SIZE，第二层是2倍，第三层是4倍，以此类推
-            multiplier = 2 ** (layer - 1)
-            size_in_usdt = BASE_TRADE_SIZE * multiplier
+            # 使用环境变量中的仓位比例
+            if layer <= len(POSITION_SIZES):
+                # 将百分比转换为USDT金额
+                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[layer - 1] / POSITION_SIZES[0]
+            else:
+                # 如果层级超过配置，使用最后一层的值
+                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[-1] / POSITION_SIZES[0]
         
         size = size_in_usdt / current_price
         
@@ -581,15 +607,16 @@ class DualMartingaleManager:
         return size
 
     def calculate_initial_size(self, current_price: float) -> float:
-        """计算初始仓位大小 - 使用cointech2u的初始配置"""
-        # 使用cointech2u的初始配置
-        size = BASE_TRADE_SIZE / current_price
+        """计算初始仓位大小 - 使用环境变量中的配置"""
+        # 使用环境变量中的第一层仓位比例
+        size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[0]
+        size = size_in_usdt / current_price
         
-        logger.info(f"📏 初始仓位计算: USDT价值={BASE_TRADE_SIZE:.3f}, 数量={size:.6f}")
+        logger.info(f"📏 初始仓位计算: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
         return size
         
     def should_close_position(self, symbol: str, position_side: str, current_price: float) -> bool:
-        """检查是否应该平仓（止盈）"""
+        """检查是否应该平仓（止盈） - 使用环境变量中的配置"""
         self.initialize_symbol(symbol)
         if not self.positions[symbol][position_side]:
             return False
@@ -606,9 +633,9 @@ class DualMartingaleManager:
             pnl_pct = (avg_price - current_price) / avg_price
             
         # 如果盈利超过止盈点，止盈平仓
-        if pnl_pct >= TAKE_PROFIT_PCT:
+        if pnl_pct >= TP_PERCENT:
             current_layers = len(positions)
-            logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 盈利超过{TAKE_PROFIT_PCT*100:.2f}%，止盈平仓")
+            logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 盈利超过{TP_PERCENT*100:.2f}%，止盈平仓")
             
             # 发送 Telegram 通知
             if self.telegram:
@@ -937,11 +964,12 @@ class CoinTech2uBot:
             logger.info(f"📊 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
             
             # 检查趋势捕捉加仓
-            for position_side in ['long', 'short']:
-                if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
-                    should_add, next_layer = self.martingale.should_add_trend_catch_layer(symbol, position_side, trend_strength)
-                    if should_add:
-                        self.add_trend_catch_layer(symbol, position_side, current_price)
+            if ENABLE_TREND_CATCH:
+                for position_side in ['long', 'short']:
+                    if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
+                        should_add, next_layer = self.martingale.should_add_trend_catch_layer(symbol, position_side, trend_strength)
+                        if should_add:
+                            self.add_trend_catch_layer(symbol, position_side, current_price)
         
         # 检查是否需要止盈
         for position_side in ['long', 'short']:
@@ -949,9 +977,10 @@ class CoinTech2uBot:
                 self.close_profitable_position(symbol, position_side, current_price)
         
         # 检查是否需要加仓
-        for position_side in ['long', 'short']:
-            if self.martingale.should_add_layer(symbol, position_side, current_price):
-                self.add_martingale_layer(symbol, position_side, current_price)
+        if ENABLE_MARTINGALE:
+            for position_side in ['long', 'short']:
+                if self.martingale.should_add_layer(symbol, position_side, current_price):
+                    self.add_martingale_layer(symbol, position_side, current_price)
 
     def add_trend_catch_layer(self, symbol: str, position_side: str, current_price: float):
         """为指定方向添加趋势捕捉加仓"""
