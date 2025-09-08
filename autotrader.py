@@ -31,18 +31,15 @@ BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小
 
 # 策略参数 - CoinTech2u核心逻辑
 TAKE_PROFIT_PCT = 0.015  # 1.5%止盈
-ADD_INTERVAL_HOURS = int(os.getenv("ADD_INTERVAL_HOURS", "12"))  # 加仓间隔12小时
 MAX_LAYERS = 10  # 最大10层仓位
 
 # 加仓触发百分比阈值
-LAYER_TRIGGER_PERCENTAGES = [0.02678, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.13, 0.14]  # 转换为小数
+LAYER_TRIGGER_PERCENTAGES = [0.02678, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.13, 0.14, 0.15]  # 10个层级
 
 # 趋势捕捉加仓配置
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
-TREND_COOLDOWN_HOURS = 12  # 趋势加仓冷却时间
-MAX_DAILY_TREND_CATCH = 2  # 每天最多2次趋势加仓
 
 # 止损配置
 STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
@@ -419,14 +416,6 @@ class DualMartingaleManager:
     def __init__(self, telegram_notifier: TelegramNotifier = None, symbols: List[str] = None):
         # 仓位结构: {symbol: {'long': [], 'short': []}}
         self.positions: Dict[str, Dict[str, List[dict]]] = {}
-        # 最后加仓时间: {symbol: {'long': datetime, 'short': datetime}}
-        self.last_layer_time: Dict[str, Dict[str, datetime]] = {}
-        # 趋势捕捉加仓时间: {symbol: {'long': datetime, 'short': datetime}}
-        self.last_trend_catch_time: Dict[str, Dict[str, datetime]] = {}
-        # 每日趋势捕捉加仓计数: {symbol: {'long': int, 'short': int}}
-        self.daily_trend_catch_count: Dict[str, Dict[str, int]] = {}
-        # 上次重置计数日期
-        self.last_trend_catch_reset: datetime = datetime.now().date()
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
@@ -443,21 +432,6 @@ class DualMartingaleManager:
         """初始化交易对仓位结构"""
         if symbol not in self.positions:
             self.positions[symbol] = {'long': [], 'short': []}
-        if symbol not in self.last_layer_time:
-            self.last_layer_time[symbol] = {'long': None, 'short': None}
-        if symbol not in self.last_trend_catch_time:
-            self.last_trend_catch_time[symbol] = {'long': None, 'short': None}
-        if symbol not in self.daily_trend_catch_count:
-            self.daily_trend_catch_count[symbol] = {'long': 0, 'short': 0}
-
-    def reset_trend_catch_daily(self):
-        """每天重置趋势加仓计数"""
-        today = datetime.now().date()
-        if today != self.last_trend_catch_reset:
-            for symbol in self.symbols:
-                self.daily_trend_catch_count[symbol] = {'long': 0, 'short': 0}
-            self.last_trend_catch_reset = today
-            logger.info("📅 每日趋势加仓计数已重置")
 
     def add_position(self, symbol: str, side: str, size: float, price: float, is_trend_catch: bool = False):
         """添加仓位到对应方向"""
@@ -474,22 +448,16 @@ class DualMartingaleManager:
             'is_trend_catch': is_trend_catch
         })
         
-        if is_trend_catch:
-            self.last_trend_catch_time[symbol][position_side] = datetime.now()
-            self.daily_trend_catch_count[symbol][position_side] += 1
-        else:
-            self.last_layer_time[symbol][position_side] = datetime.now()
-        
         # 记录日志
         log_msg = f"📊 {symbol} {position_side.upper()} 第{layer}层仓位: {side} {size:.6f} @ {price:.2f}"
         if is_trend_catch:
-            log_msg += f" (趋势捕捉, 今日第{self.daily_trend_catch_count[symbol][position_side]}次)"
+            log_msg += " (趋势捕捉)"
         logger.info(log_msg)
         
         # 发送 Telegram 通知
         if self.telegram:
             if is_trend_catch:
-                telegram_msg = f"<b>🎯 趋势捕捉加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}\n今日趋势加仓次数: {self.daily_trend_catch_count[symbol][position_side]}/{MAX_DAILY_TREND_CATCH}"
+                telegram_msg = f"<b>🎯 趋势捕捉加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}"
             else:
                 telegram_msg = f"<b>🔄 常规加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}"
             self.telegram.send_message(telegram_msg)
@@ -500,7 +468,6 @@ class DualMartingaleManager:
     def should_add_trend_catch_layer(self, symbol: str, position_side: str, trend_strength: float) -> Tuple[bool, int]:
         """检查是否应该进行趋势捕捉加仓"""
         self.initialize_symbol(symbol)
-        self.reset_trend_catch_daily()
         
         # 检查是否有持仓
         if not self.positions[symbol][position_side]:
@@ -510,22 +477,15 @@ class DualMartingaleManager:
         if trend_strength < TREND_SIGNAL_STRENGTH:
             return False, 0
             
-        # 检查是否已达到最大每日趋势加仓次数
-        if self.daily_trend_catch_count[symbol][position_side] >= MAX_DAILY_TREND_CATCH:
-            # 超过次数 → 检查是否还在冷却期
-            last_trend_catch = self.last_trend_catch_time[symbol][position_side]
-            if last_trend_catch and (datetime.now() - last_trend_catch) < timedelta(hours=TREND_COOLDOWN_HOURS):
-                remaining = (last_trend_catch + timedelta(hours=TREND_COOLDOWN_HOURS) - datetime.now()).total_seconds() / 3600
-                logger.info(f"⏳ {symbol} {position_side.upper()} 趋势加仓冷却期剩余: {remaining:.1f}小时")
-                return False, 0
-            # 冷却期已过，重置计数
-            self.daily_trend_catch_count[symbol][position_side] = 0
-            logger.info(f"🔄 {symbol} {position_side.upper()} 趋势加仓冷却期已过，重置计数")
-            
         # 获取当前仓位层数
         current_layers = len(self.positions[symbol][position_side])
         next_layer = current_layers + 1
         
+        # 检查是否已达到最大层数
+        if next_layer > MAX_LAYERS:
+            logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
+            return False, 0
+            
         return True, next_layer
 
     def should_add_layer(self, symbol: str, position_side: str, current_price: float) -> bool:
@@ -536,12 +496,6 @@ class DualMartingaleManager:
         current_layers = len(self.positions[symbol][position_side])
         if current_layers >= MAX_LAYERS:
             logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
-            return False
-            
-        # 检查加仓时间间隔
-        last_time = self.last_layer_time[symbol][position_side]
-        if last_time and (datetime.now() - last_time) < timedelta(hours=ADD_INTERVAL_HOURS):
-            logger.info(f"⏰ {symbol} {position_side.upper()} 加仓间隔时间不足，跳过加仓")
             return False
             
         positions = self.positions[symbol][position_side]
@@ -652,7 +606,6 @@ class DualMartingaleManager:
         """清空某个方向的仓位记录"""
         self.initialize_symbol(symbol)
         self.positions[symbol][position_side] = []
-        self.daily_trend_catch_count[symbol][position_side] = 0
         logger.info(f"🔄 {symbol} {position_side.upper()} 仓位记录已清空")
         # 保存仓位状态
         self.save_positions()
@@ -681,21 +634,8 @@ class DualMartingaleManager:
                             'is_trend_catch': pos.get('is_trend_catch', False)
                         })
             
-            # 保存趋势捕捉计数
             serializable_data = {
                 'positions': serializable_positions,
-                'daily_trend_catch_count': self.daily_trend_catch_count,
-                'last_trend_catch_time': {
-                    sym: {side: time.isoformat() if time else None 
-                         for side, time in sides.items()}
-                    for sym, sides in self.last_trend_catch_time.items()
-                },
-                'last_layer_time': {
-                    sym: {side: time.isoformat() if time else None 
-                         for side, time in sides.items()}
-                    for sym, sides in self.last_layer_time.items()
-                },
-                'last_trend_catch_reset': self.last_trend_catch_reset.isoformat(),
                 'saved_at': datetime.now().isoformat()
             }
             
@@ -726,27 +666,6 @@ class DualMartingaleManager:
                                 'layer': pos['layer'],
                                 'is_trend_catch': pos.get('is_trend_catch', False)
                             })
-                
-                # 加载趋势捕捉计数
-                self.daily_trend_catch_count = data.get('daily_trend_catch_count', {})
-                
-                # 加载时间数据
-                self.last_trend_catch_time = {}
-                for sym, sides in data.get('last_trend_catch_time', {}).items():
-                    self.last_trend_catch_time[sym] = {}
-                    for side, time_str in sides.items():
-                        self.last_trend_catch_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
-                
-                self.last_layer_time = {}
-                for sym, sides in data.get('last_layer_time', {}).items():
-                    self.last_layer_time[sym] = {}
-                    for side, time_str in sides.items():
-                        self.last_layer_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
-                
-                # 加载重置日期
-                reset_str = data.get('last_trend_catch_reset')
-                if reset_str:
-                    self.last_trend_catch_reset = datetime.fromisoformat(reset_str).date()
                 
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
