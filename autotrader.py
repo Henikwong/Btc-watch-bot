@@ -32,7 +32,7 @@ BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小
 # 策略参数 - CoinTech2u核心逻辑
 TAKE_PROFIT_PCT = 0.015  # 1.5%止盈
 ADD_INTERVAL_HOURS = int(os.getenv("ADD_INTERVAL_HOURS", "12"))  # 加仓间隔12小时
-MAX_LAYERS = 9  # 最大9层仓位
+MAX_LAYERS = 10  # 最大10层仓位
 
 # 加仓触发百分比阈值
 LAYER_TRIGGER_PERCENTAGES = [0.02678, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.13, 0.14]  # 转换为小数
