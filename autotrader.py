@@ -595,11 +595,11 @@ class DualMartingaleManager:
         else:
             # 使用环境变量中的仓位比例
             if layer <= len(POSITION_SIZES):
-                # 将百分比转换为USDT金额
-                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[layer - 1] / POSITION_SIZES[0]
+                # 直接使用对应的百分比计算仓位大小
+                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[layer - 1]
             else:
                 # 如果层级超过配置，使用最后一层的值
-                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[-1] / POSITION_SIZES[0]
+                size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[-1]
         
         size = size_in_usdt / current_price
         
