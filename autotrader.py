@@ -1,3 +1,213 @@
+import os
+import sys
+import time
+import ccxt
+import pandas as pd
+import numpy as np
+import ta
+import logging
+import asyncio
+import signal
+import json
+import math
+import requests
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
+
+# ================== 配置参数 ==================
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
+TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
+LEVERAGE = int(os.getenv("LEVERAGE", "15"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+TELEGRAM_SUMMARY_INTERVAL = int(os.getenv("TELEGRAM_SUMMARY_INTERVAL", "3600"))  # 默认每小时发送一次摘要
+
+# 风险管理配置
+MAX_ACCOUNT_RISK = float(os.getenv("MAX_ACCOUNT_RISK", "0.3"))  # 最大账户风险30%
+MAX_SYMBOL_RISK = float(os.getenv("MAX_SYMBOL_RISK", "0.1"))  # 单币种最大风险10%
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.05"))  # 单日最大亏损5%
+POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "fixed")  # fixed或percentage
+
+# 止损配置
+STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+
+# Telegram 配置
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# 重试参数
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
+
+# 币安最小名义价值要求（USDT）
+MIN_NOTIONAL = {
+    "LTC/USDT": 20,
+    "XRP/USDT": 5,
+    "ADA/USDT": 5,
+    "DOGE/USDT": 20,
+    "LINK/USDT": 20,
+    "BTC/USDT": 10,
+    "ETH/USDT": 10,
+    "BNB/USDT": 10,
+    "SOL/USDT": 10,
+    "DOT/USDT": 10,
+    "AVAX/USDT": 10,
+    "MATIC/USDT": 10,
+    "UNI/USDT": 10,
+    "SUI/USDT": 10,
+}
+
+# ================== 日志设置 ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('cointech2u_bot.log')]
+)
+logger = logging.getLogger("CoinTech2uBot")
+
+# ================== 明确的层级配置 ==================
+class LayerConfiguration:
+    def __init__(self):
+        # 明确的层级配置：从第1层到第10层
+        self.layers = {
+            1: {
+                'trigger_percentage': 0.02678,  # 2.678%
+                'base_size': 6.0,               # 基础交易大小
+                'trend_catch_size': 5.0,        # 趋势捕捉加仓大小
+                'description': '第一层基础仓位'
+            },
+            2: {
+                'trigger_percentage': 0.05,     # 5%
+                'base_size': 12.0,              # 2倍基础
+                'trend_catch_size': 7.0,        # 趋势捕捉加仓大小
+                'description': '第二层加仓'
+            },
+            3: {
+                'trigger_percentage': 0.06,     # 6%
+                'base_size': 24.0,              # 4倍基础
+                'trend_catch_size': 10.0,       # 趋势捕捉加仓大小
+                'description': '第三层加仓'
+            },
+            4: {
+                'trigger_percentage': 0.07,     # 7%
+                'base_size': 48.0,              # 8倍基础
+                'trend_catch_size': 15.0,       # 趋势捕捉加仓大小
+                'description': '第四层加仓'
+            },
+            5: {
+                'trigger_percentage': 0.08,     # 8%
+                'base_size': 96.0,              # 16倍基础
+                'trend_catch_size': 20.0,       # 趋势捕捉加仓大小
+                'description': '第五层加仓'
+            },
+            6: {
+                'trigger_percentage': 0.09,     # 9%
+                'base_size': 192.0,             # 32倍基础
+                'trend_catch_size': 25.0,       # 趋势捕捉加仓大小
+                'description': '第六层加仓'
+            },
+            7: {
+                'trigger_percentage': 0.10,     # 10%
+                'base_size': 384.0,             # 64倍基础
+                'trend_catch_size': 30.0,       # 趋势捕捉加仓大小
+                'description': '第七层加仓'
+            },
+            8: {
+                'trigger_percentage': 0.13,     # 13%
+                'base_size': 768.0,             # 128倍基础
+                'trend_catch_size': 35.0,       # 趋势捕捉加仓大小
+                'description': '第八层加仓'
+            },
+            9: {
+                'trigger_percentage': 0.14,     # 14%
+                'base_size': 1536.0,            # 256倍基础
+                'trend_catch_size': 40.0,       # 趋势捕捉加仓大小
+                'description': '第九层加仓'
+            },
+            10: {
+                'trigger_percentage': 0.15,     # 15%
+                'base_size': 3072.0,            # 512倍基础
+                'trend_catch_size': 45.0,       # 趋势捕捉加仓大小
+                'description': '第十层加仓'
+            }
+        }
+        
+        # 最大层数
+        self.max_layers = len(self.layers)
+        
+    def get_trigger_percentage(self, layer: int) -> float:
+        """获取指定层级的触发百分比"""
+        if layer > self.max_layers:
+            return self.layers[self.max_layers]['trigger_percentage']
+        return self.layers[layer]['trigger_percentage']
+    
+    def get_base_size(self, layer: int) -> float:
+        """获取指定层级的基础交易大小"""
+        if layer > self.max_layers:
+            return self.layers[self.max_layers]['base_size']
+        return self.layers[layer]['base_size']
+    
+    def get_trend_catch_size(self, layer: int) -> float:
+        """获取指定层级的趋势捕捉加仓大小"""
+        if layer > self.max_layers:
+            return self.layers[self.max_layers]['trend_catch_size']
+        return self.layers[layer]['trend_catch_size']
+    
+    def get_description(self, layer: int) -> str:
+        """获取指定层级的描述"""
+        if layer > self.max_layers:
+            return self.layers[self.max_layers]['description']
+        return self.layers[layer]['description']
+    
+    def print_configuration(self):
+        """打印层级配置"""
+        logger.info("📋 层级配置:")
+        for layer in range(1, self.max_layers + 1):
+            config = self.layers[layer]
+            logger.info(f"  第{layer}层: {config['description']}, "
+                       f"触发阈值={config['trigger_percentage']*100}%, "
+                       f"基础大小=${config['base_size']}, "
+                       f"趋势捕捉大小=${config['trend_catch_size']}")
+
+# ================== Telegram 通知类 ==================
+class TelegramNotifier:
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+        
+    def send_message(self, message: str) -> bool:
+        """发送消息到Telegram"""
+        if not self.bot_token or not self.chat_id:
+            logger.warning("Telegram 配置未设置，跳过发送消息")
+            return False
+            
+        try:
+            url = f"{self.base_url}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                logger.info("Telegram 消息发送成功")
+                return True
+            else:
+                logger.error(f"Telegram 消息发送失败: {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"发送 Telegram 消息时出错: {e}")
+            return False
+
+# ================== 技术分析函数 ==================
 def analyze_trend(df: pd.DataFrame) -> Tuple[float, str]:
     """分析趋势方向和强度，使用多时间框架确认
     
@@ -299,23 +509,258 @@ class BinanceFutureAPI:
             logger.error(f"下单失败 {symbol} {side}: {e}")
             return False
 
+# ================== 风险管理类 ==================
+class RiskManager:
+    def __init__(self, api: BinanceFutureAPI):
+        self.api = api
+        self.initial_balance = 0.0
+        self.daily_balance = 0.0
+        self.daily_loss_limit = 0.0
+        self.max_symbol_risk = 0.0
+        self.max_account_risk = 0.0
+        self.today = datetime.now().date()
+        
+    def initialize(self):
+        """初始化风险管理"""
+        balance = self.api.get_balance()
+        self.initial_balance = balance
+        self.daily_balance = balance
+        self.daily_loss_limit = balance * DAILY_LOSS_LIMIT
+        self.max_symbol_risk = balance * MAX_SYMBOL_RISK
+        self.max_account_risk = balance * MAX_ACCOUNT_RISK
+        
+        logger.info(f"💰 风险管理初始化: 初始余额=${balance:.2f}, 单日最大亏损=${self.daily_loss_limit:.2f}")
+        logger.info(f"📊 单币种最大风险=${self.max_symbol_risk:.2f}, 账户最大风险=${self.max_account_risk:.2f}")
+    
+    def check_daily_loss(self):
+        """检查每日亏损限制"""
+        current_balance = self.api.get_balance()
+        daily_pnl = self.daily_balance - current_balance
+        
+        if daily_pnl >= self.daily_loss_limit:
+            logger.warning(f"🚨 达到每日亏损限制: ${daily_pnl:.2f} >= ${self.daily_loss_limit:.2f}")
+            return False
+        
+        return True
+    
+    def check_symbol_risk(self, symbol: str, position_side: str, current_price: float, positions: List[dict]) -> bool:
+        """检查单币种风险"""
+        if not positions:
+            return True
+            
+        total_size = sum(p['size'] for p in positions)
+        total_value = sum(p['size'] * p['entry_price'] for p in positions)
+        avg_price = total_value / total_size
+        
+        # 计算当前浮动盈亏
+        if position_side == 'long':
+            unrealized_pnl = total_size * (current_price - avg_price)
+        else:  # short
+            unrealized_pnl = total_size * (avg_price - current_price)
+        
+        # 如果浮动亏损超过单币种风险限制，停止加仓
+        if unrealized_pnl <= -self.max_symbol_risk:
+            logger.warning(f"🚨 {symbol} {position_side.upper()} 达到单币种风险限制: ${unrealized_pnl:.2f} <= -${self.max_symbol_risk:.2f}")
+            return False
+            
+        return True
+    
+    def check_account_risk(self) -> bool:
+        """检查账户整体风险"""
+        current_balance = self.api.get_balance()
+        total_loss = self.initial_balance - current_balance
+        
+        if total_loss >= self.max_account_risk:
+            logger.warning(f"🚨 达到账户最大风险限制: ${total_loss:.2f} >= ${self.max_account_risk:.2f}")
+            return False
+            
+        return True
+    
+    def calculate_position_size(self, symbol: str, current_price: float, base_size: float) -> float:
+        """根据风险管理计算仓位大小"""
+        if POSITION_SIZING_MODE == "percentage":
+            # 基于账户余额的百分比计算仓位大小
+            balance = self.api.get_balance()
+            risk_per_trade = balance * 0.01  # 每笔交易风险1%
+            position_size_usdt = risk_per_trade * 2  # 因为是双仓，所以乘以2
+        else:
+            # 固定仓位大小
+            position_size_usdt = base_size
+        
+        # 确保不超过单币种风险限制
+        position_size = position_size_usdt / current_price
+        
+        logger.info(f"📏 {symbol} 风险调整后仓位: USDT价值={position_size_usdt:.3f}, 数量={position_size:.6f}")
+        return position_size
+    
+    def should_trade(self, symbol: str) -> bool:
+        """检查是否允许交易"""
+        # 检查每日亏损限制
+        if not self.check_daily_loss():
+            return False
+            
+        # 检查账户整体风险
+        if not self.check_account_risk():
+            return False
+            
+        return True
+    
+    def reset_daily_balance(self):
+        """重置每日余额（在每天开始时调用）"""
+        today = datetime.now().date()
+        if today != self.today:
+            self.daily_balance = self.api.get_balance()
+            self.today = today
+            logger.info(f"📅 新的一天开始，重置每日余额: ${self.daily_balance:.2f}")
+
+# ================== 精准加仓监控系统 ==================
+class PrecisionLayerMonitor:
+    def __init__(self, martingale_manager, api, telegram_notifier=None):
+        self.martingale = martingale_manager
+        self.api = api
+        self.telegram = telegram_notifier
+        # 记录每个仓位的最后检查时间和价格
+        self.last_check = {}
+        # 设置更频繁的检查间隔（秒）
+        self.check_interval = 30
+        
+    def initialize_symbol(self, symbol: str):
+        """初始化交易对监控"""
+        if symbol not in self.last_check:
+            self.last_check[symbol] = {
+                'long': {'last_check_time': 0, 'last_price': 0},
+                'short': {'last_check_time': 0, 'last_price': 0}
+            }
+    
+    def monitor_all_symbols(self):
+        """监控所有交易对的加仓条件"""
+        current_time = time.time()
+        
+        for symbol in self.martingale.symbols:
+            self.initialize_symbol(symbol)
+            
+            # 获取当前价格
+            current_price = self.api.get_current_price(symbol)
+            if current_price is None:
+                continue
+                
+            # 监控多仓
+            self.monitor_position(symbol, 'long', current_price, current_time)
+            
+            # 监控空仓
+            self.monitor_position(symbol, 'short', current_price, current_time)
+    
+    def monitor_position(self, symbol: str, position_side: str, current_price: float, current_time: float):
+        """监控特定方向的仓位"""
+        # 检查是否有该方向的仓位
+        if not self.martingale.positions[symbol][position_side]:
+            return
+            
+        # 检查是否达到检查间隔
+        last_check = self.last_check[symbol][position_side]['last_check_time']
+        if current_time - last_check < self.check_interval:
+            return
+            
+        # 更新最后检查时间
+        self.last_check[symbol][position_side]['last_check_time'] = current_time
+        self.last_check[symbol][position_side]['last_price'] = current_price
+        
+        # 计算当前盈亏百分比
+        positions = self.martingale.positions[symbol][position_side]
+        total_size = sum(p['size'] for p in positions)
+        total_value = sum(p['size'] * p['entry_price'] for p in positions)
+        avg_price = total_value / total_size
+        
+        if position_side == 'long':
+            pnl_pct = (current_price - avg_price) / avg_price
+        else:  # short
+            pnl_pct = (avg_price - current_price) / avg_price
+            
+        current_layers = len(positions)
+        
+        # 记录详细监控信息
+        logger.info(f"🔍 {symbol} {position_side.upper()} 第{current_layers}层监控: "
+                   f"均价={avg_price:.6f}, 现价={current_price:.6f}, 盈亏={pnl_pct*100:.4f}%")
+        
+        # 检查是否达到加仓阈值
+        threshold = self.martingale.layer_config.get_trigger_percentage(current_layers + 1)
+            
+        # 只有当亏损达到触发阈值时才加仓
+        if pnl_pct <= -threshold:
+            logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层达到加仓阈值: "
+                       f"亏损{pnl_pct*100:.4f}% >= 阈值{threshold*100:.4f}%")
+            
+            # 检查是否已达到最大层数
+            if current_layers >= self.martingale.layer_config.max_layers:
+                logger.info(f"⛔ {symbol} {position_side.upper()} 已达到最大层数 {self.martingale.layer_config.max_layers}")
+                return
+                
+            # 执行加仓
+            self.execute_add_layer(symbol, position_side, current_price)
+    
+    def execute_add_layer(self, symbol: str, position_side: str, current_price: float):
+        """执行加仓操作"""
+        side = "buy" if position_side == "long" else "sell"
+        position_side_param = "LONG" if position_side == "long" else "SHORT"
+        
+        # 计算加仓大小
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, False)
+        
+        current_layers = len(self.martingale.positions[symbol][position_side])
+        logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层准备加仓第{current_layers+1}层，"
+                   f"方向: {side}, 大小: {layer_size:.8f}")
+        
+        # 执行市价订单
+        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
+        if success:
+            self.martingale.add_position(symbol, side, layer_size, current_price, False)
+            logger.info(f"✅ {symbol} {position_side.upper()} 第{current_layers+1}层加仓成功")
+            
+            # 发送Telegram通知
+            if self.telegram:
+                telegram_msg = (f"<b>📈 加仓成功</b>\n"
+                               f"{symbol} {position_side.upper()} 第{current_layers+1}层\n"
+                               f"操作: {side.upper()}\n"
+                               f"数量: {layer_size:.8f}\n"
+                               f"价格: ${current_price:.6f}")
+                self.telegram.send_message(telegram_msg)
+        else:
+            logger.error(f"❌ {symbol} {position_side.upper()} 加仓失败")
+            
+            # 发送Telegram通知
+            if self.telegram:
+                telegram_msg = (f"<b>❌ 加仓失败</b>\n"
+                               f"{symbol} {position_side.upper()} 第{current_layers+1}层\n"
+                               f"操作: {side.upper()}\n"
+                               f"数量: {layer_size:.8f}\n"
+                               f"价格: ${current_price:.6f}")
+                self.telegram.send_message(telegram_msg)
+
 # ================== 双仓马丁策略管理 ==================
 class DualMartingaleManager:
-    def __init__(self, telegram_notifier: TelegramNotifier = None, symbols: List[str] = None):
+    def __init__(self, telegram_notifier: TelegramNotifier = None, symbols: List[str] = None, risk_manager: RiskManager = None):
         # 仓位结构: {symbol: {'long': [], 'short': []}}
         self.positions: Dict[str, Dict[str, List[dict]]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
         self.telegram = telegram_notifier
+        # 风险管理器
+        self.risk_manager = risk_manager
         # 交易对列表
         self.symbols = symbols or []
+        # 层级配置
+        self.layer_config = LayerConfiguration()
         # 初始化所有交易对
         for symbol in self.symbols:
             self.initialize_symbol(symbol)
         # 加载保存的仓位
         self.load_positions()
 
+    def initialize(self):
+        """初始化时打印层级配置"""
+        self.layer_config.print_configuration()
+        
     def initialize_symbol(self, symbol: str):
         """初始化交易对仓位结构"""
         if symbol not in self.positions:
@@ -362,7 +807,7 @@ class DualMartingaleManager:
             return False, 0
             
         # 检查趋势强度
-        if trend_strength < TREND_SIGNAL_STRENGTH:
+        if trend_strength < 0.7:  # 趋势信号强度阈值
             return False, 0
             
         # 获取当前仓位层数
@@ -370,24 +815,28 @@ class DualMartingaleManager:
         next_layer = current_layers + 1
         
         # 检查是否已达到最大层数
-        if next_layer > MAX_LAYERS:
-            logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
+        if next_layer > self.layer_config.max_layers:
+            logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {self.layer_config.max_layers}")
             return False, 0
             
         return True, next_layer
 
     def should_add_layer(self, symbol: str, position_side: str, current_price: float) -> bool:
-        """检查是否应该加仓"""
+        """检查是否应该加仓（使用明确的层级配置）"""
         self.initialize_symbol(symbol)
         
         # 检查是否已达到最大层数
         current_layers = len(self.positions[symbol][position_side])
-        if current_layers >= MAX_LAYERS:
-            logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
+        if current_layers >= self.layer_config.max_layers:
+            logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {self.layer_config.max_layers}")
             return False
             
         positions = self.positions[symbol][position_side]
         if not positions:
+            return False
+            
+        # 检查风险管理
+        if self.risk_manager and not self.risk_manager.check_symbol_risk(symbol, position_side, current_price, positions):
             return False
             
         total_size = sum(p['size'] for p in positions)
@@ -400,7 +849,12 @@ class DualMartingaleManager:
         else:  # short
             pnl_pct = (avg_price - current_price) / avg_price
             
-        logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 当前盈亏: {pnl_pct*100:.2f}%")
+        # 获取当前层对应的触发阈值
+        threshold = self.layer_config.get_trigger_percentage(current_layers + 1)
+        
+        logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位监控: "
+                   f"均价={avg_price:.6f}, 现价={current_price:.6f}, "
+                   f"盈亏={pnl_pct*100:.2f}%, 第{current_layers+1}层触发阈值={threshold*100:.2f}%")
         
         # 检查止损条件
         unrealized_pnl = total_size * (current_price - avg_price) if position_side == 'long' else total_size * (avg_price - current_price)
@@ -408,44 +862,49 @@ class DualMartingaleManager:
             logger.warning(f"🚨 {symbol} {position_side.upper()} 达到止损条件: {unrealized_pnl:.2f} USDT <= {STOP_LOSS_PER_SYMBOL} USDT")
             return False
         
-        # 检查是否达到加仓阈值
-        if current_layers < len(LAYER_TRIGGER_PERCENTAGES):
-            threshold = LAYER_TRIGGER_PERCENTAGES[current_layers]  # 当前层对应的亏损阈值
-        else:
-            # 如果层级超过配置，使用最后一层的阈值
-            threshold = LAYER_TRIGGER_PERCENTAGES[-1]
-            
         # 只有当亏损达到触发阈值时才加仓
         return pnl_pct <= -threshold
 
     def calculate_layer_size(self, symbol: str, position_side: str, current_price: float, is_trend_catch: bool = False) -> float:
-        """计算加仓大小 - 使用2倍递增"""
+        """计算加仓大小（使用明确的层级配置）"""
         self.initialize_symbol(symbol)
-        layer = len(self.positions[symbol][position_side]) + 1
+        current_layers = len(self.positions[symbol][position_side])
+        next_layer = current_layers + 1
+        
+        if next_layer > self.layer_config.max_layers:
+            logger.error(f"层数 {next_layer} 超过最大层数 {self.layer_config.max_layers}")
+            return 0
         
         if is_trend_catch:
             # 使用趋势捕捉加仓配置
-            if layer <= len(TREND_CATCH_SIZES):
-                size_in_usdt = TREND_CATCH_SIZES[layer - 1]
-            else:
-                # 如果层级超过配置，使用最后一层的值
-                size_in_usdt = TREND_CATCH_SIZES[-1]
+            size_in_usdt = self.layer_config.get_trend_catch_size(next_layer)
         else:
-            # 使用2倍递增的层级配置
-            # 第一层是BASE_TRADE_SIZE，第二层是2倍，第三层是4倍，以此类推
-            multiplier = 2 ** (layer - 1)
-            size_in_usdt = BASE_TRADE_SIZE * multiplier
+            # 使用基础加仓配置
+            size_in_usdt = self.layer_config.get_base_size(next_layer)
         
-        size = size_in_usdt / current_price
+        # 如果有风险管理器，使用风险管理计算仓位大小
+        if self.risk_manager:
+            size = self.risk_manager.calculate_position_size(symbol, current_price, size_in_usdt)
+        else:
+            size = size_in_usdt / current_price
         
-        logger.info(f"📏 {symbol} {position_side.upper()} 第{layer}层计算仓位: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
+        layer_desc = self.layer_config.get_description(next_layer)
+        logger.info(f"📏 {symbol} {position_side.upper()} {layer_desc}: "
+                   f"USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
         return size
 
-    def calculate_initial_size(self, current_price: float) -> float:
-        """计算初始仓位大小"""
-        size = BASE_TRADE_SIZE / current_price
+    def calculate_initial_size(self, current_price: float, symbol: str = "") -> float:
+        """计算初始仓位大小（使用明确的层级配置）"""
+        # 使用第一层的基础交易大小
+        size_in_usdt = self.layer_config.get_base_size(1)
         
-        logger.info(f"📏 初始仓位计算: USDT价值={BASE_TRADE_SIZE:.3f}, 数量={size:.6f}")
+        # 如果有风险管理器，使用风险管理计算仓位大小
+        if self.risk_manager:
+            size = self.risk_manager.calculate_position_size(symbol, current_price, size_in_usdt)
+        else:
+            size = size_in_usdt / current_price
+        
+        logger.info(f"📏 {symbol} 初始仓位计算: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
         return size
         
     def should_close_position(self, symbol: str, position_side: str, current_price: float) -> bool:
@@ -466,9 +925,9 @@ class DualMartingaleManager:
             pnl_pct = (avg_price - current_price) / avg_price
             
         # 如果盈利超过止盈点，止盈平仓
-        if pnl_pct >= TAKE_PROFIT_PCT:
+        if pnl_pct >= 0.015:  # 1.5%止盈
             current_layers = len(positions)
-            logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 盈利超过{TAKE_PROFIT_PCT*100:.2f}%，止盈平仓")
+            logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 盈利超过1.5%，止盈平仓")
             
             # 发送 Telegram 通知
             if self.telegram:
@@ -596,7 +1055,7 @@ class DualMartingaleManager:
                     return
                 
                 # 计算初始仓位大小
-                position_size = self.calculate_initial_size(current_price)
+                position_size = self.calculate_initial_size(current_price, symbol)
                 if position_size <= 0:
                     logger.error(f"{symbol} 仓位大小计算错误，跳过补仓")
                     return
@@ -636,6 +1095,38 @@ class DualMartingaleManager:
         short_size = sum(p['size'] for p in self.positions[symbol]['short'])
         
         return f"{symbol}: 多仓{long_layers}层({long_size:.6f}) | 空仓{short_layers}层({short_size:.6f})"
+    
+    def get_all_positions_summary(self) -> str:
+        """获取所有交易对的仓位摘要"""
+        summary = "📊 <b>仓位摘要</b>\n\n"
+        for symbol in self.symbols:
+            self.initialize_symbol(symbol)
+            long_layers = len(self.positions[symbol]['long'])
+            short_layers = len(self.positions[symbol]['short'])
+            
+            if long_layers > 0 or short_layers > 0:
+                long_size = sum(p['size'] for p in self.positions[symbol]['long'])
+                short_size = sum(p['size'] for p in self.positions[symbol]['short'])
+                
+                # 计算平均入场价格
+                long_avg_price = 0
+                if long_layers > 0:
+                    long_total_value = sum(p['size'] * p['entry_price'] for p in self.positions[symbol]['long'])
+                    long_avg_price = long_total_value / long_size
+                
+                short_avg_price = 0
+                if short_layers > 0:
+                    short_total_value = sum(p['size'] * p['entry_price'] for p in self.positions[symbol]['short'])
+                    short_avg_price = short_total_value / short_size
+                
+                summary += f"<b>{symbol}</b>\n"
+                summary += f"  多仓: {long_layers}层, 数量: {long_size:.6f}, 均价: ${long_avg_price:.4f}\n"
+                summary += f"  空仓: {short_layers}层, 数量: {short_size:.6f}, 均价: ${short_avg_price:.4f}\n\n"
+        
+        if summary == "📊 <b>仓位摘要</b>\n\n":
+            summary += "暂无持仓"
+            
+        return summary
 
 # ================== 主交易机器人 ==================
 class CoinTech2uBot:
@@ -643,13 +1134,27 @@ class CoinTech2uBot:
         self.symbols = symbols
         self.api = BinanceFutureAPI(BINANCE_API_KEY, BINANCE_API_SECRET, symbols)
         
+        # 初始化风险管理器
+        self.risk_manager = RiskManager(self.api)
+        
         # 初始化 Telegram 通知器
         self.telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.martingale = DualMartingaleManager(self.telegram, symbols)
+        
+        # 初始化策略管理器（传入风险管理器）
+        self.martingale = DualMartingaleManager(self.telegram, symbols, self.risk_manager)
+        
+        # 初始化精准加仓监控系统
+        self.layer_monitor = PrecisionLayerMonitor(self.martingale, self.api, self.telegram)
+        
+        # 上次发送摘要的时间
+        self.last_summary_time = 0
         
         self.running = True
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
+        
+        # 初始化层级配置
+        self.martingale.initialize()
 
     def shutdown(self, signum, frame):
         logger.info("收到关闭信号，停止交易...")
@@ -667,25 +1172,61 @@ class CoinTech2uBot:
             if self.telegram:
                 self.telegram.send_message("<b>❌ 交易所初始化失败，程序退出</b>")
             return
+        
+        # 初始化风险管理
+        self.risk_manager.initialize()
             
         logger.info("🚀 开始CoinTech2u策略交易...")
         
         # 发送启动通知
         if self.telegram:
-            self.telegram.send_message(f"<b>🚀 CoinTech2u交易机器人已启动</b>\n交易对: {', '.join(self.symbols)}\n杠杆: {LEVERAGE}x\n基础仓位: ${BASE_TRADE_SIZE}")
+            # 获取第一层配置
+            first_layer_config = self.martingale.layer_config.layers[1]
+            telegram_msg = (f"<b>🚀 CoinTech2u交易机器人已启动</b>\n"
+                           f"交易对: {', '.join(self.symbols)}\n"
+                           f"杠杆: {LEVERAGE}x\n"
+                           f"基础仓位: ${first_layer_config['base_size']}\n"
+                           f"最大层数: {self.martingale.layer_config.max_layers}\n"
+                           f"风险管理: 单日最大亏损{DAILY_LOSS_LIMIT*100}%, 单币种最大风险{MAX_SYMBOL_RISK*100}%")
+            self.telegram.send_message(telegram_msg)
         
         # 程序启动时立即对所有币对开双仓
         logger.info("🔄 程序启动时对所有币对开双仓")
         for symbol in self.symbols:
             self.open_immediate_hedge(symbol)
         
+        # 记录启动时间
+        start_time = time.time()
+        self.last_summary_time = start_time
+        
         while self.running:
             try:
+                # 重置每日余额（如果需要）
+                self.risk_manager.reset_daily_balance()
+                
+                # 检查是否允许交易
+                if not self.risk_manager.should_trade(""):
+                    logger.warning("⚠️ 交易被风险管理阻止")
+                    # 发送警告通知
+                    if self.telegram:
+                        self.telegram.send_message("<b>⚠️ 交易被风险管理阻止</b>\n已达到风险限制，暂停交易")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                
                 balance = self.api.get_balance()
                 logger.info(f"当前余额: {balance:.2f} USDT")
                 
+                # 监控所有仓位状态
+                self.layer_monitor.monitor_all_symbols()
+                
                 # 打印所有币种的仓位摘要
                 self.print_position_summary()
+                
+                # 检查是否需要发送Telegram摘要
+                current_time = time.time()
+                if current_time - self.last_summary_time >= TELEGRAM_SUMMARY_INTERVAL:
+                    self.send_telegram_summary(balance)
+                    self.last_summary_time = current_time
                 
                 for symbol in self.symbols:
                     # 检查并填充基础仓位 - 核心功能：一测试到没有仓位就补上
@@ -701,6 +1242,17 @@ class CoinTech2uBot:
                     self.telegram.send_message(f"<b>❌ 交易循环错误</b>\n{str(e)}")
                 time.sleep(10)
 
+    def send_telegram_summary(self, balance: float):
+        """发送仓位摘要到Telegram"""
+        if not self.telegram:
+            return
+            
+        summary = self.martingale.get_all_positions_summary()
+        summary += f"\n💰 <b>账户余额</b>: ${balance:.2f} USDT"
+        summary += f"\n⏰ <b>更新时间</b>: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        self.telegram.send_message(summary)
+
     def print_position_summary(self):
         """打印所有币种的仓位摘要"""
         logger.info("📋 仓位摘要:")
@@ -709,7 +1261,12 @@ class CoinTech2uBot:
             logger.info(f"   {summary}")
 
     def open_immediate_hedge(self, symbol: str):
-        """程序启动时立即开双仓"""
+        """程序启动时立即开双仓（增加风险管理）"""
+        # 检查是否允许交易
+        if not self.risk_manager.should_trade(symbol):
+            logger.warning(f"⚠️ {symbol} 开仓被风险管理阻止")
+            return
+            
         # 检查交易所是否已有仓位
         exchange_positions = self.api.get_positions(symbol)
         has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
@@ -730,8 +1287,8 @@ class CoinTech2uBot:
             logger.error(f"无法获取 {symbol} 的价格，跳过")
             return
         
-        # 计算初始仓位大小
-        position_size = self.martingale.calculate_initial_size(current_price)
+        # 计算初始仓位大小（使用风险管理）
+        position_size = self.martingale.calculate_initial_size(current_price, symbol)
         if position_size <= 0:
             logger.error(f"{symbol} 仓位大小计算错误，跳过")
             return
@@ -746,143 +1303,4 @@ class CoinTech2uBot:
             logger.info(f"✅ {symbol} 已同时开多空仓位: 多单 {position_size:.6f} | 空单 {position_size:.6f}")
             # 记录仓位
             self.martingale.add_position(symbol, "buy", position_size, current_price)
-            self.martingale.add_position(symbol, "sell", position_size, current_price)
-        else:
-            logger.error(f"❌ {symbol} 开仓失败，需要手动检查")
-            # 发送错误通知
-            if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} 开仓失败</b>\n需要手动检查")
-
-    def process_symbol(self, symbol: str):
-        """处理单个交易对的交易逻辑"""
-        # 获取当前价格
-        current_price = self.api.get_current_price(symbol)
-        if current_price is None:
-            return
-        
-        # 获取K线数据用于趋势分析
-        df = self.api.get_ohlcv_data(symbol, TIMEFRAME, 100)
-        if df is not None:
-            # 分析趋势
-            trend_strength, trend_direction = analyze_trend(df)
-            logger.info(f"📊 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
-            
-            # 检查趋势捕捉加仓
-            for position_side in ['long', 'short']:
-                if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
-                    should_add, next_layer = self.martingale.should_add_trend_catch_layer(symbol, position_side, trend_strength)
-                    if should_add:
-                        self.add_trend_catch_layer(symbol, position_side, current_price)
-        
-        # 检查是否需要止盈
-        for position_side in ['long', 'short']:
-            if self.martingale.should_close_position(symbol, position_side, current_price):
-                self.close_profitable_position(symbol, position_side, current_price)
-        
-        # 检查是否需要加仓
-        for position_side in ['long', 'short']:
-            if self.martingale.should_add_layer(symbol, position_side, current_price):
-                self.add_martingale_layer(symbol, position_side, current_price)
-
-    def add_trend_catch_layer(self, symbol: str, position_side: str, current_price: float):
-        """为指定方向添加趋势捕捉加仓"""
-        positions = self.martingale.positions[symbol][position_side]
-        if not positions:
-            return
-            
-        side = "buy" if position_side == "long" else "sell"
-        position_side_param = "LONG" if position_side == "long" else "SHORT"
-        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, True)
-        
-        current_layers = len(positions)
-        logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 趋势捕捉加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
-        
-        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
-        if success:
-            self.martingale.add_position(symbol, side, layer_size, current_price, True)
-        else:
-            # 发送错误通知
-            if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 趋势捕捉加仓失败</b>")
-
-    def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
-        """平掉盈利的仓位"""
-        position_size = self.martingale.get_position_size(symbol, position_side)
-        if position_size <= 0:
-            return
-            
-        # 获取当前层数
-        current_layers = self.martingale.get_position_layers(symbol, position_side)
-            
-        # 平仓方向与开仓方向相反
-        if position_side == "long":
-            close_side = "sell"
-            position_side_param = "LONG"
-        else:  # short
-            close_side = "buy"
-            position_side_param = "SHORT"
-        
-        logger.info(f"📤 {symbol} {position_side.upper()} 第{current_layers}层仓位 止盈平仓，方向: {close_side}, 大小: {position_size:.6f}")
-        
-        success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
-        if success:
-            self.martingale.clear_positions(symbol, position_side)
-            logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
-            
-            # 平仓后重新开仓
-            time.sleep(1)  # 等待一下再开新仓
-            new_position_size = self.martingale.calculate_initial_size(current_price)
-            open_side = "buy" if position_side == "long" else "sell"
-            open_success = self.api.execute_market_order(symbol, open_side, new_position_size, position_side_param)
-            
-            if open_success:
-                self.martingale.add_position(symbol, open_side, new_position_size, current_price)
-                logger.info(f"🔄 {symbol} {position_side.upper()} 已重新开仓")
-        else:
-            # 发送错误通知
-            if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 止盈平仓失败</b>")
-
-    def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
-        """为指定方向加仓"""
-        positions = self.martingale.positions[symbol][position_side]
-        if not positions:
-            return
-            
-        side = "buy" if position_side == "long" else "sell"
-        position_side_param = "LONG" if position_side == "long" else "SHORT"
-        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, False)
-        
-        current_layers = len(positions)
-        logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 准备加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
-        
-        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
-        if success:
-            self.martingale.add_position(symbol, side, layer_size, current_price, False)
-        else:
-            # 发送错误通知
-            if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 加仓失败</b>")
-
-# ================== 启动程序 ==================
-def main():
-    bot = CoinTech2uBot(SYMBOLS_CONFIG)
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        logger.info("用户中断程序")
-    except Exception as e:
-        logger.error(f"程序错误: {e}")
-    finally:
-        logger.info("交易程序结束")
-
-if __name__ == "__main__":
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        print("错误: 请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
-        sys.exit(1)
-        
-    if not SYMBOLS_CONFIG:
-        print("错误: 请设置 SYMBOLS 环境变量，例如: LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT")
-        sys.exit(1)
-        
-    main()
+            self.martingale.add_position(symbol, "sell", position_size, current
