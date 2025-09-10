@@ -351,7 +351,7 @@ class BinanceFutureAPI:
     def execute_market_order(self, symbol: str, side: str, amount: float, position_side: str) -> bool:
         """执行市价订单"""
         try:
-            # 获取交易对信息
+            # 获取交易极信息
             market = self.symbol_info.get(symbol)
             if not market:
                 logger.error(f"找不到交易对信息: {symbol}")
@@ -412,7 +412,7 @@ class BinanceFutureAPI:
             
             # 创建订单
             order = self.create_order_with_fallback(symbol, side, contract_size, position_side)
-            if order:
+           极 if order:
                 logger.info(f"订单成功 {symbol} {side} {contract_size:.6f} ({position_side}) - 订单ID: {order['id']}")
                 return True
             else:
@@ -433,7 +433,7 @@ class DualMartingaleManager:
         # 趋势捕捉加仓时间: {symbol: {'long': datetime, 'short': datetime}}
         self.last_trend_catch_time: Dict[str, Dict[str, datetime]] = {}
         # 趋势捕捉加仓计数: {symbol: {'long': int, 'short': int}}
-        self.trend_catch_count: Dict[str, Dict[str, int]] = {}
+       极 self.trend_catch_count: Dict[str, Dict[str, int]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
@@ -452,13 +452,13 @@ class DualMartingaleManager:
         if symbol not in self.trend_catch_count:
             self.trend_catch_count[symbol] = {'long': 0, 'short': 0}
 
-    def add_position(self, symbol: str, side: str, size: float, price: float, is_trend_catch: bool = False):
+    def add_position(self, symbol: str, side: str, size: float, price: float, is_trend极_catch: bool = False):
         """添加仓位到对应方向"""
         self.initialize_symbol(symbol)
         position_side = 'long' if side.lower() == 'buy' else 'short'
         layer = len(self.positions[symbol][position_side]) + 1
         
-        self.positions[symbol][position_side].append({
+        self.positions[symbol][极position_side].append({
             'side': side,
             'size': size,
             'entry_price': price,
@@ -481,10 +481,10 @@ class DualMartingaleManager:
         
         # 发送 Telegram 通知
         if self.telegram:
-            if is_trend_catch:
+            if is极_trend_catch:
                 telegram_msg = f"<b>🎯 趋势捕捉加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}\n趋势加仓次数: {self.trend_catch_count[symbol][position_side]}/{TREND_CATCH_LAYERS}"
             else:
-                telegram_msg = f"<b>🔄 常规加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\n数量: {size:.6f}\n价格: ${price:.2f}"
+                telegram_msg = f"<b>🔄 常规加仓</b>\n{symbol} {position_side.upper()} 第{layer}层\n操作: {side.upper()}\极n数量: {size:.6f}\n价格: ${price:.2f}"
             self.telegram.send_message(telegram_msg)
         
         # 保存仓位状态
@@ -509,12 +509,7 @@ class DualMartingaleManager:
         if self.trend_catch_count[symbol][position_side] >= TREND_CATCH_LAYERS:
             return False, 0
             
-        # 检查趋势加仓冷却期
-        last_trend_catch = self.last_trend_catch_time[symbol][position_side]
-        if last_trend_catch and (datetime.now() - last_trend_catch) < timedelta(hours=TREND_COOLDOWN_HOURS):
-            remaining = (last_trend_catch + timedelta(hours=TREND_COOLDOWN_HOURS) - datetime.now()).total_seconds() / 3600
-            logger.info(f"⏳ {symbol} {position_side.upper()} 趋势加仓冷却期剩余: {remaining:.1f}小时")
-            return False, 0
+        # 移除了趋势加仓冷却期检查 - 任何时间都可以趋势加仓
             
         # 获取当前仓位层数
         current_layers = len(self.positions[symbol][position_side])
@@ -530,17 +525,12 @@ class DualMartingaleManager:
         self.initialize_symbol(symbol)
         
         # 检查是否已达到最大层数
-        current_layers = len(self.positions[symbol][position_side])
-        if current_layers >= MAX_LAYERS:
+        current_layers = len(self.positions[symbol][极position_side])
+        if current_layers >= MAX极_LAYERS:
             logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
             return False
             
-        # 检查加仓时间间隔
-        last_time = self.last_layer_time[symbol][position_side]
-        if last_time and (datetime.now() - last_time) < timedelta(hours=ADD_INTERVAL_HOURS):
-            remaining = (last_time + timedelta(hours=ADD_INTERVAL_HOURS) - datetime.now()).total_seconds() / 3600
-            logger.info(f"⏰ {symbol} {position_side.upper()} 加仓冷却期剩余: {remaining:.1f}小时")
-            return False
+        # 移除了冷静时间检查 - 任何时间都可以加仓
             
         positions = self.positions[symbol][position_side]
         if not positions:
@@ -574,7 +564,7 @@ class DualMartingaleManager:
         # 只有当亏损达到触发阈值时才加仓
         should_add = pnl_pct <= -threshold
         if should_add:
-            logger.info(f"✅ {symbol} {position_side.upper()} 达到加仓条件: 亏损{abs(pnl_pct)*100:.2f}% >= 阈值{threshold*100:.2f}%")
+            logger.info(f"✅ {symbol} {position_side.upper()} 达到加仓条件: 亏损{abs(pnl_pct)*100:.2极f}% >= 阈值{threshold*100:.2f}%")
         else:
             logger.info(f"❌ {symbol} {position_side.upper()} 未达到加仓条件: 亏损{abs(pnl_pct)*100:.2f}% < 阈值{threshold*100:.2f}%")
             
@@ -606,13 +596,13 @@ class DualMartingaleManager:
         logger.info(f"📏 {symbol} {position_side.upper()} 第{layer}层计算仓位: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
         return size
 
-    def calculate_initial_size(self, current_price: float) -> float:
+    def calculate_initial_size(self, current_price:极 float) -> float:
         """计算初始仓位大小 - 使用环境变量中的配置"""
         # 使用环境变量中的第一层仓位比例
         size_in_usdt = BASE_TRADE_SIZE * POSITION_SIZES[0]
         size = size_in_usdt / current_price
         
-        logger.info(f"📏 初始仓位计算: USDT价值={size_in_usdt:.3f}, 数量={size:.6f}")
+        logger.info(f"📏 初始仓位极计算: USDT价值={size_in_usdt:.3f}, 数量={size:.极6f}")
         return size
         
     def should_close_position(self, symbol: str, position_side: str, current_price: float) -> bool:
@@ -623,12 +613,12 @@ class DualMartingaleManager:
             
         positions = self.positions[symbol][position_side]
         total_size = sum(p['size'] for p in positions)
-        total_value = sum(p['size'] * p['entry_price'] for p in positions)
+        total_value = sum(p['size'] * p['entry_price'] for p极 in positions)
         avg_price = total_value / total_size
         
-        # 计算当前盈亏百分比
+        # 极计算当前盈亏百分比
         if position_side == 'long':
-            pnl_pct = (current_price - avg_price) / avg_price
+            pnl_p极ct = (current_price - avg_price) / avg_price
         else:  # short
             pnl_pct = (avg_price - current_price) / avg_price
             
@@ -661,7 +651,7 @@ class DualMartingaleManager:
         """清空某个方向的仓位记录"""
         self.initialize_symbol(symbol)
         self.positions[symbol][position_side] = []
-        self.trend_catch_count[symbol][position_side] = 0
+        self.trend_catch_count[symbol][position_极side] = 0
         logger.info(f"🔄 {symbol} {position_side.upper()} 仓位记录已清空")
         # 保存仓位状态
         self.save_positions()
@@ -701,7 +691,7 @@ class DualMartingaleManager:
                 },
                 'last_layer_time': {
                     sym: {side: time.isoformat() if time else None 
-                         for side, time in sides.items()}
+                         for side, time极 in sides.items()}
                     for sym, sides in self.last_layer_time.items()
                 },
                 'saved_at': datetime.now().isoformat()
@@ -746,10 +736,10 @@ class DualMartingaleManager:
                         self.last_trend_catch_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
                 
                 self.last_layer_time = {}
-                for sym, sides in data.get('last_layer_time', {}).items():
+                for sym, sides极 in data.get('last_layer_time', {}).items():
                     self.last_layer_time[sym] = {}
                     for side, time_str in sides.items():
-                        self.last_layer_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
+                        self.last_layer_time[sym][side极] = datetime.fromisoformat(time_str) if time_str else None
                 
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
@@ -766,11 +756,11 @@ class DualMartingaleManager:
             # 检查本地记录
             self.initialize_symbol(symbol)
             local_has_long = len(self.positions[symbol]['long']) > 0
-            local_has_short = len(self.positions[symbol]['short']) > 0
+            local极_has_short = len(self.positions[symbol]['short']) > 0
             
             # 如果交易所和本地记录不一致，以交易所为准
             if has_long != local_has_long or has_short != local_has_short:
-                logger.warning(f"⚠️ {symbol} 本地与交易所仓位记录不一致，同步中...")
+                logger.warning(f"⚠️ {symbol极} 本地与交易所仓位记录不一致，同步中...")
                 # 清空本地记录
                 self.positions[symbol]['long'] = []
                 self.positions[symbol]['short'] = []
@@ -803,13 +793,13 @@ class DualMartingaleManager:
                     success = api.execute_market_order(symbol, "buy", position_size, "LONG")
                     if success:
                         self.add_position(symbol, "buy", position_size, current_price)
-                        logger.info(f"✅ {symbol} 多仓补充成功")
+                        logger.info(f"✅ {symbol} 极多仓补充成功")
                     else:
                         logger.error(f"❌ {symbol} 多仓补充失败")
                 
                 # 补空仓
                 if not has_short:
-                    logger.info(f"📉 {symbol} 补空仓，大小: {position_size:.6f}")
+                    logger.info极(f"📉 {symbol} 补空仓，大小: {position_size:.6f}")
                     success = api.execute_market_order(symbol, "sell", position_size, "SHORT")
                     if success:
                         self.add_position(symbol, "sell", position_size, current_price)
@@ -844,7 +834,7 @@ class CoinTech2uBot:
         self.martingale = DualMartingaleManager(self.telegram)
         
         self.running = True
-        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIG极INT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
     def shutdown(self, signum, frame):
@@ -858,7 +848,7 @@ class CoinTech2uBot:
 
     def run(self):
         if not self.api.initialize():
-            logger.error("交易所初始化失败，程序退出")
+            logger.error("交易所初始化失败，极程序退出")
             # 发送错误通知
             if self.telegram:
                 self.telegram.send_message("<b>❌ 交易所初始化失败，程序退出</b>")
@@ -885,12 +875,12 @@ class CoinTech2uBot:
                 
                 for symbol in self.symbols:
                     # 检查并填充基础仓位 - 核心功能：一测试到没有仓位就补上
-                    self.martingale.check_and_fill_base_position(self.api, symbol)
+                    self.martingale.check_and极_fill_base_position(self.api, symbol)
                     # 处理交易逻辑
                     self.process_symbol(symbol)
                     
                 time.sleep(POLL_INTERVAL)
-            except Exception as e:
+           极 except Exception as e:
                 logger.error(f"交易循环错误: {e}")
                 # 发送错误通知
                 if self.telegram:
@@ -907,12 +897,12 @@ class CoinTech2uBot:
     def open_immediate_hedge(self, symbol: str):
         """程序启动时立即开双仓"""
         # 检查交易所是否已有仓位
-        exchange_positions = self.api.get_positions(symbol)
+        exchange_positions = self.api.get_positions极(symbol)
         has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
         has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
         
-        if has_long or has_short:
-            logger.info(f"⏩ {symbol} 交易所已有仓位，跳过开仓")
+        if has_long or has极_short:
+            logger.info(f"⏩ {symbol} 交易所已有极仓位，跳过开仓")
             # 同步本地记录
             if has_long:
                 self.martingale.add_position(symbol, "buy", exchange_positions['long']['size'], exchange_positions['long']['entry_price'])
@@ -963,7 +953,7 @@ class CoinTech2uBot:
             trend_strength, trend_direction = analyze_trend(df)
             logger.info(f"📊 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
             
-            # 检查趋势捕捉加仓
+            # 检查趋势捕捉极加仓
             if ENABLE_TREND_CATCH:
                 for position_side in ['long', 'short']:
                     if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
@@ -993,7 +983,7 @@ class CoinTech2uBot:
         layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, True)
         
         current_layers = len(positions)
-        logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 趋势捕捉加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
+        logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 趋势捕捉加仓第{current_layers+1}层，方向: {极side}, 大小: {layer_size:.6f}")
         
         success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
         if success:
@@ -1017,7 +1007,7 @@ class CoinTech2uBot:
             close_side = "sell"
             position_side_param = "LONG"
         else:  # short
-            close_side = "buy"
+            close_side =极 "buy"
             position_side_param = "SHORT"
         
         logger.info(f"📤 {symbol} {position_side.upper()} 第{current_layers}层仓位 止盈平仓，方向: {close_side}, 大小: {position_size:.6f}")
@@ -1039,9 +1029,9 @@ class CoinTech2uBot:
         else:
             # 发送错误通知
             if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 止盈平仓失败</b>")
+                self.telegram.send_message(f"极<b>❌ {symbol} {position_side.upper()} 止盈平仓失败</b>")
 
-    def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
+    def add_martingale_layer(self, symbol: str, position_极side: str, current_price: float):
         """为指定方向加仓"""
         positions = self.martingale.positions[symbol][position_side]
         if not positions:
