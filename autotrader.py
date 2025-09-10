@@ -23,19 +23,20 @@ load_dotenv()
 # ================== 配置参数 ==================
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
+SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "ETH/USDT,LTC/USDT,BNB/USDT,DOGE/USDT,XRP/USDT,SOL/USDT,AVAX/USDT,ADA/USDT,LINK/USDT,UNI/USDT,SUI/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "8"))  # 基础交易大小改为8 USDT
+BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "8"))  # 基础交易大小
 
 # 从环境变量读取加仓触发百分比
 position_sizes_str = os.getenv("POSITION_SIZES", "2.678,5,6,7,8,9,10,13,14")
-POSITION_SIZES = [float(size.strip()) for size in position_sizes_str.split(',')]
-MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
+# 移除百分号并转换为浮点数
+POSITION_SIZES = [float(size.strip().replace('%', '')) for size in position_sizes_str.split(',')]
+MAX_LAYERS = int(os.getenv("MAX_LAYERS", "10"))  # 最大层数
 
 # 从环境变量读取止盈比例
-TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5")) / 100
+TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").replace('%', '')) / 100
 
 # 从环境变量读取止损设置
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))
@@ -43,6 +44,8 @@ STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))
 # 从环境变量读取趋势捕捉和马丁设置
 ENABLE_TREND_CATCH = os.getenv("ENABLE_TREND_CATCH", "true").lower() == "true"
 ENABLE_MARTINGALE = os.getenv("ENABLE_MARTINGALE", "true").lower() == "true"
+ENABLE_STOP_LOSS = os.getenv("ENABLE_STOP_LOSS", "true").lower() == "true"
+ENABLE_TAKE_PROFIT = os.getenv("ENABLE_TAKE_PROFIT", "true").lower() == "true"
 
 # 加仓间隔配置
 INITIAL_ADD_INTERVAL = int(os.getenv("INITIAL_ADD_INTERVAL", "1"))  # 前3层加仓间隔(小时)
@@ -55,37 +58,35 @@ TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
 TREND_COOLDOWN_HOURS = 6  # 趋势加仓冷却时间
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = float(os.getenv("STOP_LOSS", "-100"))  # 单币种亏损100USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "false").lower() == "true"
 
 # 重试参数
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2.0"))
 
-# 币安最小名义价值要求（USDT）
+# 币安最小名义价值要求（USDT） - 更新更多交易对
 MIN_NOTIONAL = {
-    "LTC/USDT": 20,
-    "XRP/USDT": 5,
-    "ADA/USDT": 5,
-    "DOGE/USDT": 20,
-    "LINK/USDT": 20,
-    "BTC/USDT": 10,
     "ETH/USDT": 10,
+    "LTC/USDT": 20,
     "BNB/USDT": 10,
+    "XRP/USDT": 5,
+    "DOGE/USDT": 20,
     "SOL/USDT": 10,
-    "DOT/USDT": 10,
     "AVAX/USDT": 10,
-    "MATIC/USDT": 10,
+    "ADA/USDT": 5,
+    "LINK/USDT": 20,
     "UNI/USDT": 10,
     "SUI/USDT": 10,
 }
 
 # ================== 日志设置 ==================
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('cointech2u_bot.log')]
 )
@@ -470,7 +471,7 @@ class DualMartingaleManager:
             message = f"✅ {symbol} {side}方向第{current_layer+1}层加仓\n"
             message += f"加仓金额: {layer_size} USDT\n"
             message += f"当前价格: {current_price}"
-            if self.telegram:
+            if self.telegram and ENABLE_TELEGRAM:
                 self.telegram.send_message(message)
             
             # 保存仓位状态
@@ -481,6 +482,9 @@ class DualMartingaleManager:
     
     def check_add_condition(self, symbol: str, positions: dict, current_price: float, api: BinanceFutureAPI):
         """检查是否满足加仓条件"""
+        if not ENABLE_MARTINGALE:
+            return
+            
         for side in ["long", "short"]:
             if side in positions and positions[side]:
                 # 计算平均开仓价格和总数量
@@ -516,6 +520,9 @@ class DualMartingaleManager:
     
     def check_take_profit(self, symbol: str, positions: dict, current_price: float, api: BinanceFutureAPI):
         """检查是否满足止盈条件"""
+        if not ENABLE_TAKE_PROFIT:
+            return
+            
         for side in ["long", "short"]:
             if side in positions and positions[side]:
                 # 计算平均开仓价格和总数量
@@ -544,7 +551,7 @@ class DualMartingaleManager:
                         message = f"✅ {symbol} {side}方向止盈平仓\n"
                         message += f"盈利: {unrealized_pnl_percent:.2f}%\n"
                         message += f"平仓价格: {current_price}"
-                        if self.telegram:
+                        if self.telegram and ENABLE_TELEGRAM:
                             self.telegram.send_message(message)
                         
                         # 保存仓位状态
@@ -552,6 +559,9 @@ class DualMartingaleManager:
     
     def check_stop_loss(self, symbol: str, positions: dict, current_price: float, api: BinanceFutureAPI):
         """检查是否满足止损条件"""
+        if not ENABLE_STOP_LOSS:
+            return
+            
         for side in ["long", "short"]:
             if side in positions and positions[side]:
                 # 计算总亏损
@@ -573,7 +583,7 @@ class DualMartingaleManager:
                         message = f"⚠️ {symbol} {side}方向止损平仓\n"
                         message += f"亏损: {total_pnl:.2f} USDT\n"
                         message += f"平仓价格: {current_price}"
-                        if self.telegram:
+                        if self.telegram and ENABLE_TELEGRAM:
                             self.telegram.send_message(message)
                         
                         # 保存仓位状态
@@ -601,7 +611,7 @@ class CoinTech2uBot:
         """主循环"""
         logger.info("交易机器人启动")
         
-        if self.telegram:
+        if self.telegram and ENABLE_TELEGRAM:
             self.telegram.send_message("🚀 交易机器人启动")
         
         while self.running:
@@ -618,7 +628,7 @@ class CoinTech2uBot:
         
         logger.info("交易机器人停止")
         
-        if self.telegram:
+        if self.telegram and ENABLE_TELEGRAM:
             self.telegram.send_message("🛑 交易机器人停止")
     
     def check_symbol(self, symbol: str):
@@ -709,7 +719,7 @@ class CoinTech2uBot:
                                     message += f"加仓金额: {layer_size} USDT\n"
                                     message += f"趋势强度: {trend_strength:.2f}\n"
                                     message += f"当前价格: {current_price}"
-                                    if self.telegram:
+                                    if self.telegram and ENABLE_TELEGRAM:
                                         self.telegram.send_message(message)
                                     
                                     # 保存仓位状态
