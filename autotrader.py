@@ -43,15 +43,14 @@ STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))
 ENABLE_TREND_CATCH = os.getenv("ENABLE_TREND_CATCH", "true").lower() == "true"
 ENABLE_MARTINGALE = os.getenv("ENABLE_MARTINGALE", "true").lower() == "true"
 
-# 加仓间隔
-ADD_INTERVAL_HOURS = int(os.getenv("ADD_INTERVAL_HOURS", "12"))
+# 加仓间隔 - 已删除冷静期，此参数不再使用
 MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 
 # 趋势捕捉加仓配置
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
-TREND_COOLDOWN_HOURS = 6  # 趋势加仓冷却时间
+# 已删除趋势加仓冷却时间
 
 # 止损配置
 STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
@@ -509,13 +508,8 @@ class DualMartingaleManager:
         if self.trend_catch_count[symbol][position_side] >= TREND_CATCH_LAYERS:
             return False, 0
             
-        # 检查趋势加仓冷却期
-        last_trend_catch = self.last_trend_catch_time[symbol][position_side]
-        if last_trend_catch and (datetime.now() - last_trend_catch) < timedelta(hours=TREND_COOLDOWN_HOURS):
-            remaining = (last_trend_catch + timedelta(hours=TREND_COOLDOWN_HOURS) - datetime.now()).total_seconds() / 3600
-            logger.info(f"⏳ {symbol} {position_side.upper()} 趋势加仓冷却期剩余: {remaining:.1f}小时")
-            return False, 0
-            
+        # 已删除趋势加仓冷却期检查
+        
         # 获取当前仓位层数
         current_layers = len(self.positions[symbol][position_side])
         next_layer = current_layers + 1
@@ -535,13 +529,8 @@ class DualMartingaleManager:
             logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
             return False
             
-        # 检查加仓时间间隔
-        last_time = self.last_layer_time[symbol][position_side]
-        if last_time and (datetime.now() - last_time) < timedelta(hours=ADD_INTERVAL_HOURS):
-            remaining = (last_time + timedelta(hours=ADD_INTERVAL_HOURS) - datetime.now()).total_seconds() / 3600
-            logger.info(f"⏰ {symbol} {position_side.upper()} 加仓冷却期剩余: {remaining:.1f}小时")
-            return False
-            
+        # 已删除加仓时间间隔检查
+        
         positions = self.positions[symbol][position_side]
         if not positions:
             return False
