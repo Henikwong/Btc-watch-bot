@@ -67,7 +67,7 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 MIN_NOTIONAL = {
     "LTC/USDT": 20,
     "XRP/USDT": 5,
-    "ADA/USDT": 5,
+    "ADA/USDT": 8,
     "DOGE/USDT": 20,
     "LINK/USDT": 20,
     "BTC/USDT": 10,
