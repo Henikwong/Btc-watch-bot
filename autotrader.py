@@ -1,3 +1,39 @@
+import os
+import sys
+import time
+import ccxt
+import pandas as pd
+import numpy as np
+import ta
+import logging
+import asyncio
+import signal
+import json
+import math
+import requests
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
+
+# ================== 配置参数 ==================
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
+TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
+LEVERAGE = int(os.getenv("LEVERAGE", "15"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
+
+# 从环境变量读取加仓比例
+position_sizes_str = os.getenv("POSITION_SIZES", "2.678%,5%,6%,7%,8%,9%,10%,13%,14%")
+POSITION_SIZES = [float(size.strip().replace('%', '')) / 100 for size in position_sizes_str.split(',')]
+
+# 从环境变量读取止盈比例
 TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").replace('%', '')) / 100
 
 # 从环境变量读取止损设置
@@ -16,8 +52,12 @@ TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
 # 已删除趋势加仓冷却时间
 
+# 冷静期配置
+COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
+COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
+
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -217,7 +257,7 @@ class BinanceFutureAPI:
             logger.info("交易所初始化成功")
             return True
         except Exception as e:
-            logger.error(f"交易所初始化失败: {e}")
+            logger.error(f"交易所初始化失败: {e")
             return False
 
     def get_balance(self) -> float:
@@ -397,6 +437,8 @@ class DualMartingaleManager:
         self.last_trend_catch_time: Dict[str, Dict[str, datetime]] = {}
         # 趋势捕捉加仓计数: {symbol: {'long': int, 'short': int}}
         self.trend_catch_count: Dict[str, Dict[str, int]] = {}
+        # 冷静期开始时间: {symbol: {'long': datetime, 'short': datetime}}
+        self.cooldown_start_time: Dict[str, Dict[str, datetime]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
@@ -414,6 +456,41 @@ class DualMartingaleManager:
             self.last_trend_catch_time[symbol] = {'long': None, 'short': None}
         if symbol not in self.trend_catch_count:
             self.trend_catch_count[symbol] = {'long': 0, 'short': 0}
+        if symbol not in self.cooldown_start_time:
+            self.cooldown_start_time[symbol] = {'long': None, 'short': None}
+
+    def is_in_cooldown(self, symbol: str, position_side: str) -> bool:
+        """检查是否处于冷静期"""
+        self.initialize_symbol(symbol)
+        cooldown_start = self.cooldown_start_time[symbol][position_side]
+        
+        if cooldown_start is None:
+            return False
+            
+        # 计算冷静期结束时间
+        cooldown_end = cooldown_start + timedelta(hours=COOLDOWN_HOURS)
+        
+        # 如果当前时间在冷静期内
+        if datetime.now() < cooldown_end:
+            remaining = cooldown_end - datetime.now()
+            logger.info(f"⏳ {symbol} {position_side.upper()} 处于冷静期，剩余时间: {remaining}")
+            return True
+            
+        # 冷静期已过，重置
+        self.cooldown_start_time[symbol][position_side] = None
+        return False
+
+    def start_cooldown(self, symbol: str, position_side: str):
+        """开始冷静期"""
+        self.initialize_symbol(symbol)
+        self.cooldown_start_time[symbol][position_side] = datetime.now()
+        logger.info(f"⏸️ {symbol} {position_side.upper()} 开始 {COOLDOWN_HOURS} 小时冷静期")
+        
+        # 发送Telegram通知
+        if self.telegram:
+            cooldown_end = datetime.now() + timedelta(hours=COOLDOWN_HOURS)
+            message = f"<b>⏸️ 冷静期开始</b>\n{symbol} {position_side.upper()}\n持续时间: {COOLDOWN_HOURS}小时\n结束时间: {cooldown_end.strftime('%Y-%m-%d %H:%M:%S')}"
+            self.telegram.send_message(message)
 
     def add_position(self, symbol: str, side: str, size: float, price: float, is_trend_catch: bool = False):
         """添加仓位到对应方向"""
@@ -429,6 +506,10 @@ class DualMartingaleManager:
             'layer': layer,
             'is_trend_catch': is_trend_catch
         })
+        
+        # 检查是否需要启动冷静期
+        if layer >= COOLDOWN_AFTER_LAYERS and not self.is_in_cooldown(symbol, position_side):
+            self.start_cooldown(symbol, position_side)
         
         if is_trend_catch:
             self.last_trend_catch_time[symbol][position_side] = datetime.now()
@@ -472,7 +553,9 @@ class DualMartingaleManager:
         if self.trend_catch_count[symbol][position_side] >= TREND_CATCH_LAYERS:
             return False, 0
             
-        # 已删除趋势加仓冷却期检查
+        # 检查是否处于冷静期
+        if self.is_in_cooldown(symbol, position_side):
+            return False, 0
         
         # 获取当前仓位层数
         current_layers = len(self.positions[symbol][position_side])
@@ -493,7 +576,9 @@ class DualMartingaleManager:
             logger.info(f"⚠️ {symbol} {position_side.upper()} 已达到最大层数 {MAX_LAYERS}")
             return False
             
-        # 已删除加仓时间间隔检查
+        # 检查是否处于冷静期
+        if self.is_in_cooldown(symbol, position_side):
+            return False
         
         positions = self.positions[symbol][position_side]
         if not positions:
@@ -664,7 +749,9 @@ class DualMartingaleManager:
         self.initialize_symbol(symbol)
         self.positions[symbol][position_side] = []
         self.trend_catch_count[symbol][position_side] = 0
-        logger.info(f"🔄 {symbol} {position_side.upper()} 仓位记录已清空")
+        # 重置冷静期
+        self.cooldown_start_time[symbol][position_side] = None
+        logger.info(f"🔄 {symbol} {position_side.upper()} 仓位记录已清空，冷静期重置")
         # 保存仓位状态
         self.save_positions()
         
@@ -705,6 +792,11 @@ class DualMartingaleManager:
                     sym: {side: time.isoformat() if time else None 
                          for side, time in sides.items()}
                     for sym, sides in self.last_layer_time.items()
+                },
+                'cooldown_start_time': {
+                    sym: {side: time.isoformat() if time else None 
+                         for side, time in sides.items()}
+                    for sym, sides in self.cooldown_start_time.items()
                 },
                 'saved_at': datetime.now().isoformat()
             }
@@ -752,6 +844,13 @@ class DualMartingaleManager:
                     self.last_layer_time[sym] = {}
                     for side, time_str in sides.items():
                         self.last_layer_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
+                
+                # 加载冷静期时间
+                self.cooldown_start_time = {}
+                for sym, sides in data.get('cooldown_start_time', {}).items():
+                    self.cooldown_start_time[sym] = {}
+                    for side, time_str in sides.items():
+                        self.cooldown_start_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
                 
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
