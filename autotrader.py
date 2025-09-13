@@ -70,7 +70,7 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 # 币安最小名义价值要求（USDT）
 MIN_NOTIONAL = {
     "LTC/USDT": 20,
-    "XRP/USDT": 5,
+    "XRP/USDT": 8,
     "ADA/USDT": 8,
     "DOGE/USDT": 20,
     "LINK/USDT": 20,
