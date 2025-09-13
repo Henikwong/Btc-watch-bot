@@ -1,39 +1,3 @@
-import os
-import sys
-import time
-import ccxt
-import pandas as pd
-import numpy as np
-import ta
-import logging
-import asyncio
-import signal
-import json
-import math
-import requests
-from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Any
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
-
-# ================== 配置参数 ==================
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
-TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
-LEVERAGE = int(os.getenv("LEVERAGE", "15"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
-
-# 从环境变量读取加仓比例
-position_sizes_str = os.getenv("POSITION_SIZES", "2.678%,5%,6%,7%,8%,9%,10%,13%,14%")
-POSITION_SIZES = [float(size.strip().replace('%', '')) / 100 for size in position_sizes_str.split(',')]
-
-# 从环境变量读取止盈比例
 TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").replace('%', '')) / 100
 
 # 从环境变量读取止损设置
