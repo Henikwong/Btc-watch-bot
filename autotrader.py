@@ -53,11 +53,11 @@ TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
 # 已删除趋势加仓冷却时间
 
 # 冷静期配置
-COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
+COOLDOWN_AFTER_LAYERS = 3  # 加仓到第几层后触发冷静期
 COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -70,7 +70,7 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 # 币安最小名义价值要求（USDT）
 MIN_NOTIONAL = {
     "LTC/USDT": 20,
-    "XRP/USDT": 8,
+    "XRP/USDT": 5,
     "ADA/USDT": 8,
     "DOGE/USDT": 20,
     "LINK/USDT": 20,
@@ -257,7 +257,7 @@ class BinanceFutureAPI:
             logger.info("交易所初始化成功")
             return True
         except Exception as e:
-            logger.error(f"交易所初始化失败: {e")
+            logger.error(f"交易所初始化失败: {e}")
             return False
 
     def get_balance(self) -> float:
