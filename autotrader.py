@@ -1,5 +1,4 @@
-n(self, signum, frame):
-        logger.info("收到关闭信号，停止交易...")
+...")
         self.running = False
         self.martingale.save_positions()
         
