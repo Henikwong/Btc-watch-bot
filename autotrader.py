@@ -53,11 +53,11 @@ TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
 # 已删除趋势加仓冷却时间
 
 # 冷静期配置
-COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
+COOLDOWN_AFTER_LAYERS = 3  # 加仓到第几层后触发冷静期
 COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -70,7 +70,7 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 # 币安最小名义价值要求（USDT）
 MIN_NOTIONAL = {
     "LTC/USDT": 20,
-    "XRP/USDT": 8,
+    "XRP/USDT": 5,
     "ADA/USDT": 8,
     "DOGE/USDT": 20,
     "LINK/USDT": 20,
@@ -1017,23 +1017,30 @@ class CoinTech2uBot:
                 logger.error(f"{symbol} 仓位大小计算错误，跳过开仓")
                 return
             
-            # 开多仓
-            logger.info(f"📈 {symbol} 开多仓，大小: {position_size:.6f}")
-            success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
-            if success:
-                self.martingale.add_position(symbol, "buy", position_size, current_price)
-                logger.info(f"✅ {symbol} 多仓开仓成功")
-            else:
-                logger.error(f"❌ {symbol} 多仓开仓失败")
+            # 检查是否已经有仓位
+            exchange_positions = self.api.get_positions(symbol)
+            has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+            has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
             
-            # 开空仓
-            logger.info(f"📉 {symbol} 开空仓，大小: {position_size:.6f}")
-            success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
-            if success:
-                self.martingale.add_position(symbol, "sell", position_size, current_price)
-                logger.info(f"✅ {symbol} 空仓开仓成功")
-            else:
-                logger.error(f"❌ {symbol} 空仓开仓失败")
+            # 开多仓（如果没有多仓）
+            if not has_long:
+                logger.info(f"📈 {symbol} 开多仓，大小: {position_size:.6f}")
+                success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
+                if success:
+                    self.martingale.add_position(symbol, "buy", position_size, current_price)
+                    logger.info(f"✅ {symbol} 多仓开仓成功")
+                else:
+                    logger.error(f"❌ {symbol} 多仓开仓失败")
+            
+            # 开空仓（如果没有空仓）
+            if not has_short:
+                logger.info(f"📉 {symbol} 开空仓，大小: {position_size:.6f}")
+                success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
+                if success:
+                    self.martingale.add_position(symbol, "sell", position_size, current_price)
+                    logger.info(f"✅ {symbol} 空仓开仓成功")
+                else:
+                    logger.error(f"❌ {symbol} 空仓开仓失败")
                 
         except Exception as e:
             logger.error(f"立即开对冲仓位错误 {symbol}: {e}")
@@ -1077,26 +1084,42 @@ class CoinTech2uBot:
                 # 获取多仓总大小
                 long_size = self.martingale.get_position_size(symbol, 'long')
                 if long_size > 0:
-                    # 平多仓
-                    success = self.api.execute_market_order(symbol, "sell", long_size, "LONG")
-                    if success:
-                        self.martingale.clear_positions(symbol, 'long')
-                        logger.info(f"✅ {symbol} 多仓止盈平仓成功")
+                    # 检查交易所是否真的有这个仓位
+                    exchange_positions = self.api.get_positions(symbol)
+                    has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+                    
+                    if has_long:
+                        # 平多仓
+                        success = self.api.execute_market_order(symbol, "sell", long_size, "LONG")
+                        if success:
+                            self.martingale.clear_positions(symbol, 'long')
+                            logger.info(f"✅ {symbol} 多仓止盈平仓成功")
+                        else:
+                            logger.error(f"❌ {symbol} 多仓止盈平仓失败")
                     else:
-                        logger.error(f"❌ {symbol} 多仓止盈平仓失败")
+                        logger.warning(f"⚠️ {symbol} 本地记录有多仓，但交易所没有，清空本地记录")
+                        self.martingale.clear_positions(symbol, 'long')
             
             # 检查空仓止盈
             if self.martingale.should_close_position(symbol, 'short', current_price):
                 # 获取空仓总大小
                 short_size = self.martingale.get_position_size(symbol, 'short')
                 if short_size > 0:
-                    # 平空仓
-                    success = self.api.execute_market_order(symbol, "buy", short_size, "SHORT")
-                    if success:
-                        self.martingale.clear_positions(symbol, 'short')
-                        logger.info(f"✅ {symbol} 空仓止盈平仓成功")
+                    # 检查交易所是否真的有这个仓位
+                    exchange_positions = self.api.get_positions(symbol)
+                    has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+                    
+                    if has_short:
+                        # 平空仓
+                        success = self.api.execute_market_order(symbol, "buy", short_size, "SHORT")
+                        if success:
+                            self.martingale.clear_positions(symbol, 'short')
+                            logger.info(f"✅ {symbol} 空仓止盈平仓成功")
+                        else:
+                            logger.error(f"❌ {symbol} 空仓止盈平仓失败")
                     else:
-                        logger.error(f"❌ {symbol} 空仓止盈平仓失败")
+                        logger.warning(f"⚠️ {symbol} 本地记录有空仓，但交易所没有，清空本地记录")
+                        self.martingale.clear_positions(symbol, 'short')
                         
         except Exception as e:
             logger.error(f"检查并关闭盈利仓位错误 {symbol}: {e}")
@@ -1123,26 +1146,42 @@ class CoinTech2uBot:
                 # 计算加仓大小
                 layer_size = self.martingale.calculate_layer_size(symbol, 'long', current_price)
                 if layer_size > 0:
-                    # 执行加仓
-                    success = self.api.execute_market_order(symbol, "buy", layer_size, "LONG")
-                    if success:
-                        self.martingale.add_position(symbol, "buy", layer_size, current_price)
-                        logger.info(f"✅ {symbol} 多仓加仓成功")
+                    # 检查交易所是否真的有这个仓位
+                    exchange_positions = self.api.get_positions(symbol)
+                    has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+                    
+                    if has_long:
+                        # 执行加仓
+                        success = self.api.execute_market_order(symbol, "buy", layer_size, "LONG")
+                        if success:
+                            self.martingale.add_position(symbol, "buy", layer_size, current_price)
+                            logger.info(f"✅ {symbol} 多仓加仓成功")
+                        else:
+                            logger.error(f"❌ {symbol} 多仓加仓失败")
                     else:
-                        logger.error(f"❌ {symbol} 多仓加仓失败")
+                        logger.warning(f"⚠️ {symbol} 想加多仓，但交易所没有多仓，先补基础仓位")
+                        self.martingale.check_and_fill_base_position(self.api, symbol)
             
             # 检查空仓加仓
             if self.martingale.should_add_layer(symbol, 'short', current_price):
                 # 计算加仓大小
                 layer_size = self.martingale.calculate_layer_size(symbol, 'short', current_price)
                 if layer_size > 0:
-                    # 执行加仓
-                    success = self.api.execute_market_order(symbol, "sell", layer_size, "SHORT")
-                    if success:
-                        self.martingale.add_position(symbol, "sell", layer_size, current_price)
-                        logger.info(f"✅ {symbol} 空仓加仓成功")
+                    # 检查交易所是否真的有这个仓位
+                    exchange_positions = self.api.get_positions(symbol)
+                    has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+                    
+                    if has_short:
+                        # 执行加仓
+                        success = self.api.execute_market_order(symbol, "sell", layer_size, "SHORT")
+                        if success:
+                            self.martingale.add_position(symbol, "sell", layer_size, current_price)
+                            logger.info(f"✅ {symbol} 空仓加仓成功")
+                        else:
+                            logger.error(f"❌ {symbol} 空仓加仓失败")
                     else:
-                        logger.error(f"❌ {symbol} 空仓加仓失败")
+                        logger.warning(f"⚠️ {symbol} 想加空仓，但交易所没有空仓，先补基础仓位")
+                        self.martingale.check_and_fill_base_position(self.api, symbol)
             
             # 检查趋势捕捉加仓
             if trend_direction == 'long' and trend_strength >= TREND_SIGNAL_STRENGTH:
@@ -1151,13 +1190,21 @@ class CoinTech2uBot:
                     # 计算趋势捕捉加仓大小
                     trend_size = self.martingale.calculate_layer_size(symbol, 'long', current_price, True)
                     if trend_size > 0:
-                        # 执行趋势捕捉加仓
-                        success = self.api.execute_market_order(symbol, "buy", trend_size, "LONG")
-                        if success:
-                            self.martingale.add_position(symbol, "buy", trend_size, current_price, True)
-                            logger.info(f"✅ {symbol} 多仓趋势捕捉加仓成功")
+                        # 检查交易所是否真的有这个仓位
+                        exchange_positions = self.api.get_positions(symbol)
+                        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+                        
+                        if has_long:
+                            # 执行趋势捕捉加仓
+                            success = self.api.execute_market_order(symbol, "buy", trend_size, "LONG")
+                            if success:
+                                self.martingale.add_position(symbol, "buy", trend_size, current_price, True)
+                                logger.info(f"✅ {symbol} 多仓趋势捕捉加仓成功")
+                            else:
+                                logger.error(f"❌ {symbol} 多仓趋势捕捉加仓失败")
                         else:
-                            logger.error(f"❌ {symbol} 多仓趋势捕捉加仓失败")
+                            logger.warning(f"⚠️ {symbol} 想趋势加多仓，但交易所没有多仓，先补基础仓位")
+                            self.martingale.check_and_fill_base_position(self.api, symbol)
             
             elif trend_direction == 'short' and trend_strength >= TREND_SIGNAL_STRENGTH:
                 should_add, layer = self.martingale.should_add_trend_catch_layer(symbol, 'short', trend_strength)
@@ -1165,13 +1212,21 @@ class CoinTech2uBot:
                     # 计算趋势捕捉加仓大小
                     trend_size = self.martingale.calculate_layer_size(symbol, 'short', current_price, True)
                     if trend_size > 0:
-                        # 执行趋势捕捉加仓
-                        success = self.api.execute_market_order(symbol, "sell", trend_size, "SHORT")
-                        if success:
-                            self.martingale.add_position(symbol, "sell", trend_size, current_price, True)
-                            logger.info(f"✅ {symbol} 空仓趋势捕捉加仓成功")
+                        # 检查交易所是否真的有这个仓位
+                        exchange_positions = self.api.get_positions(symbol)
+                        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+                        
+                        if has_short:
+                            # 执行趋势捕捉加仓
+                            success = self.api.execute_market_order(symbol, "sell", trend_size, "SHORT")
+                            if success:
+                                self.martingale.add_position(symbol, "sell", trend_size, current_price, True)
+                                logger.info(f"✅ {symbol} 空仓趋势捕捉加仓成功")
+                            else:
+                                logger.error(f"❌ {symbol} 空仓趋势捕捉加仓失败")
                         else:
-                            logger.error(f"❌ {symbol} 空仓趋势捕捉加仓失败")
+                            logger.warning(f"⚠️ {symbol} 想趋势加空仓，但交易所没有空仓，先补基础仓位")
+                            self.martingale.check_and_fill_base_position(self.api, symbol)
                             
         except Exception as e:
             logger.error(f"检查并添加加仓层错误 {symbol}: {e}")
