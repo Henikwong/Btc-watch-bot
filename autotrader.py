@@ -26,7 +26,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # 每分钟监控一次
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
 
 # 从环境变量读取加仓比例
@@ -50,10 +50,14 @@ MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
+# 已删除趋势加仓冷却时间
 
 # 冷静期配置
 COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
 COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
+
+# 新增: 止盈后重新开仓的冷静期 (秒)
+TP_COOLDOWN_SECONDS = int(os.getenv("TP_COOLDOWN_SECONDS", "60"))
 
 # 止损配置
 STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
@@ -438,6 +442,8 @@ class DualMartingaleManager:
         self.trend_catch_count: Dict[str, Dict[str, int]] = {}
         # 冷静期开始时间: {symbol: {'long': datetime, 'short': datetime}}
         self.cooldown_start_time: Dict[str, Dict[str, datetime]] = {}
+        # 止盈平仓时间: {symbol: {'long': datetime, 'short': datetime}} (新增)
+        self.last_tp_close_time: Dict[str, Dict[str, datetime]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
         # Telegram 通知器
@@ -457,6 +463,9 @@ class DualMartingaleManager:
             self.trend_catch_count[symbol] = {'long': 0, 'short': 0}
         if symbol not in self.cooldown_start_time:
             self.cooldown_start_time[symbol] = {'long': None, 'short': None}
+        # 新增: 初始化止盈平仓时间
+        if symbol not in self.last_tp_close_time:
+            self.last_tp_close_time[symbol] = {'long': None, 'short': None}
 
     def is_in_cooldown(self, symbol: str, position_side: str) -> bool:
         """检查是否处于冷静期"""
@@ -477,6 +486,28 @@ class DualMartingaleManager:
             
         # 冷静期已过，重置
         self.cooldown_start_time[symbol][position_side] = None
+        return False
+
+    # 新增: 检查是否在止盈后的重新开仓冷静期内
+    def is_in_tp_cooldown(self, symbol: str, position_side: str) -> bool:
+        """检查是否处于止盈后的重新开仓冷静期"""
+        self.initialize_symbol(symbol)
+        tp_close_time = self.last_tp_close_time[symbol][position_side]
+        
+        if tp_close_time is None:
+            return False
+            
+        # 计算冷静期结束时间
+        cooldown_end = tp_close_time + timedelta(seconds=TP_COOLDOWN_SECONDS)
+        
+        # 如果当前时间在冷静期内
+        if datetime.now() < cooldown_end:
+            remaining = cooldown_end - datetime.now()
+            logger.info(f"⏳ {symbol} {position_side.upper()} 处于止盈冷静期，剩余时间: {remaining}")
+            return True
+            
+        # 冷静期已过，重置
+        self.last_tp_close_time[symbol][position_side] = None
         return False
 
     def start_cooldown(self, symbol: str, position_side: str):
@@ -587,16 +618,16 @@ class DualMartingaleManager:
         total_value = sum(p['size'] * p['entry_price'] for p in positions)
         avg_price = total_value / total_size
         
-        # 计算当前盈亏百分比 (考虑杠杆)
+        # 计算当前盈亏百分比
         if position_side == 'long':
-            pnl_pct = (current_price - avg_price) / avg_price * LEVERAGE
+            pnl_pct = (current_price - avg_price) / avg_price
         else:  # short
-            pnl_pct = (avg_price - current_price) / avg_price * LEVERAGE
+            pnl_pct = (avg_price - current_price) / avg_price
             
         logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 当前盈亏: {pnl_pct*100:.2f}%")
         
         # 检查止损条件
-        unrealized_pnl = total_size * (current_price - avg_price) * LEVERAGE if position_side == 'long' else total_size * (avg_price - current_price) * LEVERAGE
+        unrealized_pnl = total_size * (current_price - avg_price) if position_side == 'long' else total_size * (avg_price - current_price)
         if unrealized_pnl <= STOP_LOSS:
             logger.warning(f"🚨 {symbol} {position_side.upper()} 达到止损条件: {unrealized_pnl:.2f} USDT <= {STOP_LOSS} USDT")
             return False
@@ -663,14 +694,12 @@ class DualMartingaleManager:
         total_value = sum(p['size'] * p['entry_price'] for p in positions)
         avg_price = total_value / total_size
         
-        # 计算当前盈亏百分比 (考虑杠杆)
+        # 计算当前盈亏百分比
         if position_side == 'long':
-            pnl_pct = (current_price - avg_price) / avg_price * LEVERAGE
+            pnl_pct = (current_price - avg_price) / avg_price
         else:  # short
-            pnl_pct = (avg_price - current_price) / avg_price * LEVERAGE
+            pnl_pct = (avg_price - current_price) / avg_price
             
-        logger.info(f"📊 {symbol} {position_side.upper()} 当前盈利: {pnl_pct*100:.2f}%, 止盈阈值: {TP_PERCENT*100:.2f}%")
-        
         # 如果盈利超过止盈点，止盈平仓
         if pnl_pct >= TP_PERCENT:
             current_layers = len(positions)
@@ -678,7 +707,7 @@ class DualMartingaleManager:
             
             # 发送 Telegram 通知
             if self.telegram:
-                profit_usdt = total_size * (current_price - avg_price) * LEVERAGE if position_side == 'long' else total_size * (avg_price - current_price) * LEVERAGE
+                profit_usdt = total_size * (current_price - avg_price) if position_side == 'long' else total_size * (avg_price - current_price)
                 telegram_msg = f"<b>🎯 止盈触发</b>\n{symbol} {position_side.upper()} 第{current_layers}层\n盈利: {pnl_pct*100:.2f}%\n收益: ${profit_usdt:.2f}\n平均成本: ${avg_price:.2f}\n当前价格: ${current_price:.2f}"
                 self.telegram.send_message(telegram_msg)
                 
@@ -698,11 +727,11 @@ class DualMartingaleManager:
         total_value = sum(p['size'] * p['entry_price'] for p in positions)
         avg_price = total_value / total_size
         
-        # 计算当前盈亏 (考虑杠杆)
+        # 计算当前盈亏
         if position_side == 'long':
-            unrealized_pnl = total_size * (current_price - avg_price) * LEVERAGE
+            unrealized_pnl = total_size * (current_price - avg_price)
         else:  # short
-            unrealized_pnl = total_size * (avg_price - current_price) * LEVERAGE
+            unrealized_pnl = total_size * (avg_price - current_price)
         
         # 检查是否达到止损条件
         if unrealized_pnl <= STOP_LOSS:  # STOP_LOSS是负值，所以用<=
@@ -799,6 +828,12 @@ class DualMartingaleManager:
                          for side, time in sides.items()}
                     for sym, sides in self.cooldown_start_time.items()
                 },
+                # 新增: 保存止盈平仓时间
+                'last_tp_close_time': {
+                    sym: {side: time.isoformat() if time else None 
+                         for side, time in sides.items()}
+                    for sym, sides in self.last_tp_close_time.items()
+                },
                 'saved_at': datetime.now().isoformat()
             }
             
@@ -853,6 +888,13 @@ class DualMartingaleManager:
                     for side, time_str in sides.items():
                         self.cooldown_start_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
                 
+                # 新增: 加载止盈平仓时间
+                self.last_tp_close_time = {}
+                for sym, sides in data.get('last_tp_close_time', {}).items():
+                    self.last_tp_close_time[sym] = {}
+                    for side, time_str in sides.items():
+                        self.last_tp_close_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
+                
                 logger.info("仓位状态已从文件加载")
         except Exception as e:
             logger.error(f"加载仓位状态失败: {e}")
@@ -885,6 +927,14 @@ class DualMartingaleManager:
             
             # 检查是否需要补仓
             if not has_long or not has_short:
+                # 新增: 检查是否在止盈冷静期内
+                if not has_long and self.is_in_tp_cooldown(symbol, 'long'):
+                    logger.info(f"⏳ {symbol} 多仓处于止盈冷静期，跳过补仓")
+                    return
+                if not has_short and self.is_in_tp_cooldown(symbol, 'short'):
+                    logger.info(f"⏳ {symbol} 空仓处于止盈冷静期，跳过补仓")
+                    return
+                
                 logger.info(f"🔄 {symbol} 检测到仓位不完整，准备补仓")
                 
                 # 获取当前价格
@@ -935,6 +985,14 @@ class DualMartingaleManager:
         
         return f"{symbol}: 多仓{long_layers}层({long_size:.6f}) | 空仓{short_layers}层({short_size:.6f})"
 
+    # 新增: 记录止盈平仓时间
+    def record_tp_close_time(self, symbol: str, position_side: str):
+        """记录止盈平仓时间"""
+        self.initialize_symbol(symbol)
+        self.last_tp_close_time[symbol][position_side] = datetime.now()
+        logger.info(f"⏱️ {symbol} {position_side.upper()} 记录止盈平仓时间")
+        self.save_positions()
+
 # ================== 主交易机器人 ==================
 class CoinTech2uBot:
     def __init__(self, symbols: List[str]):
@@ -970,7 +1028,7 @@ class CoinTech2uBot:
         
         # 发送启动通知
         if self.telegram:
-            self.telegram.send_message(f"<b>🚀 CoinTech2u交易机器人已启动</b>\n交易对: {', '.join(self.symbols)}\n杠杆: {LEVERAGE}x\n基础仓位: ${BASE_TRADE_SIZE}")
+            self.telegram.send_message(f"<b>🚀 CoinTech2u交易机器人已启动</b>\n交易对: {', '.join(self.symbols)}\n杠杆: {LEVERAGE}x\n基础仓位: ${BASE_TRADE_SIZE}\n止盈冷静期: {TP_COOLDOWN_SECONDS}秒")
         
         # 程序启动时立即对所有币对开双仓
         logger.info("🔄 程序启动时对所有币对开双仓")
@@ -991,8 +1049,6 @@ class CoinTech2uBot:
                     # 处理交易逻辑
                     self.process_symbol(symbol)
                     
-                # 每分钟监控一次
-                logger.info(f"⏰ 等待 {POLL_INTERVAL} 秒后进行下一次监控...")
                 time.sleep(POLL_INTERVAL)
             except Exception as e:
                 logger.error(f"交易循环错误: {e}")
@@ -1112,7 +1168,7 @@ class CoinTech2uBot:
                 self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 趋势捕捉加仓失败</b>")
 
     def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
-        """平掉盈利的仓位（止盈）"""
+        """平掉盈利的仓位"""
         position_size = self.martingale.get_position_size(symbol, position_side)
         if position_size <= 0:
             return
@@ -1132,9 +1188,13 @@ class CoinTech2uBot:
         
         success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
         if success:
+            # 新增: 记录止盈平仓时间
+            self.martingale.record_tp_close_time(symbol, position_side)
             self.martingale.clear_positions(symbol, position_side)
             logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
-            # 止盈后不再重新开仓
+            
+            # 不再立即重新开仓，而是等待冷静期过后由check_and_fill_base_position处理
+            logger.info(f"⏳ {symbol} {position_side.upper()} 等待{TP_COOLDOWN_SECONDS}秒冷静期后再重新开仓")
         else:
             # 发送错误通知
             if self.telegram:
