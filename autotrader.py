@@ -848,7 +848,7 @@ class DualMartingaleManager:
                 
                 # 加载冷静期时间
                 self.cooldown_start_time = {}
-                for sym, sides in data.get('cooldown_start_time", {}).items():
+                for sym, sides in data.get('cooldown_start_time', {}).items():
                     self.cooldown_start_time[sym] = {}
                     for side, time_str in sides.items():
                         self.cooldown_start_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
