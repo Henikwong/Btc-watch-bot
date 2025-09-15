@@ -26,7 +26,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # 每分钟监控一次
 BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
 
 # 从环境变量读取加仓比例
@@ -50,14 +50,13 @@ MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
-# 已删除趋势加仓冷却时间
 
 # 冷静期配置
-COOLDOWN_AFTER_LAYERS = 3  # 加仓到第几层后触发冷静期
+COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
 COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -70,7 +69,7 @@ RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 # 币安最小名义价值要求（USDT）
 MIN_NOTIONAL = {
     "LTC/USDT": 20,
-    "XRP/USDT": 5,
+    "XRP/USDT": 8,
     "ADA/USDT": 8,
     "DOGE/USDT": 20,
     "LINK/USDT": 20,
@@ -666,10 +665,8 @@ class DualMartingaleManager:
         
         # 计算当前盈亏百分比 (考虑杠杆)
         if position_side == 'long':
-            # 多头: (当前价格 - 平均成本) / 平均成本 * 杠杆
             pnl_pct = (current_price - avg_price) / avg_price * LEVERAGE
         else:  # short
-            # 空头: (平均成本 - 当前价格) / 平均成本 * 杠杆
             pnl_pct = (avg_price - current_price) / avg_price * LEVERAGE
             
         logger.info(f"📊 {symbol} {position_side.upper()} 当前盈利: {pnl_pct*100:.2f}%, 止盈阈值: {TP_PERCENT*100:.2f}%")
@@ -851,7 +848,7 @@ class DualMartingaleManager:
                 
                 # 加载冷静期时间
                 self.cooldown_start_time = {}
-                for sym, sides in data.get('cooldown_start_time', {}).items():
+                for sym, sides in data.get('cooldown_start_time", {}).items():
                     self.cooldown_start_time[sym] = {}
                     for side, time_str in sides.items():
                         self.cooldown_start_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
@@ -994,251 +991,175 @@ class CoinTech2uBot:
                     # 处理交易逻辑
                     self.process_symbol(symbol)
                     
+                # 每分钟监控一次
+                logger.info(f"⏰ 等待 {POLL_INTERVAL} 秒后进行下一次监控...")
                 time.sleep(POLL_INTERVAL)
             except Exception as e:
                 logger.error(f"交易循环错误: {e}")
                 # 发送错误通知
                 if self.telegram:
-                    self.telegram.send_message(f"<b>❌ 交易循环错误</b>\n错误: {str(e)}")
-                time.sleep(60)  # 出错后等待60秒再继续
+                    self.telegram.send_message(f"<b>❌ 交易循环错误</b>\n{str(e)}")
+                time.sleep(10)
+
+    def print_position_summary(self):
+        """打印所有币种的仓位摘要"""
+        logger.info("📋 仓位摘要:")
+        for symbol in self.symbols:
+            summary = self.martingale.get_position_summary(symbol)
+            logger.info(f"   {summary}")
 
     def open_immediate_hedge(self, symbol: str):
-        """立即开对冲仓位"""
-        try:
-            # 获取当前价格
-            current_price = self.api.get_current_price(symbol)
-            if current_price is None:
-                logger.error(f"无法获取 {symbol} 的价格，跳过开仓")
-                return
-                
-            # 计算初始仓位大小
-            position_size = self.martingale.calculate_initial_size(current_price)
-            if position_size <= 0:
-                logger.error(f"{symbol} 仓位大小计算错误，跳过开仓")
-                return
-            
-            # 检查是否已经有仓位
-            exchange_positions = self.api.get_positions(symbol)
-            has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-            has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
-            
-            # 开多仓（如果没有多仓）
-            if not has_long:
-                logger.info(f"📈 {symbol} 开多仓，大小: {position_size:.6f}")
-                success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
-                if success:
-                    self.martingale.add_position(symbol, "buy", position_size, current_price)
-                    logger.info(f"✅ {symbol} 多仓开仓成功")
-                else:
-                    logger.error(f"❌ {symbol} 多仓开仓失败")
-            
-            # 开空仓（如果没有空仓）
-            if not has_short:
-                logger.info(f"📉 {symbol} 开空仓，大小: {position_size:.6f}")
-                success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
-                if success:
-                    self.martingale.add_position(symbol, "sell", position_size, current_price)
-                    logger.info(f"✅ {symbol} 空仓开仓成功")
-                else:
-                    logger.error(f"❌ {symbol} 空仓开仓失败")
-                
-        except Exception as e:
-            logger.error(f"立即开对冲仓位错误 {symbol}: {e}")
+        """程序启动时立即开双仓"""
+        # 检查交易所是否已有仓位
+        exchange_positions = self.api.get_positions(symbol)
+        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
+        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+        
+        if has_long or has_short:
+            logger.info(f"⏩ {symbol} 交易所已有仓位，跳过开仓")
+            # 同步本地记录
+            if has_long:
+                self.martingale.add_position(symbol, "buy", exchange_positions['long']['size'], exchange_positions['long']['entry_price'])
+            if has_short:
+                self.martingale.add_position(symbol, "sell", exchange_positions['short']['size'], exchange_positions['short']['entry_price'])
+            return
+        
+        # 获取当前价格
+        current_price = self.api.get_current_price(symbol)
+        if current_price is None:
+            logger.error(f"无法获取 {symbol} 的价格，跳过")
+            return
+        
+        # 计算初始仓位大小
+        position_size = self.martingale.calculate_initial_size(current_price)
+        if position_size <= 0:
+            logger.error(f"{symbol} 仓位大小计算错误，跳过")
+            return
+        
+        logger.info(f"📊 {symbol} 准备开双仓，价格: {current_price:.2f}, 大小: {position_size:.6f}")
+        
+        # 同时开多仓和空仓
+        long_success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
+        short_success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
+        
+        if long_success and short_success:
+            logger.info(f"✅ {symbol} 已同时开多空仓位: 多单 {position_size:.6f} | 空单 {position_size:.6f}")
+            # 记录仓位
+            self.martingale.add_position(symbol, "buy", position_size, current_price)
+            self.martingale.add_position(symbol, "sell", position_size, current_price)
+        else:
+            logger.error(f"❌ {symbol} 开仓失败，需要手动检查")
+            # 发送错误通知
+            if self.telegram:
+                self.telegram.send_message(f"<b>❌ {symbol} 开仓失败</b>\n需要手动检查")
 
     def process_symbol(self, symbol: str):
         """处理单个交易对的交易逻辑"""
-        try:
-            # 获取当前价格
-            current_price = self.api.get_current_price(symbol)
-            if current_price is None:
-                logger.error(f"无法获取 {symbol} 的价格，跳过处理")
-                return
-                
-            # 获取K线数据
-            df = self.api.get_ohlcv_data(symbol, TIMEFRAME)
-            if df is None or len(df) < 50:  # 确保有足够的数据
-                logger.error(f"无法获取足够的K线数据 {symbol}，跳过处理")
-                return
-                
+        # 获取当前价格
+        current_price = self.api.get_current_price(symbol)
+        if current_price is None:
+            return
+        
+        # 检查止损
+        for position_side in ['long', 'short']:
+            self.martingale.check_stop_loss(symbol, position_side, current_price, self.api)
+        
+        # 获取K线数据用于趋势分析
+        df = self.api.get_ohlcv_data(symbol, TIMEFRAME, 100)
+        if df is not None:
             # 分析趋势
             trend_strength, trend_direction = analyze_trend(df)
-            logger.info(f"📈 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
-            
-            # 检查并处理止盈
-            self.check_and_close_profitable_positions(symbol, current_price)
-            
-            # 检查并处理止损
-            self.check_and_close_loss_positions(symbol, current_price)
-            
-            # 检查并处理加仓
-            self.check_and_add_layers(symbol, current_price, trend_strength, trend_direction)
-            
-        except Exception as e:
-            logger.error(f"处理交易对 {symbol} 时出错: {e}")
-
-    def check_and_close_profitable_positions(self, symbol: str, current_price: float):
-        """检查并关闭盈利的仓位（止盈）"""
-        try:
-            # 检查多仓止盈
-            if self.martingale.should_close_position(symbol, 'long', current_price):
-                # 获取多仓总大小
-                long_size = self.martingale.get_position_size(symbol, 'long')
-                if long_size > 0:
-                    # 检查交易所是否真的有这个仓位
-                    exchange_positions = self.api.get_positions(symbol)
-                    has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-                    
-                    if has_long:
-                        # 平多仓
-                        success = self.api.execute_market_order(symbol, "sell", long_size, "LONG")
-                        if success:
-                            self.martingale.clear_positions(symbol, 'long')
-                            logger.info(f"✅ {symbol} 多仓止盈平仓成功")
-                        else:
-                            logger.error(f"❌ {symbol} 多仓止盈平仓失败")
-                    else:
-                        logger.warning(f"⚠️ {symbol} 本地记录有多仓，但交易所没有，清空本地记录")
-                        self.martingale.clear_positions(symbol, 'long')
-            
-            # 检查空仓止盈
-            if self.martingale.should_close_position(symbol, 'short', current_price):
-                # 获取空仓总大小
-                short_size = self.martingale.get_position_size(symbol, 'short')
-                if short_size > 0:
-                    # 检查交易所是否真的有这个仓位
-                    exchange_positions = self.api.get_positions(symbol)
-                    has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
-                    
-                    if has_short:
-                        # 平空仓
-                        success = self.api.execute_market_order(symbol, "buy", short_size, "SHORT")
-                        if success:
-                            self.martingale.clear_positions(symbol, 'short')
-                            logger.info(f"✅ {symbol} 空仓止盈平仓成功")
-                        else:
-                            logger.error(f"❌ {symbol} 空仓止盈平仓失败")
-                    else:
-                        logger.warning(f"⚠️ {symbol} 本地记录有空仓，但交易所没有，清空本地记录")
-                        self.martingale.clear_positions(symbol, 'short')
-                        
-        except Exception as e:
-            logger.error(f"检查并关闭盈利仓位错误 {symbol}: {e}")
-
-    def check_and_close_loss_positions(self, symbol: str, current_price: float):
-        """检查并关闭亏损的仓位（止损）"""
-        try:
-            # 检查多仓止损
-            if self.martingale.check_stop_loss(symbol, 'long', current_price, self.api):
-                logger.info(f"✅ {symbol} 多仓已止损")
-                
-            # 检查空仓止损
-            if self.martingale.check_stop_loss(symbol, 'short', current_price, self.api):
-                logger.info(f"✅ {symbol} 空仓已止损")
-                
-        except Exception as e:
-            logger.error(f"检查并关闭亏损仓位错误 {symbol}: {e}")
-
-    def check_and_add_layers(self, symbol: str, current_price: float, trend_strength: float, trend_direction: str):
-        """检查并添加加仓层"""
-        try:
-            # 检查多仓加仓
-            if self.martingale.should_add_layer(symbol, 'long', current_price):
-                # 计算加仓大小
-                layer_size = self.martingale.calculate_layer_size(symbol, 'long', current_price)
-                if layer_size > 0:
-                    # 检查交易所是否真的有这个仓位
-                    exchange_positions = self.api.get_positions(symbol)
-                    has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-                    
-                    if has_long:
-                        # 执行加仓
-                        success = self.api.execute_market_order(symbol, "buy", layer_size, "LONG")
-                        if success:
-                            self.martingale.add_position(symbol, "buy", layer_size, current_price)
-                            logger.info(f"✅ {symbol} 多仓加仓成功")
-                        else:
-                            logger.error(f"❌ {symbol} 多仓加仓失败")
-                    else:
-                        logger.warning(f"⚠️ {symbol} 想加多仓，但交易所没有多仓，先补基础仓位")
-                        self.martingale.check_and_fill_base_position(self.api, symbol)
-            
-            # 检查空仓加仓
-            if self.martingale.should_add_layer(symbol, 'short', current_price):
-                # 计算加仓大小
-                layer_size = self.martingale.calculate_layer_size(symbol, 'short', current_price)
-                if layer_size > 0:
-                    # 检查交易所是否真的有这个仓位
-                    exchange_positions = self.api.get_positions(symbol)
-                    has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
-                    
-                    if has_short:
-                        # 执行加仓
-                        success = self.api.execute_market_order(symbol, "sell", layer_size, "SHORT")
-                        if success:
-                            self.martingale.add_position(symbol, "sell", layer_size, current_price)
-                            logger.info(f"✅ {symbol} 空仓加仓成功")
-                        else:
-                            logger.error(f"❌ {symbol} 空仓加仓失败")
-                    else:
-                        logger.warning(f"⚠️ {symbol} 想加空仓，但交易所没有空仓，先补基础仓位")
-                        self.martingale.check_and_fill_base_position(self.api, symbol)
+            logger.info(f"📊 {symbol} 趋势分析: 方向={trend_direction}, 强度={trend_strength:.2f}")
             
             # 检查趋势捕捉加仓
-            if trend_direction == 'long' and trend_strength >= TREND_SIGNAL_STRENGTH:
-                should_add, layer = self.martingale.should_add_trend_catch_layer(symbol, 'long', trend_strength)
-                if should_add:
-                    # 计算趋势捕捉加仓大小
-                    trend_size = self.martingale.calculate_layer_size(symbol, 'long', current_price, True)
-                    if trend_size > 0:
-                        # 检查交易所是否真的有这个仓位
-                        exchange_positions = self.api.get_positions(symbol)
-                        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-                        
-                        if has_long:
-                            # 执行趋势捕捉加仓
-                            success = self.api.execute_market_order(symbol, "buy", trend_size, "LONG")
-                            if success:
-                                self.martingale.add_position(symbol, "buy", trend_size, current_price, True)
-                                logger.info(f"✅ {symbol} 多仓趋势捕捉加仓成功")
-                            else:
-                                logger.error(f"❌ {symbol} 多仓趋势捕捉加仓失败")
-                        else:
-                            logger.warning(f"⚠️ {symbol} 想趋势加多仓，但交易所没有多仓，先补基础仓位")
-                            self.martingale.check_and_fill_base_position(self.api, symbol)
-            
-            elif trend_direction == 'short' and trend_strength >= TREND_SIGNAL_STRENGTH:
-                should_add, layer = self.martingale.should_add_trend_catch_layer(symbol, 'short', trend_strength)
-                if should_add:
-                    # 计算趋势捕捉加仓大小
-                    trend_size = self.martingale.calculate_layer_size(symbol, 'short', current_price, True)
-                    if trend_size > 0:
-                        # 检查交易所是否真的有这个仓位
-                        exchange_positions = self.api.get_positions(symbol)
-                        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
-                        
-                        if has_short:
-                            # 执行趋势捕捉加仓
-                            success = self.api.execute_market_order(symbol, "sell", trend_size, "SHORT")
-                            if success:
-                                self.martingale.add_position(symbol, "sell", trend_size, current_price, True)
-                                logger.info(f"✅ {symbol} 空仓趋势捕捉加仓成功")
-                            else:
-                                logger.error(f"❌ {symbol} 空仓趋势捕捉加仓失败")
-                        else:
-                            logger.warning(f"⚠️ {symbol} 想趋势加空仓，但交易所没有空仓，先补基础仓位")
-                            self.martingale.check_and_fill_base_position(self.api, symbol)
-                            
-        except Exception as e:
-            logger.error(f"检查并添加加仓层错误 {symbol}: {e}")
-
-    def print_position_summary(self):
-        """打印所有交易对的仓位摘要"""
-        summary_lines = []
-        for symbol in self.symbols:
-            summary = self.martingale.get_position_summary(symbol)
-            summary_lines.append(summary)
+            if ENABLE_TREND_CATCH:
+                for position_side in ['long', 'short']:
+                    if trend_direction == position_side and trend_strength >= TREND_SIGNAL_STRENGTH:
+                        should_add, next_layer = self.martingale.should_add_trend_catch_layer(symbol, position_side, trend_strength)
+                        if should_add:
+                            self.add_trend_catch_layer(symbol, position_side, current_price)
         
-        logger.info("📊 仓位摘要:\n" + "\n".join(summary_lines))
+        # 检查是否需要止盈
+        for position_side in ['long', 'short']:
+            if self.martingale.should_close_position(symbol, position_side, current_price):
+                self.close_profitable_position(symbol, position_side, current_price)
+        
+        # 检查是否需要加仓
+        if ENABLE_MARTINGALE:
+            for position_side in ['long', 'short']:
+                if self.martingale.should_add_layer(symbol, position_side, current_price):
+                    self.add_martingale_layer(symbol, position_side, current_price)
+
+    def add_trend_catch_layer(self, symbol: str, position_side: str, current_price: float):
+        """为指定方向添加趋势捕捉加仓"""
+        positions = self.martingale.positions[symbol][position_side]
+        if not positions:
+            return
+            
+        side = "buy" if position_side == "long" else "sell"
+        position_side_param = "LONG" if position_side == "long" else "SHORT"
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, True)
+        
+        current_layers = len(positions)
+        logger.info(f"🎯 {symbol} {position_side.upper()} 第{current_layers}层仓位 趋势捕捉加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
+        
+        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
+        if success:
+            self.martingale.add_position(symbol, side, layer_size, current_price, True)
+        else:
+            # 发送错误通知
+            if self.telegram:
+                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 趋势捕捉加仓失败</b>")
+
+    def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
+        """平掉盈利的仓位（止盈）"""
+        position_size = self.martingale.get_position_size(symbol, position_side)
+        if position_size <= 0:
+            return
+            
+        # 获取当前层数
+        current_layers = self.martingale.get_position_layers(symbol, position_side)
+            
+        # 平仓方向与开仓方向相反
+        if position_side == "long":
+            close_side = "sell"
+            position_side_param = "LONG"
+        else:  # short
+            close_side = "buy"
+            position_side_param = "SHORT"
+        
+        logger.info(f"📤 {symbol} {position_side.upper()} 第{current_layers}层仓位 止盈平仓，方向: {close_side}, 大小: {position_size:.6f}")
+        
+        success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
+        if success:
+            self.martingale.clear_positions(symbol, position_side)
+            logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
+            # 止盈后不再重新开仓
+        else:
+            # 发送错误通知
+            if self.telegram:
+                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 止盈平仓失败</b>")
+
+    def add_martingale_layer(self, symbol: str, position_side: str, current_price: float):
+        """为指定方向加仓"""
+        positions = self.martingale.positions[symbol][position_side]
+        if not positions:
+            return
+            
+        side = "buy" if position_side == "long" else "sell"
+        position_side_param = "LONG" if position_side == "long" else "SHORT"
+        layer_size = self.martingale.calculate_layer_size(symbol, position_side, current_price, False)
+        
+        current_layers = len(positions)
+        logger.info(f"📈 {symbol} {position_side.upper()} 第{current_layers}层仓位 准备加仓第{current_layers+1}层，方向: {side}, 大小: {layer_size:.6f}")
+        
+        success = self.api.execute_market_order(symbol, side, layer_size, position_side_param)
+        if success:
+            self.martingale.add_position(symbol, side, layer_size, current_price, False)
+        else:
+            # 发送错误通知
+            if self.telegram:
+                self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 加仓失败</b>")
 
 # ================== 启动程序 ==================
 def main():
@@ -1255,6 +1176,10 @@ def main():
 if __name__ == "__main__":
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         print("错误: 请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET 环境变量")
+        sys.exit(1)
+        
+    if not SYMBOLS_CONFIG:
+        print("错误: 请设置 SYMBOLS 环境变量，例如: LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT")
         sys.exit(1)
         
     main()
