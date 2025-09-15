@@ -57,7 +57,7 @@ COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
 COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
