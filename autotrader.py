@@ -921,7 +921,7 @@ class DualMartingaleManager:
                 
                 # 加载止盈平仓时间
                 self.last_tp_close_time = {}
-                for sym, sides in data.get('last_tp_close_time", {}).items():
+                for sym, sides in data.get("last_tp_close_time", {}).items():
                     self.last_tp_close_time[sym] = {}
                     for side, time_str in sides.items():
                         self.last_tp_close_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
