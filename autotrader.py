@@ -6,14 +6,11 @@ import pandas as pd
 import numpy as np
 import ta
 import logging
-import asyncio
 import signal
 import json
-import math
 import requests
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
-from enum import Enum
 from typing import Dict, List, Optional, Tuple, Any
 from dotenv import load_dotenv
 
@@ -25,7 +22,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOLS_CONFIG = [s.strip() for s in os.getenv("SYMBOLS", "LTC/USDT,DOGE/USDT,XRP/USDT,ADA/USDT,LINK/USDT").split(",") if s.strip()]
 TIMEFRAME = os.getenv("MACD_FILTER_TIMEFRAME", "4h")
-LEVERAGE = int(os.getenv("LEVERAGE", "15"))
+LEVERAGE = int(os.getenv("LEVERAGE", "1"))  # 设置为1，不加杠杆
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小改为6 USDT
 
@@ -33,8 +30,8 @@ BASE_TRADE_SIZE = float(os.getenv("BASE_TRADE_SIZE", "6"))  # 基础交易大小
 position_sizes_str = os.getenv("POSITION_SIZES", "2.678%,5%,6%,7%,8%,9%,10%,13%,14%")
 POSITION_SIZES = [float(size.strip().replace('%', '')) / 100 for size in position_sizes_str.split(',')]
 
-# 从环境变量读取止盈比例
-TP_PERCENT = float(os.getenv("TP_PERCENT", "1.5").replace('%', '')) / 100
+# 从环境变量读取止盈比例 - 设置为1.5%
+TP_PERCENT = 0.015  # 1.5% 止盈
 
 # 从环境变量读取止损设置
 STOP_LOSS = float(os.getenv("STOP_LOSS", "-100"))
@@ -50,13 +47,14 @@ MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
+TREND_CATCH_COOLDOWN_MINUTES = 30  # 趋势捕捉加仓冷却时间（分钟")
 
 # 冷静期配置
 COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
-COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
+COOLDOWN_HOURS = 12  # 冷静期持续时间（小时")
 
-# 新增: 止盈后重新开仓的冷静期 (秒)
-TP_COOLDOWN_SECONDS = int(os.getenv("TP_COOLDOWN_SECONDS", "60"))
+# 止盈后重新开仓的冷静期设置为0秒，立即重新开仓
+TP_COOLDOWN_SECONDS = 0
 
 # 止损配置
 STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
@@ -86,6 +84,9 @@ MIN_NOTIONAL = {
     "UNI/USDT": 10,
     "SUI/USDT": 10,
 }
+
+# 仓位大小精度阈值
+POSITION_SIZE_THRESHOLD = 1e-6  # 小于此值视为零仓位
 
 # ================== 日志设置 ==================
 logging.basicConfig(
@@ -241,6 +242,10 @@ def quantize_amount(amount: float, market) -> float:
         # 回退到简单舍入
         return round(amount, 6)
 
+def is_nonzero_size(size: float, threshold: float = POSITION_SIZE_THRESHOLD) -> bool:
+    """检查仓位大小是否大于阈值（非零）"""
+    return abs(size) > threshold
+
 # ================== 交易所接口 ==================
 class BinanceFutureAPI:
     def __init__(self, api_key: str, api_secret: str, symbols: List[str]):
@@ -321,7 +326,7 @@ class BinanceFutureAPI:
             positions = self.exchange.fetch_positions([symbol])
             result = {}
             for pos in positions:
-                if float(pos['contracts']) > 0:
+                if is_nonzero_size(float(pos['contracts'])):
                     # 使用side作为键，而不是positionSide
                     side = pos['side'].lower()
                     result[side] = {
@@ -464,7 +469,7 @@ class DualMartingaleManager:
         self.trend_catch_count: Dict[str, Dict[str, int]] = {}
         # 冷静期开始时间: {symbol: {'long': datetime, 'short': datetime}}
         self.cooldown_start_time: Dict[str, Dict[str, datetime]] = {}
-        # 止盈平仓时间: {symbol: {'long': datetime, 'short': datetime}} (新增)
+        # 止盈平仓时间: {symbol: {'long': datetime, 'short': datetime}}
         self.last_tp_close_time: Dict[str, Dict[str, datetime]] = {}
         # 仓位状态文件
         self.positions_file = "positions.json"
@@ -485,7 +490,6 @@ class DualMartingaleManager:
             self.trend_catch_count[symbol] = {'long': 0, 'short': 0}
         if symbol not in self.cooldown_start_time:
             self.cooldown_start_time[symbol] = {'long': None, 'short': None}
-        # 新增: 初始化止盈平仓时间
         if symbol not in self.last_tp_close_time:
             self.last_tp_close_time[symbol] = {'long': None, 'short': None}
 
@@ -510,26 +514,28 @@ class DualMartingaleManager:
         self.cooldown_start_time[symbol][position_side] = None
         return False
 
-    # 新增: 检查是否在止盈后的重新开仓冷静期内
     def is_in_tp_cooldown(self, symbol: str, position_side: str) -> bool:
         """检查是否处于止盈后的重新开仓冷静期"""
+        # 设置为0秒冷静期，所以总是返回False
+        return False
+
+    def is_in_trend_catch_cooldown(self, symbol: str, position_side: str) -> bool:
+        """检查是否处于趋势捕捉加仓的冷却时间"""
         self.initialize_symbol(symbol)
-        tp_close_time = self.last_tp_close_time[symbol][position_side]
+        last_trend_catch = self.last_trend_catch_time[symbol][position_side]
         
-        if tp_close_time is None:
+        if last_trend_catch is None:
             return False
             
-        # 计算冷静期结束时间
-        cooldown_end = tp_close_time + timedelta(seconds=TP_COOLDOWN_SECONDS)
+        # 计算冷却结束时间
+        cooldown_end = last_trend_catch + timedelta(minutes=TREND_CATCH_COOLDOWN_MINUTES)
         
-        # 如果当前时间在冷静期内
+        # 如果当前时间在冷却期内
         if datetime.now() < cooldown_end:
             remaining = cooldown_end - datetime.now()
-            logger.info(f"⏳ {symbol} {position_side.upper()} 处于止盈冷静期，剩余时间: {remaining}")
+            logger.info(f"⏳ {symbol} {position_side.upper()} 趋势捕捉加仓冷却中，剩余时间: {remaining}")
             return True
             
-        # 冷静期已过，重置
-        self.last_tp_close_time[symbol][position_side] = None
         return False
 
     def start_cooldown(self, symbol: str, position_side: str):
@@ -607,6 +613,10 @@ class DualMartingaleManager:
             
         # 检查是否处于冷静期
         if self.is_in_cooldown(symbol, position_side):
+            return False, 0
+            
+        # 检查是否处于趋势捕捉冷却期
+        if self.is_in_trend_catch_cooldown(symbol, position_side):
             return False, 0
         
         # 获取当前仓位层数
@@ -850,7 +860,6 @@ class DualMartingaleManager:
                          for side, time in sides.items()}
                     for sym, sides in self.cooldown_start_time.items()
                 },
-                # 新增: 保存止盈平仓时间
                 'last_tp_close_time': {
                     sym: {side: time.isoformat() if time else None 
                          for side, time in sides.items()}
@@ -910,9 +919,9 @@ class DualMartingaleManager:
                     for side, time_str in sides.items():
                         self.cooldown_start_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
                 
-                # 新增: 加载止盈平仓时间
+                # 加载止盈平仓时间
                 self.last_tp_close_time = {}
-                for sym, sides in data.get('last_tp_close_time', {}).items():
+                for sym, sides in data.get('last_tp_close_time", {}).items():
                     self.last_tp_close_time[sym] = {}
                     for side, time_str in sides.items():
                         self.last_tp_close_time[sym][side] = datetime.fromisoformat(time_str) if time_str else None
@@ -926,8 +935,8 @@ class DualMartingaleManager:
         try:
             # 获取交易所当前仓位
             exchange_positions = api.get_positions(symbol)
-            has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-            has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+            has_long = exchange_positions.get('long') and is_nonzero_size(exchange_positions['long']['size'])
+            has_short = exchange_positions.get('short') and is_nonzero_size(exchange_positions['short']['size'])
             
             # 检查本地记录
             self.initialize_symbol(symbol)
@@ -947,18 +956,8 @@ class DualMartingaleManager:
                 if has_short:
                     self.add_position(symbol, "sell", exchange_positions['short']['size'], exchange_positions['short']['entry_price'])
             
-            # 检查是否需要补仓
-            if not has_long or not has_short:
-                # 新增: 检查是否在止盈冷静期内
-                if not has_long and self.is_in_tp_cooldown(symbol, 'long'):
-                    logger.info(f"⏳ {symbol} 多仓处于止盈冷静期，跳过补仓")
-                    return
-                if not has_short and self.is_in_tp_cooldown(symbol, 'short'):
-                    logger.info(f"⏳ {symbol} 空仓处于止盈冷静期，跳过补仓")
-                    return
-                
-                logger.info(f"🔄 {symbol} 检测到仓位不完整，准备补仓")
-                
+            # 检查是否需要补仓 - 确保本地没有仓位记录且不在止盈冷静期
+            if not has_long and not self.positions[symbol]['long']:
                 # 获取当前价格
                 current_price = api.get_current_price(symbol)
                 if current_price is None:
@@ -971,25 +970,41 @@ class DualMartingaleManager:
                     logger.error(f"{symbol} 仓位大小计算错误，跳过补仓")
                     return
                 
-                # 补多仓
-                if not has_long:
-                    logger.info(f"📈 {symbol} 补多仓，大小: {position_size:.6f}")
-                    success = api.execute_market_order(symbol, "buy", position_size, "LONG")
-                    if success:
-                        self.add_position(symbol, "buy", position_size, current_price)
-                        logger.info(f"✅ {symbol} 多仓补充成功")
-                    else:
-                        logger.error(f"❌ {symbol} 多仓补充失败")
+                logger.info(f"📈 {symbol} 补多仓，大小: {position_size:.6f}")
+                success = api.execute_market_order(symbol, "buy", position_size, "LONG")
+                if success:
+                    self.add_position(symbol, "buy", position_size, current_price)
+                    logger.info(f"✅ {symbol} 多仓补充成功 | 价格: {current_price:.2f}, 层数: {len(self.positions[symbol]['long'])}")
+                    # 发送通知
+                    if self.telegram:
+                        self.telegram.send_message(f"<b>🔄 补仓成功</b>\n{symbol} LONG\n价格: ${current_price:.2f}\n数量: {position_size:.6f}")
+                else:
+                    logger.error(f"❌ {symbol} 多仓补充失败")
+            
+            # 检查是否需要补空仓 - 确保本地没有仓位记录且不在止盈冷静期
+            if not has_short and not self.positions[symbol]['short']:
+                # 获取当前价格
+                current_price = api.get_current_price(symbol)
+                if current_price is None:
+                    logger.error(f"无法获取 {symbol} 的价格，跳过补仓")
+                    return
                 
-                # 补空仓
-                if not has_short:
-                    logger.info(f"📉 {symbol} 补空仓，大小: {position_size:.6f}")
-                    success = api.execute_market_order(symbol, "sell", position_size, "SHORT")
-                    if success:
-                        self.add_position(symbol, "sell", position_size, current_price)
-                        logger.info(f"✅ {symbol} 空仓补充成功")
-                    else:
-                        logger.error(f"❌ {symbol} 空仓补充失败")
+                # 计算初始仓位大小
+                position_size = self.calculate_initial_size(current_price)
+                if position_size <= 0:
+                    logger.error(f"{symbol} 仓位大小计算错误，跳过补仓")
+                    return
+                
+                logger.info(f"📉 {symbol} 补空仓，大小: {position_size:.6f}")
+                success = api.execute_market_order(symbol, "sell", position_size, "SHORT")
+                if success:
+                    self.add_position(symbol, "sell", position_size, current_price)
+                    logger.info(f"✅ {symbol} 空仓补充成功 | 价格: {current_price:.2f}, 层数: {len(self.positions[symbol]['short'])}")
+                    # 发送通知
+                    if self.telegram:
+                        self.telegram.send_message(f"<b>🔄 补仓成功</b>\n{symbol} SHORT\n价格: ${current_price:.2f}\n数量: {position_size:.6f}")
+                else:
+                    logger.error(f"❌ {symbol} 空仓补充失败")
         except Exception as e:
             logger.error(f"检查并填充基础仓位错误 {symbol}: {e}")
 
@@ -1007,7 +1022,6 @@ class DualMartingaleManager:
         
         return f"{symbol}: 多仓{long_layers}层({long_size:.6f}) | 空仓{short_layers}层({short_size:.6f})"
 
-    # 新增: 记录止盈平仓时间
     def record_tp_close_time(self, symbol: str, position_side: str):
         """记录止盈平仓时间"""
         self.initialize_symbol(symbol)
@@ -1093,8 +1107,8 @@ class CoinTech2uBot:
         """程序启动时立即开双仓"""
         # 检查交易所是否已有仓位
         exchange_positions = self.api.get_positions(symbol)
-        has_long = exchange_positions.get('long') and exchange_positions['long']['size'] > 0
-        has_short = exchange_positions.get('short') and exchange_positions['short']['size'] > 0
+        has_long = exchange_positions.get('long') and is_nonzero_size(exchange_positions['long']['size'])
+        has_short = exchange_positions.get('short') and is_nonzero_size(exchange_positions['short']['size'])
         
         if has_long or has_short:
             logger.info(f"⏩ {symbol} 交易所已有仓位，跳过开仓")
@@ -1119,20 +1133,33 @@ class CoinTech2uBot:
         
         logger.info(f"📊 {symbol} 准备开双仓，价格: {current_price:.2f}, 大小: {position_size:.6f}")
         
-        # 同时开多仓和空仓
+        # 先开多仓
         long_success = self.api.execute_market_order(symbol, "buy", position_size, "LONG")
-        short_success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
         
-        if long_success and short_success:
-            logger.info(f"✅ {symbol} 已同时开多空仓位: 多单 {position_size:.6f} | 空单 {position_size:.6f}")
-            # 记录仓位
+        if long_success:
+            # 记录多仓
             self.martingale.add_position(symbol, "buy", position_size, current_price)
-            self.martingale.add_position(symbol, "sell", position_size, current_price)
+            logger.info(f"✅ {symbol} 多仓已开: {position_size:.6f}")
+            
+            # 再开空仓
+            short_success = self.api.execute_market_order(symbol, "sell", position_size, "SHORT")
+            
+            if short_success:
+                # 记录空仓
+                self.martingale.add_position(symbol, "sell", position_size, current_price)
+                logger.info(f"✅ {symbol} 空仓已开: {position_size:.6f}")
+                logger.info(f"✅ {symbol} 已同时开多空仓位: 多单 {position_size:.6f} | 空单 {position_size:.6f}")
+            else:
+                # 空仓失败，撤销多仓
+                logger.error(f"❌ {symbol} 空仓开仓失败，撤销多仓")
+                close_success = self.api.execute_market_order(symbol, "sell", position_size, "LONG")
+                if close_success:
+                    self.martingale.clear_positions(symbol, "long")
+                    logger.info(f"✅ {symbol} 多仓已撤销")
+                else:
+                    logger.error(f"❌ {symbol} 多仓撤销失败，需要手动处理")
         else:
-            logger.error(f"❌ {symbol} 开仓失败，需要手动检查")
-            # 发送错误通知
-            if self.telegram:
-                self.telegram.send_message(f"<b>❌ {symbol} 开仓失败</b>\n需要手动检查")
+            logger.error(f"❌ {symbol} 多仓开仓失败，跳过空仓")
 
     def process_symbol(self, symbol: str):
         """处理单个交易对的交易逻辑"""
@@ -1193,7 +1220,7 @@ class CoinTech2uBot:
                 self.telegram.send_message(f"<b>❌ {symbol} {position_side.upper()} 趋势捕捉加仓失败</b>")
 
     def close_profitable_position(self, symbol: str, position_side: str, current_price: float):
-        """平掉盈利的仓位"""
+        """平掉盈利的仓位，并立即重新开仓"""
         position_size = self.martingale.get_position_size(symbol, position_side)
         if position_size <= 0:
             return
@@ -1205,21 +1232,35 @@ class CoinTech2uBot:
         if position_side == "long":
             close_side = "sell"
             position_side_param = "LONG"
+            new_side = "buy"  # 重新开仓的方向
         else:  # short
             close_side = "buy"
             position_side_param = "SHORT"
+            new_side = "sell"  # 重新开仓的方向
         
         logger.info(f"📤 {symbol} {position_side.upper()} 第{current_layers}层仓位 止盈平仓，方向: {close_side}, 大小: {position_size:.6f}")
         
         success = self.api.execute_market_order(symbol, close_side, position_size, position_side_param)
         if success:
-            # 新增: 记录止盈平仓时间
+            # 记录止盈平仓时间
             self.martingale.record_tp_close_time(symbol, position_side)
             self.martingale.clear_positions(symbol, position_side)
             logger.info(f"✅ {symbol} {position_side.upper()} 所有仓位已平仓")
             
-            # 不再立即重新开仓，而是等待冷静期过后由check_and_fill_base_position处理
-            logger.info(f"⏳ {symbol} {position_side.upper()} 等待{TP_COOLDOWN_SECONDS}秒冷静期后再重新开仓")
+            # 立即重新开仓
+            logger.info(f"🔄 {symbol} {position_side.upper()} 立即重新开仓")
+            new_position_size = self.martingale.calculate_initial_size(current_price)
+            if new_position_size > 0:
+                new_success = self.api.execute_market_order(symbol, new_side, new_position_size, position_side_param.upper())
+                if new_success:
+                    self.martingale.add_position(symbol, new_side, new_position_size, current_price)
+                    logger.info(f"✅ {symbol} {position_side.upper()} 已重新开仓，大小: {new_position_size:.6f}")
+                    
+                    # 发送通知
+                    if self.telegram:
+                        self.telegram.send_message(f"<b>🔄 重新开仓成功</b>\n{symbol} {position_side.upper()}\n价格: ${current_price:.2f}\n数量: {new_position_size:.6f}")
+                else:
+                    logger.error(f"❌ {symbol} {position_side.upper()} 重新开仓失败")
         else:
             # 发送错误通知
             if self.telegram:
