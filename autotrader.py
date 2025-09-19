@@ -50,7 +50,6 @@ MAX_LAYERS = len(POSITION_SIZES)  # 最大层数等于仓位比例的数量
 TREND_CATCH_LAYERS = 2  # 捕捉行情时额外加仓层数
 TREND_CATCH_SIZES = [5, 7]  # 额外加仓的仓位大小
 TREND_SIGNAL_STRENGTH = 0.7  # 趋势信号强度阈值
-# 已删除趋势加仓冷却时间
 
 # 冷静期配置
 COOLDOWN_AFTER_LAYERS = 2  # 加仓到第几层后触发冷静期
@@ -60,7 +59,7 @@ COOLDOWN_HOURS = 12  # 冷静期持续时间（小时）
 TP_COOLDOWN_SECONDS = int(os.getenv("TP_COOLDOWN_SECONDS", "60"))
 
 # 止损配置
-STOP_LOSS_PER_SYMBOL = -100  # 单币种亏损1000USDT时止损
+STOP_LOSS_PER_SYMBOL = -1000  # 单币种亏损1000USDT时止损
 
 # Telegram 配置
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -92,9 +91,32 @@ MIN_NOTIONAL = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('cointech2u_bot.log')]
+    handlers=[logging.StreamHandler(sys.stdout)]  # 只使用标准输出，不使用文件
 )
 logger = logging.getLogger("CoinTech2uBot")
+
+# ================== 健康检查端点 ==================
+def start_health_check_server():
+    """启动一个简单的健康检查服务器"""
+    try:
+        from flask import Flask
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def health_check():
+            return {'status': 'ok', 'timestamp': datetime.now().isoformat()}
+        
+        # 在后台线程中运行Flask应用
+        import threading
+        port = int(os.getenv('PORT', 8000))
+        thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False))
+        thread.daemon = True
+        thread.start()
+        logger.info(f"健康检查服务器已启动，端口: {port}")
+    except ImportError:
+        logger.warning("未安装Flask，跳过健康检查服务器启动")
+    except Exception as e:
+        logger.error(f"启动健康检查服务器失败: {e}")
 
 # ================== Telegram 通知类 ==================
 class TelegramNotifier:
@@ -1017,6 +1039,9 @@ class CoinTech2uBot:
             self.telegram.send_message("<b>🛑 交易机器人已停止</b>")
 
     def run(self):
+        # 启动健康检查服务器
+        start_health_check_server()
+        
         if not self.api.initialize():
             logger.error("交易所初始化失败，程序退出")
             # 发送错误通知
